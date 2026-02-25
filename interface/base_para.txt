@@ -1,0 +1,129 @@
+# state file generated using paraview version 5.11.0-RC2
+import paraview
+paraview.compatibility.major = 5
+paraview.compatibility.minor = 11
+
+#### import the simple module from the paraview
+from paraview.simple import *
+#### disable automatic camera reset on 'Show'
+paraview.simple._DisableFirstRenderCameraReset()
+
+# ----------------------------------------------------------------
+# setup views used in the visualization
+# ----------------------------------------------------------------
+
+# get the material library
+materialLibrary1 = GetMaterialLibrary()
+
+# Create a new 'Render View'
+renderView1 = CreateView('RenderView')
+renderView1.ViewSize = [1216, 794]
+renderView1.AxesGrid = 'GridAxes3DActor'
+renderView1.CenterOfRotation = [30.0, 30.5, 27.5]
+renderView1.StereoType = 'Crystal Eyes'
+renderView1.CameraPosition = [97.12172294334181, 200.73455602133814, 99.10075349074762]
+renderView1.CameraFocalPoint = [30.000000000000007, 30.499999999999968, 27.499999999999975]
+renderView1.CameraViewUp = [-0.17947903253402203, 0.4406975393908316, -0.8795299629094611]
+renderView1.CameraFocalDisk = 1.0
+renderView1.CameraParallelScale = 50.85764445980565
+renderView1.BackEnd = 'OSPRay raycaster'
+renderView1.OSPRayMaterialLibrary = materialLibrary1
+
+SetActiveView(None)
+
+# ----------------------------------------------------------------
+# setup view layouts
+# ----------------------------------------------------------------
+
+# create new layout object 'Layout #1'
+layout1 = CreateLayout(name='Layout #1')
+layout1.AssignView(0, renderView1)
+layout1.SetSize(1216, 794)
+
+# ----------------------------------------------------------------
+# restore active view
+SetActiveView(renderView1)
+# ----------------------------------------------------------------
+
+# ----------------------------------------------------------------
+# setup the data processing pipelines
+# ----------------------------------------------------------------
+
+# create a new 'Image Reader'
+volume = ImageReader(registrationName='{dest}.raw', FileNames=['E:\\lanchlin\\neural-ultrasound-field\\volume\\Generated\\{dest}\\volume.raw'])
+volume.DataScalarType = 'unsigned char'
+volume.DataExtent = [0, {X}, 0, {Y}, 0, {Z}]
+
+# ----------------------------------------------------------------
+# setup the visualization in view 'renderView1'
+# ----------------------------------------------------------------
+
+# show data from volume
+volumeDisplay = Show(volume, renderView1, 'UniformGridRepresentation')
+
+# get 2D transfer function for 'ImageFile'
+imageFileTF2D = GetTransferFunction2D('ImageFile')
+imageFileTF2D.ScalarRangeInitialized = 1
+imageFileTF2D.Range = [11.0, 255.0, 0.0, 1.0]
+
+# get color transfer function/color map for 'ImageFile'
+imageFileLUT = GetColorTransferFunction('ImageFile')
+imageFileLUT.TransferFunction2D = imageFileTF2D
+imageFileLUT.RGBPoints = [11.0, 0.231373, 0.298039, 0.752941, 133.0, 0.865003, 0.865003, 0.865003, 255.0, 0.705882, 0.0156863, 0.14902]
+imageFileLUT.ScalarRangeInitialized = 1.0
+
+# get opacity transfer function/opacity map for 'ImageFile'
+imageFilePWF = GetOpacityTransferFunction('ImageFile')
+imageFilePWF.Points = [11.0, 0.0, 0.5, 0.0, 153.71697998046875, 0.0, 0.5, 0.0, 255.0, 1.0, 0.5, 0.0]
+imageFilePWF.ScalarRangeInitialized = 1
+
+# trace defaults for the display properties.
+volumeDisplay.Representation = 'Volume'
+volumeDisplay.ColorArrayName = ['POINTS', 'ImageFile']
+volumeDisplay.LookupTable = imageFileLUT
+volumeDisplay.SelectTCoordArray = 'None'
+volumeDisplay.SelectNormalArray = 'None'
+volumeDisplay.SelectTangentArray = 'None'
+volumeDisplay.OSPRayScaleArray = 'ImageFile'
+volumeDisplay.OSPRayScaleFunction = 'PiecewiseFunction'
+volumeDisplay.SelectOrientationVectors = 'None'
+volumeDisplay.ScaleFactor = 6.1000000000000005
+volumeDisplay.SelectScaleArray = 'ImageFile'
+volumeDisplay.GlyphType = 'Arrow'
+volumeDisplay.GlyphTableIndexArray = 'ImageFile'
+volumeDisplay.GaussianRadius = 0.305
+volumeDisplay.SetScaleArray = ['POINTS', 'ImageFile']
+volumeDisplay.ScaleTransferFunction = 'PiecewiseFunction'
+volumeDisplay.OpacityArray = ['POINTS', 'ImageFile']
+volumeDisplay.OpacityTransferFunction = 'PiecewiseFunction'
+volumeDisplay.DataAxesGrid = 'GridAxesRepresentation'
+volumeDisplay.PolarAxes = 'PolarAxesRepresentation'
+volumeDisplay.ScalarOpacityUnitDistance = 1.7355547242196372
+volumeDisplay.ScalarOpacityFunction = imageFilePWF
+volumeDisplay.TransferFunction2D = imageFileTF2D
+volumeDisplay.OpacityArrayName = ['POINTS', 'ImageFile']
+volumeDisplay.ColorArray2Name = ['POINTS', 'ImageFile']
+volumeDisplay.IsosurfaceValues = [127.5]
+volumeDisplay.SliceFunction = 'Plane'
+volumeDisplay.Slice = 27
+volumeDisplay.SelectInputVectors = [None, '']
+volumeDisplay.WriteLog = ''
+
+# init the 'PiecewiseFunction' selected for 'ScaleTransferFunction'
+volumeDisplay.ScaleTransferFunction.Points = [0.0, 0.0, 0.5, 0.0, 255.0, 1.0, 0.5, 0.0]
+
+# init the 'PiecewiseFunction' selected for 'OpacityTransferFunction'
+volumeDisplay.OpacityTransferFunction.Points = [0.0, 0.0, 0.5, 0.0, 255.0, 1.0, 0.5, 0.0]
+
+# init the 'Plane' selected for 'SliceFunction'
+volumeDisplay.SliceFunction.Origin = [30.0, 30.5, 27.5]
+
+# ----------------------------------------------------------------
+# setup color maps and opacity mapes used in the visualization
+# note: the Get..() functions create a new object, if needed
+# ----------------------------------------------------------------
+
+# ----------------------------------------------------------------
+# restore active source
+SetActiveSource(volume)
+# ----------------------------------------------------------------

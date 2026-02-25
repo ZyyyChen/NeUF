@@ -1,0 +1,39 @@
+_*
+tmp/
+logs/
+datasets/**
+!datasets/baked/dicomBalayageTotalValid.pkl
+!datasets/baked/grandeSphereValid.pkl
+.idea
+tests/
+volume/*
+/.NUF_venv/
+/latest
+debugpy.txt
+/reprod
+*.npy
+US_data
+*.bat
+test_data
+*.DS_Store
+
+# large data
+data/
+*.raw
+*.mat
+*.pkl
+
+# optional large docs
+*.pptx
+
+# python cache
+__pycache__/
+*.pyc
+
+# ppt files
+*.ppt
+
+
+
+
+
