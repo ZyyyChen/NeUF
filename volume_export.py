@@ -1,6 +1,6 @@
 from slice_renderer import SliceRenderer
 from nerf_network import NeRF
-from dataset import Quat, Dataset
+from dataset_1 import Quat, Dataset
 from math import ceil
 import matplotlib.pyplot as plt
 import numpy as np

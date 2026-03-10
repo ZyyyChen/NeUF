@@ -4,7 +4,7 @@ import os, sys
 fpath = os.path.join(os.path.dirname(__file__), "..")
 sys.path.append(fpath)
 
-from dataset import Dataset
+from dataset_1 import Dataset
 
 dataset = Dataset.open_from_save("c:/Users/anchling/Documents/projects/neural-ultrasound-field/datasets/baked/test/latest.pkl")
 

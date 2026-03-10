@@ -1,5 +1,7 @@
-from dataset import Dataset
 import os
+# os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'  # 必须在所有导入之前
+
+from dataset import Dataset
 import argparse
 import shutil
 
@@ -27,12 +29,12 @@ if __name__== "__main__":
     # datasetFolder = os.path.normpath(args.input_dir)
     # datasetFile = os.path.normpath(args.output)
     datasetFolder = "D:\\0-Code\\NeUF\\data\\cerebral_data\\Pre_traitement_echo_v2\\Recalage\\Patient0"
-    datasetFile = "D:\\0-Code\\NeUF\\data\\cerebral_data\\Pre_traitement_echo_v2\\Recalage\\Patient0\\us_recal_small\\baked_patient0_recal_small.pkl"
+    datasetFile = "D:\\0-Code\\NeUF\\data\\cerebral_data\\Pre_traitement_echo_v2\\Recalage\\Patient0\\us_recal_original\\baked_patient0_recal.pkl"
 
     image_step = 1
     d = Dataset(datasetFolder,
-                img_folder="us_recal_small",
-                info_folder="us_recal_small",
+                img_folder="us_recal_original",
+                info_folder="us_recal_original",
                 prefix="us",
                 suffix=".jpg",
                 reverse_quat=False,

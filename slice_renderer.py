@@ -10,7 +10,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 class SliceRenderer:
-    def __init__(self, dataset=None, px_width=0, px_height=0, width=0, height=0, point_min=None, point_max=None,
+    def __init__(self, dataset=None, px_width=0, px_height=0, width=0, height=0, point_min=None, point_max=None, 
                  decimation=1):
         self.dataset = None
         self.X, self.Y = ([], [])
@@ -22,6 +22,7 @@ class SliceRenderer:
                                       dataset.height,
                                       dataset.point_min,
                                       dataset.point_max,
+                                      
                                       decimation)
         elif px_width and px_height and width and height and point_min is not None and point_max is not None:
             self._init_slice_renderer(px_width,
@@ -52,7 +53,7 @@ class SliceRenderer:
             (self.bb_max[0] - self.bb_min[0], self.bb_max[1] - self.bb_min[1], self.bb_max[2] - self.bb_min[2])).to(
             device)
 
-        self.X, self.Y = get_base_points(width, height, self.width_px, self.height_px)
+        self.X, self.Y = get_base_points(width, height, self.width_px, self.height_px, offset_x_mm=point_min[0], offset_y_mm=point_min[1])
 
     def render_slice_from_dataset_valid(self, model, slice_number, reshaped=False, jitter=False):
         if not self.dataset:

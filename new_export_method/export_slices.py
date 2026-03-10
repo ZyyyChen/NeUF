@@ -17,7 +17,7 @@ import cv2
 fpath = os.path.join(os.path.dirname(__file__), "..")
 sys.path.append(fpath)
 
-from dataset import Dataset, Quat, get_base_points, get_oriented_points_and_views
+from dataset_1 import Dataset, Quat, get_base_points, get_oriented_points_and_views
 from slice_renderer import SliceRenderer
 from nerf_network import NeRF
 from volume_data import VolumeData

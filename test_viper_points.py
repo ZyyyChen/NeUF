@@ -1,5 +1,5 @@
 import numpy as np
-from dataset import Quat
+from dataset_1 import Quat
 from utils import get_base_points,get_oriented_points_and_views
 from tqdm import tqdm
 

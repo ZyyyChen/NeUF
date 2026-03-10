@@ -1,24 +1,15 @@
-"""
-修复版本的 dataset.py - 支持正确处理ROI裁剪
-
-主要修改:
-1. 根据ROI调整物理尺寸，保持像素物理尺寸比例不变
-2. 保存ROI的物理偏移（可选，用于坐标系对齐）
-3. 添加调试信息输出
-"""
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
 import torch
 from torchvision.io import read_image, ImageReadMode
 from torchvision.transforms.functional import crop
 import numpy as np
-
 from utils import get_base_points, get_oriented_points_and_views
 from tqdm import tqdm
 import json
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-torch.cuda.empty_cache()
 
 class Dataset:
     def __init__(self, folder, nb_valid=4, seed=-1, **kwargs):
@@ -36,16 +27,15 @@ class Dataset:
         self.name = kwargs.get("name", os.path.basename(folder)) 
         self.has_gt = False
         self.roi_2d = None
-        self.roi_offset_x_mm = 0  # ROI的物理偏移
-        self.roi_offset_y_mm = 0
         self.image_step = kwargs.get("image_step", 1)
 
         img_folder = kwargs.get("img_folder","us")
         info_folder = kwargs.get("info_folder", "")  
         prefix = kwargs.get("prefix","us/img_")
         suffix = kwargs.get("suffix",".jpg")
-        reverse_quat = kwargs.get("reverse_quat",False)
+        reverse_quat = kwargs.get("reverse_quat",False) #TODO: reverse_quat?
         self.exclude_valid = kwargs.get("exclude_valid", True)
+
 
         image_buffer = []
         gt_buffer = []
@@ -65,60 +55,21 @@ class Dataset:
             np.random.seed(seed)
             torch.random.manual_seed(seed)
 
-        # === 修改1: 读取ROI信息 ===
         roi_json_path = os.path.join(folder, "..", "..", "bounding_box.json")
         if os.path.exists(roi_json_path):
             with open(roi_json_path, 'r') as f:
                 data = json.load(f)["bounding_box"]
-                self.roi_2d = data if data.get("width", 0) > 1 else None
-                if self.roi_2d:
-                    print(f"发现ROI配置: x={self.roi_2d['x']}, y={self.roi_2d['y']}, "
-                          f"w={self.roi_2d['width']}, h={self.roi_2d['height']}")
+                self.roi_2d = data if data["width"] > 1 else None
 
-        # === 修改2: 读取第一张图像获取原始尺寸 ===
-        first_image_path = os.path.join(folder, img_folder, prefix + "0" + suffix)
-        first_image_raw = read_image(first_image_path, ImageReadMode.GRAY)
-        # 注意: read_image返回的shape是 [C, H, W]
-        self.orig_px_height, self.orig_px_width = first_image_raw.shape[1], first_image_raw.shape[2]
-        print(f"原始图像尺寸: {self.orig_px_width} x {self.orig_px_height} px")
+        first_image = torch.squeeze( read_image(os.path.join(folder, img_folder, prefix + "0" + suffix), ImageReadMode.GRAY) )
+        self.orig_px_height, self.orig_px_width = first_image.shape
         
-        # === 修改3: 读取物理尺寸并根据ROI调整 ===
-        with open(os.path.join(folder, info_folder, "infos.json"), "r") as f:
+        with open(os.path.join(folder, info_folder,"infos.json"), "r") as f:
             infos = json.load(f)["infos"]
             if "scan_dims_mm" in infos:
-                orig_width_mm = float(infos["scan_dims_mm"]["width"])
-                orig_height_mm = float(infos["scan_dims_mm"]["depth"])
-                print(f"原始物理尺寸: {orig_width_mm:.2f} x {orig_height_mm:.2f} mm")
-            if "ROI" in infos:
-                self.roi_2d = infos["ROI"] if infos["ROI"]["width"] > 1 and infos["ROI"]["height"] > 1 else None
-                print(f"ROI config: x={self.roi_2d['x']}, y={self.roi_2d['y']}, "
-                          f"w={self.roi_2d['width']}, h={self.roi_2d['height']}")
+                self.width = float(infos["scan_dims_mm"]["width"])
+                self.height = float(infos["scan_dims_mm"]["depth"])
 
-                # 如果有ROI裁剪，按比例调整物理尺寸
-                if self.roi_2d:
-                    # 计算原始的像素物理尺寸（mm/px）
-                    pixel_size_w_mm = orig_width_mm / self.orig_px_width
-                    pixel_size_h_mm = orig_height_mm / self.orig_px_height
-                    
-                    print(f"原始像素物理尺寸: {pixel_size_w_mm:.4f} x {pixel_size_h_mm:.4f} mm/px")
-                    
-                    # 根据ROI的像素尺寸计算对应的物理尺寸
-                    self.width = self.roi_2d['width'] * pixel_size_w_mm
-                    self.height = self.roi_2d['height'] * pixel_size_h_mm
-                    
-                    # 保存ROI的物理偏移（用于坐标系对齐）
-                    self.roi_offset_x_mm = self.roi_2d['x'] * pixel_size_w_mm
-                    self.roi_offset_y_mm = self.roi_2d['y'] * pixel_size_h_mm
-                    
-                    print(f"✓ ROI裁剪应用:")
-                    print(f"  裁剪后物理尺寸: {self.width:.2f} x {self.height:.2f} mm")
-                    print(f"  物理偏移: x={self.roi_offset_x_mm:.2f}mm, y={self.roi_offset_y_mm:.2f}mm")
-                else:
-                    self.width = orig_width_mm
-                    self.height = orig_height_mm
-                    print(f"未应用ROI裁剪")
-
-        # === 原有代码继续 ===
         with open(os.path.join(folder, info_folder,"infos.dat"), "r") as info:
             lines = info.readlines()
             nb_line = 0
@@ -161,6 +112,8 @@ class Dataset:
                         exit(-1)
 
                     if (
+                        # (self.width and width != self.width) or
+                        #     (self.height and height != self.height) or
                             (self.px_width and self.px_width != image.shape[1]) or
                             (self.px_height and self.px_height != image.shape[0])):
                         print("images must be of consistent dimensions mm and px")
@@ -171,8 +124,14 @@ class Dataset:
 
                     self.X, self.Y = ([],[])
                     if self.X == [] and self.Y == []:
-                        # === 修改4: 调用get_base_points时使用裁剪后的物理尺寸 ===
-                        self.X, self.Y = get_base_points(self.width, self.height, self.px_width, self.px_height)
+                        self.X, self.Y = get_base_points(
+                            self.width, 
+                            self.height, 
+                            self.px_width, 
+                            self.px_height,
+                            offset_x_mm=getattr(self, 'roi_offset_x_mm', 0),
+                            offset_y_mm=getattr(self, 'roi_offset_y_mm', 0)
+)
 
                     image_buffer.append(torch.squeeze(torch.reshape(image,(1,-1))))
                     if self.has_gt:
@@ -218,6 +177,7 @@ class Dataset:
                     viewdirs_valid_buffer.append(viewdirs_buffer.pop(i))
                     j += 1
                 else :
+                    #Also include the slices in the base dataset
                     self.slices.append(
                         Slice(k * self.px_width * self.px_height, (k + 1) * self.px_width * self.px_height,
                               pos_buffer[i], rot_buffer[i]))
@@ -244,37 +204,31 @@ class Dataset:
         self.viewdirs = torch.cat(viewdirs_buffer)
         self.viewdirs_valid = torch.cat(viewdirs_valid_buffer)
 
-        # === 修改5: 添加验证信息 ===
-        pixel_size_w_final = self.width / self.px_width
-        pixel_size_h_final = self.height / self.px_height
-        
-        print(f"\n=== 数据集加载完成 ===")
-        print(f"数据集: {folder}")
-        print(f"图像数量: {nb_images}")
-        print(f"裁剪后像素尺寸: {self.px_width} x {self.px_height} px")
-        print(f"裁剪后物理尺寸: {self.width:.2f} x {self.height:.2f} mm")
-        print(f"最终像素物理尺寸: {pixel_size_w_final:.4f} x {pixel_size_h_final:.4f} mm/px")
-        print(f"点云范围:")
-        print(f"  X: {self.point_min[0]:.2f} ~ {self.point_max[0]:.2f} mm")
-        print(f"  Y: {self.point_min[1]:.2f} ~ {self.point_max[1]:.2f} mm")
-        print(f"  Z: {self.point_min[2]:.2f} ~ {self.point_max[2]:.2f} mm")
+        print("\nopened dataset", folder, "containing", nb_images, "slices\ndimensions:\n\tmin:",self.point_min,"\n\tmax",self.point_max)
 
     def get_torch_image(self, img_path: str,) -> torch.Tensor:
-        """Loads a grayscale image as a torch tensor, optionally cropping using a given ROI."""
-        image = read_image(img_path,ImageReadMode.GRAY)
+        """
+        Loads a grayscale image as a torch tensor, optionally cropping using a given ROI.
+        
+        Note: Cropping happens on CPU before moving to GPU (more efficient)
+        """
+        # 1. 在CPU上读取图像
+        image = read_image(img_path, ImageReadMode.GRAY)  # shape: [1, H, W]
 
-        # flip the image horizontally to match the physical orientation
-        # image = torch.flip(image, [2])
-
+        # 2. 在CPU上进行裁剪（内存操作，不需要GPU）
         if self.roi_2d:
             required_keys = {'x', 'y', 'width', 'height'}
             if not required_keys.issubset(self.roi_2d.keys()):
                 raise ValueError(f"ROI must contain keys {required_keys}")
-            image = crop(image,self.roi_2d['y'],self.roi_2d['x'],self.roi_2d['height'],self.roi_2d['width'])
+            # crop(img, top, left, height, width)
+            image = crop(image, self.roi_2d['y'], self.roi_2d['x'], 
+                        self.roi_2d['height'], self.roi_2d['width'])
 
-        return torch.squeeze(
-                    image.float()
-            ).to(device)
+        # 3. flip the image horizontally to match the physical orientation
+        # image = torch.flip(image, [2])
+
+        # 4. 最后才转到GPU（只转一次，数据量最小）
+        return torch.squeeze(image.float()).to(device)
         
 
     def get_bounding_box(self):
@@ -411,3 +365,5 @@ class Quat:
     @staticmethod
     def identity():
         return Quat(1,0,0,0)
+
+

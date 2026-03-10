@@ -1,5 +1,5 @@
 from nerf_network import NeRF
-from dataset import Dataset
+from dataset_1 import Dataset
 from slice_renderer import SliceRenderer
 import tqdm
 import time
@@ -130,6 +130,8 @@ class NeUF():
         os.mkdir(self.logPath + "/checkpoints")
         os.mkdir(self.logPath + "/images")
         os.mkdir(self.logPath + "/losses")
+        
+        self.gt_saved = False  # Flag to save ground truth images only once
 
     def run(self):
 
@@ -206,6 +208,28 @@ class NeUF():
                     lossD1 = mse(D1, torch.reshape(self.dataset.get_slice_valid_pixels(3), (self.dataset.px_height, self.dataset.px_width)))
 
                     loss_valid = (lossA1 + lossC1 + lossB1 + lossD1) / 4
+                    
+                    # Save ground truth images only once
+                    if not self.gt_saved:
+                        gt_A1 = torch.reshape(self.dataset.get_slice_valid_pixels(0), (self.dataset.px_height, self.dataset.px_width))
+                        gt_B1 = torch.reshape(self.dataset.get_slice_valid_pixels(1), (self.dataset.px_height, self.dataset.px_width))
+                        gt_C1 = torch.reshape(self.dataset.get_slice_valid_pixels(2), (self.dataset.px_height, self.dataset.px_width))
+                        gt_D1 = torch.reshape(self.dataset.get_slice_valid_pixels(3), (self.dataset.px_height, self.dataset.px_width))
+                        
+                        # Save raw tensors (cpu) for later inspection or re-use
+                        torch.save(gt_A1.cpu(), self.logPath + "/images/A1_gt.pt")
+                        torch.save(gt_B1.cpu(), self.logPath + "/images/B1_gt.pt")
+                        torch.save(gt_C1.cpu(), self.logPath + "/images/C1_gt.pt")
+                        torch.save(gt_D1.cpu(), self.logPath + "/images/D1_gt.pt")
+                        
+                        # Save quick PNG visualizations (grayscale)
+                        plt.imsave(self.logPath + "/images/A1_gt.png", gt_A1.cpu().numpy(), cmap='gray')
+                        plt.imsave(self.logPath + "/images/B1_gt.png", gt_B1.cpu().numpy(), cmap='gray')
+                        plt.imsave(self.logPath + "/images/C1_gt.png", gt_C1.cpu().numpy(), cmap='gray')
+                        plt.imsave(self.logPath + "/images/D1_gt.png", gt_D1.cpu().numpy(), cmap='gray')
+                        
+                        self.gt_saved = True
+                        print(f"Ground truth images saved to {self.logPath}/images/")
 
                     if self.precA1 is not None and self.precB1 is not None and self.precC1 is not None and self.precD1 is not None:
                         varA1 = (torch.sum(torch.square(torch.sub(self.precA1,A1))))
