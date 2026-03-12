@@ -41,7 +41,7 @@ class NeUF():
         # self.datasetFolder = "E:/NeRF-3/datasets/baked/seinGrandeSphereValidNew.pkl"
         # self.datasetFolder = "E:/NeRF-3/datasets/baked/dicomBalayageTotalValidNew.pkl"
         # self.datasetFolder = "E:/NeRF-3/datasets/baked/test/blue.pkl"
-        self.datasetFolder = kwargs.get("dataset","E:/NeRF-3/datasets/baked/test/cube.pkl")
+        self.datasetFolder = kwargs.get("dataset","D:\\0-Code\\NeUF\\data\\cerebral_data\\Pre_traitement_echo_v2\\Recalage\\Patient0\\dataset.pkl")
         # self.datasetFolder = "E:/NeRF-3/datasets/baked/test/dicom.pkl"
         # self.datasetFolder = "E:/NeRF-3/datasets/baked/CubeBalayageTotalValidNew.pkl"
         # self.datasetFolder = "E:/NeRF-3/datasets/baked/sphereTotalValid.pkl"

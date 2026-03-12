@@ -26,11 +26,10 @@ if __name__== "__main__":
     
     args = get_arguments()
     
-    # datasetFolder = os.path.normpath(args.input_dir)
-    # datasetFile = os.path.normpath(args.output)
-    datasetFolder = "D:\\0-Code\\NeUF\\data\\cerebral_data\\Pre_traitement_echo_v2\\Recalage\\Patient0"
-    datasetFile = "D:\\0-Code\\NeUF\\data\\cerebral_data\\Pre_traitement_echo_v2\\Recalage\\Patient0\\us_recal_original\\baked_patient0_recal.pkl"
-
+    datasetFolder = os.path.normpath(args.input_dir)
+    datasetFile = os.path.normpath(args.output)
+    datasetFolder = "D:/0-Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Recalage/Patient0"
+    datasetFile = "D:/0-Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Recalage/Patient0/us_recal_original/baked_dataset.pkl"
     image_step = 1
     d = Dataset(datasetFolder,
                 img_folder="us_recal_original",

@@ -1,12 +1,14 @@
 from nerf_network import NeRF
-from dataset_1 import Dataset
+from dataset import Dataset
 from slice_renderer import SliceRenderer
 import tqdm
 import time
 from datetime import date
 import shutil
+import csv
 
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 import time
 import datetime
@@ -16,20 +18,20 @@ import matplotlib.pyplot as plt
 
 # PySide6 removed for headless/non-GUI use. Provide a tiny Signal stub so
 # code that calls .emit() still works when the GUI is not present.
-class _SignalStub:
-    def __init__(self):
-        self._slots = []
+# class _SignalStub:
+#     def __init__(self):
+#         self._slots = []
 
-    def connect(self, fn):
-        self._slots.append(fn)
+#     def connect(self, fn):
+#         self._slots.append(fn)
 
-    def emit(self, *args, **kwargs):
-        for s in list(self._slots):
-            try:
-                s(*args, **kwargs)
-            except Exception:
-                # swallow exceptions from slots to avoid breaking training loop
-                pass
+#     def emit(self, *args, **kwargs):
+#         for s in list(self._slots):
+#             try:
+#                 s(*args, **kwargs)
+#             except Exception:
+#                 # swallow exceptions from slots to avoid breaking training loop
+#                 pass
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -41,8 +43,8 @@ class NeUF:
     def __init__(self, **kwargs):
         # Running without PySide6: use local signal stubs in place of Qt signals
         # so external code can still connect/emit if needed.
-        self.progress = _SignalStub()
-        self.new_values = _SignalStub()
+        # self.progress = _SignalStub()
+        # self.new_values = _SignalStub()
 
         self.grad_weight = kwargs.get("grad_weight", 0.1)
         self.seed = kwargs.get("seed",19981708)
@@ -57,24 +59,15 @@ class NeUF:
 
         self.encoding = kwargs.get("encoding","None")
 
-        self.datasetFolder = "D:\\0-Code\\NeUF\\data\\cerebral_data\\Pre_traitement_echo_v2\\Recalage\\Patient0\\us_recal_original\\baked_patient0_recal.pkl"
-        # self.datasetFolder = "E:/NeRF-3/datasets/baked/seinGrandeSphereValidNew.pkl"
-        # self.datasetFolder = "E:/NeRF-3/datasets/baked/dicomBalayageTotalValidNew.pkl"
-        # self.datasetFolder = "E:/NeRF-3/datasets/baked/test/blue.pkl"
-        # self.datasetFolder = kwargs.get("dataset","E:/NeRF-3/datasets/baked/test/cube.pkl")
-        # self.datasetFolder = "E:/NeRF-3/datasets/baked/test/dicom.pkl"
-        # self.datasetFolder = "E:/NeRF-3/datasets/baked/CubeBalayageTotalValidNew.pkl"
-        # self.datasetFolder = "E:/NeRF-3/datasets/baked/sphereTotalValid.pkl"
-        # self.datasetFolder = "E:/NeRF-3/datasets/baked/Vass2.pkl"
-        # self.datasetFolder = "E:/NeRF-3/datasets/baked/GTMRI.pkl"
-        # self.datasetFolder = "E:/NeRF-3/datasets/baked/exportsimple.pkl"
-        # self.datasetFolder = "E:/NeRF-3/datasets/baked/tube.pkl"
-        # self.datasetFolder = "E:/NeRF-3/datasets/baked/seinGrandeFixed.pkl"
+        self.datasetFolder = kwargs.get(
+            "dataset",
+            "D:\\0-Code\\NeUF\\data\\cerebral_data\\Pre_traitement_echo_v2\\Recalage\\Patient0\\us_recal_original\\baked_dataset.pkl",
+        )
+
 
         self.ckptFile = kwargs.get("checkpoint","")
         # self.ckptFile = "latest\\ckpt.pkl"
-        # ckptFile = "logs/09-05-2023_HASH_0/checkpoints/11000.pkl"
-        # ckptFile = "logs/12-05-2023_NONE_1/checkpoints/13000.pkl"
+
 
         self.rootPoint = kwargs.get("root",".")
 
@@ -91,9 +84,11 @@ class NeUF:
             self.seed = ckpt["seed"]
 
             if (ckpt.get("baked", False)):
-                self.dataset = Dataset.open_from_save(ckpt["baked_dataset_file"])
+                baked_dataset_path = ckpt.get("baked_dataset_file", ckpt.get("dataset_folder", self.datasetFolder))
+                self.dataset = Dataset.open_from_save(baked_dataset_path)
             else:
-                self.dataset = Dataset(ckpt["dataset_folder"])
+                dataset_path = ckpt.get("dataset_folder", ckpt.get("baked_dataset_file", self.datasetFolder))
+                self.dataset = Dataset(dataset_path)
 
             self.nerf = NeRF(ckpt)
 
@@ -154,6 +149,12 @@ class NeUF:
         os.makedirs("./latest", exist_ok=True)
         
         self.gt_saved = False  # Flag to save ground truth images only once
+        self.tb_writer = SummaryWriter(log_dir=os.path.join(self.logPath, "tensorboard"))
+        self.loss_csv_path = os.path.join(self.logPath, "losses", "loss_history.csv")
+        os.makedirs(os.path.join(self.logPath, "losses"), exist_ok=True)
+        with open(self.loss_csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["iteration", "loss_train", "loss_valid", "loss_gt"])
 
     def run(self):
 
@@ -204,8 +205,8 @@ class NeUF:
         for i in range(self.start, self.N_iters + 1):
             # time.sleep(0.25)
             # print(i, end=" ")
-            if (self.i_plot >= 75):
-                self.progress.emit(i, i_min, i_max)
+            # if (self.i_plot >= 75):
+                # self.progress.emit(i, i_min, i_max)
             if i % self.i_save == 0 and i != 0:
                 params = self.nerf.get_save_dict()
                 params.update({
@@ -282,11 +283,9 @@ class NeUF:
                         "D1": torch.reshape(D1, (self.dataset.px_height, self.dataset.px_width)),
                         "iteration": i,
                         "time": time_str,
-                        "loss_train": np.mean(losses) if losses else loss_gt,
-                        # "loss_valid": loss_valid.cpu().numpy(),
-                        "loss_valid": 4,
-                        # "loss_gt": loss_gt,
-                        "loss_gt": 4,
+                        "loss_train": float(np.mean(losses)) if losses else (float(loss_gt) if loss_gt is not None else None),
+                        "loss_valid": float(loss_valid.detach().cpu()),
+                        "loss_gt": float(loss_gt.detach().cpu()) if loss_gt is not None else None,
                         "i_plot": self.i_plot
                     }
                     # self.new_values.emit(params)
@@ -308,6 +307,22 @@ class NeUF:
                     except Exception as e:
                         # Don't stop training if saving fails; just warn
                         print("Warning: failed to save preview images/tensors:", e)
+
+                    if params["loss_train"] is not None:
+                        self.tb_writer.add_scalar("loss/train", params["loss_train"], i)
+                    if params["loss_valid"] is not None:
+                        self.tb_writer.add_scalar("loss/valid", params["loss_valid"], i)
+                    if params["loss_gt"] is not None:
+                        self.tb_writer.add_scalar("loss/gt", params["loss_gt"], i)
+                    with open(self.loss_csv_path, "a", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow([
+                            i,
+                            params["loss_train"],
+                            params["loss_valid"],
+                            params["loss_gt"],
+                        ])
+                    self.tb_writer.flush()
 
             self.precA1 = A1
             self.precB1 = B1
@@ -364,6 +379,8 @@ class NeUF:
             self.optimizer.step()
 
             losses.append(loss.detach().cpu())
+
+        self.tb_writer.close()
 
     def getReferences(self):
         return (torch.reshape(self.dataset.get_slice_valid_pixels(0), (self.dataset.px_height, self.dataset.px_width)),

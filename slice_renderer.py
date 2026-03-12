@@ -55,6 +55,61 @@ class SliceRenderer:
 
         self.X, self.Y = get_base_points(width, height, self.width_px, self.height_px, offset_x_mm=point_min[0], offset_y_mm=point_min[1])
 
+    def _points_in_scan_bounds(self, points):
+        points = torch.reshape(points, (-1, points.shape[-1]))
+        mask = (
+            (points[:, 0] >= self.bb_min[0]) & (points[:, 0] <= self.bb_max[0]) &
+            (points[:, 1] >= self.bb_min[1]) & (points[:, 1] <= self.bb_max[1]) &
+            (points[:, 2] >= self.bb_min[2]) & (points[:, 2] <= self.bb_max[2])
+        )
+
+        if self.dataset and self.dataset.front_plane_point is not None and self.dataset.back_plane_point is not None:
+            front_point = torch.as_tensor(self.dataset.front_plane_point, dtype=points.dtype, device=points.device)
+            back_point = torch.as_tensor(self.dataset.back_plane_point, dtype=points.dtype, device=points.device)
+            scan_axis = torch.as_tensor(self.dataset.scan_axis, dtype=points.dtype, device=points.device)
+
+            front_proj = torch.sum((points - front_point) * scan_axis, dim=1)
+            back_proj = torch.sum((points - back_point) * scan_axis, dim=1)
+            mask = mask & (front_proj >= 0) & (back_proj <= 0)
+
+        return mask
+
+    def _query_with_scan_mask(self, model, points, viewdirs, bb_min_dev):
+        points = torch.reshape(points, (-1, points.shape[-1]))
+        viewdirs = torch.reshape(viewdirs, (-1, viewdirs.shape[-1]))
+        valid_mask = self._points_in_scan_bounds(points)
+        if torch.all(valid_mask):
+            query_points = points
+            query_viewdirs = viewdirs
+            if model.encoding_type != "HASH" or not model.use_encoding:
+                query_points = torch.add(
+                    torch.multiply(torch.divide(torch.add(query_points, -bb_min_dev), self.max_coord), 2), -1
+                )
+            return model.query(query_points, query_viewdirs).to(device)
+
+        dens = torch.zeros((points.shape[0], 1), dtype=points.dtype, device=points.device)
+        if torch.any(valid_mask):
+            query_points = points[valid_mask]
+            query_viewdirs = viewdirs[valid_mask]
+            if model.encoding_type != "HASH" or not model.use_encoding:
+                query_points = torch.add(
+                    torch.multiply(torch.divide(torch.add(query_points, -bb_min_dev), self.max_coord), 2), -1
+                )
+            dens[valid_mask] = model.query(query_points, query_viewdirs)
+
+        return dens.to(device)
+
+    def _query_points(self, model, points, viewdirs, bb_min_dev):
+        points = torch.reshape(points, (-1, points.shape[-1]))
+        viewdirs = torch.reshape(viewdirs, (-1, viewdirs.shape[-1]))
+
+        if model.encoding_type != "HASH" or not model.use_encoding:
+            points = torch.add(
+                torch.multiply(torch.divide(torch.add(points, -bb_min_dev), self.max_coord), 2), -1
+            )
+
+        return model.query(points, viewdirs).to(device)
+
     def render_slice_from_dataset_valid(self, model, slice_number, reshaped=False, jitter=False):
         if not self.dataset:
             print("Cannot render slice from dataset if slice_renderer was not initialized with a dataset")
@@ -75,14 +130,12 @@ class SliceRenderer:
         # print(self.dataset.point_min)
         # print(self.max_coord.cpu())
 
-        if model.encoding_type != "HASH" or not model.use_encoding:
-            points = torch.add(
-                torch.multiply(torch.divide(torch.add(points, -self.dataset.point_min_dev), self.max_coord), 2), -1)
-
-        # print(points)
-
-        # dens = model.query(points, self.dataset.slices[slice_number].viewdirs)
-        dens = model.query(points, self.dataset.get_slice_valid_viewdirs(slice_number))
+        dens = self._query_points(
+            model,
+            points,
+            self.dataset.get_slice_valid_viewdirs(slice_number),
+            self.dataset.point_min_dev,
+        )
 
         if  not reshaped :
             return dens.to(device)
@@ -106,14 +159,12 @@ class SliceRenderer:
         # print(self.dataset.point_min)
         # print(self.max_coord.cpu())
 
-        if model.encoding_type != "HASH" or not model.use_encoding:
-            points = torch.add(
-                torch.multiply(torch.divide(torch.add(points, -self.dataset.point_min_dev), self.max_coord), 2), -1)
-
-        # print(points)
-
-        # dens = model.query(points, self.dataset.slices[slice_number].viewdirs)
-        dens = model.query(points, self.dataset.get_slice_viewdirs(slice_number))
+        dens = self._query_points(
+            model,
+            points,
+            self.dataset.get_slice_viewdirs(slice_number),
+            self.dataset.point_min_dev,
+        )
         if not reshaped :
             return dens.to(device)
         if scalefactor is None:
@@ -135,12 +186,7 @@ class SliceRenderer:
             jit = torch.stack( (w*torch.randn((points.shape[0],1)),thickness*torch.randn((points.shape[0],1)),h*torch.randn((points.shape[0],1)) ) ).to(device)
             points = torch.add(points,jit)
 
-        if model.encoding_type != "HASH" or not model.use_encoding:
-            points = torch.add(
-                torch.multiply(torch.divide(torch.add(points, -self.bb_min_dev), self.max_coord), 2), -1)
-
-
-        raw = model.query(points, viewdirs)
+        raw = self._query_points(model, points, viewdirs, self.bb_min_dev)
 
         # dens = F.relu(raw)
         dens = raw
@@ -161,12 +207,7 @@ class SliceRenderer:
             jit = torch.stack( (w*torch.randn((points.shape[0],1)),thickness*torch.randn((points.shape[0],1)),h*torch.randn((points.shape[0],1)) ) ).to(device)
             points = torch.add(points,jit)
 
-        if model.encoding_type != "HASH" or not model.use_encoding:
-            points = torch.add(
-                torch.multiply(torch.divide(torch.add(points, -self.bb_min_dev), self.max_coord), 2), -1)
-
-
-        raw = model.query(points, viewdirs)
+        raw = self._query_with_scan_mask(model, points, viewdirs, self.bb_min_dev)
 
         # dens = F.relu(raw)
         dens = raw
