@@ -51,6 +51,7 @@ class Dataset:
         suffix = kwargs.get("suffix", ".jpg")
         reverse_quat = kwargs.get("reverse_quat", False)
         self.exclude_valid = kwargs.get("exclude_valid", True)
+        self.reverse_quat = reverse_quat
 
         image_buffer = []
         gt_buffer = []
@@ -76,6 +77,7 @@ class Dataset:
         print(f"Original image size: {self.orig_px_width} x {self.orig_px_height} px")
 
         infos_path = os.path.join(folder, info_folder, "infos.json")
+        self.infos_json_path = infos_path
         with open(infos_path, "r") as f:
             infos_json = json.load(f)
 
@@ -137,11 +139,17 @@ class Dataset:
                     float(frame["w2"]),
                 )
             else:
+                # quat = Quat(
+                #     float(frame["w0"]),
+                #     - float(frame["w1"]),
+                #     - float(frame["w2"]),
+                #     - float(frame["w3"]),
+                # )
                 quat = Quat(
                     float(frame["w0"]),
-                    -float(frame["w1"]),
-                    -float(frame["w2"]),
-                    -float(frame["w3"]),
+                    float(frame["w1"]),
+                    float(frame["w2"]),
+                    float(frame["w3"]),
                 )
 
             img_name = os.path.join(folder, img_folder, prefix + str(frame_key) + suffix)
@@ -204,8 +212,30 @@ class Dataset:
                 self.scan_axis = scan_vec / self.scan_length_mm
             else:
                 self.scan_axis = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-            self.front_plane_normal = self.scan_axis.copy()
-            self.back_plane_normal = self.scan_axis.copy()
+
+            # `get_oriented_points_and_views()` currently places each slice in the
+            # local z=0 plane via local_points = [Y, X, 0], so the slice-plane
+            # normal is the rotated local +Z axis (rotation matrix column 2).
+            mid_point = np.array(pos_buffer[len(pos_buffer) // 2], dtype=np.float32)
+            front_normal = np.asarray(rot_buffer[0].as_rotmat()[:, 2], dtype=np.float32)
+            back_normal = np.asarray(rot_buffer[-1].as_rotmat()[:, 2], dtype=np.float32)
+
+            front_norm = np.linalg.norm(front_normal)
+            back_norm = np.linalg.norm(back_normal)
+            if front_norm > 0:
+                front_normal = front_normal / front_norm
+            if back_norm > 0:
+                back_normal = back_normal / back_norm
+
+            # Orient both boundary normals toward the interior of the sweep so the
+            # export-time half-space test can simply use signed_distance >= 0.
+            if np.dot(mid_point - self.front_plane_point, front_normal) < 0:
+                front_normal = -front_normal
+            if np.dot(mid_point - self.back_plane_point, back_normal) < 0:
+                back_normal = -back_normal
+
+            self.front_plane_normal = front_normal
+            self.back_plane_normal = back_normal
 
         self.point_min_dev = torch.FloatTensor(self.point_min).to(device)
         self.point_max_dev = torch.FloatTensor(self.point_max).to(device)
@@ -304,7 +334,15 @@ class Dataset:
                 f"{self.back_plane_point[1]:.2f}, {self.back_plane_point[2]:.2f}) mm"
             )
             print(
-                f"  Plane normal / scan axis: ({self.scan_axis[0]:.6f}, "
+                f"  Front slice-plane normal (inward): ({self.front_plane_normal[0]:.6f}, "
+                f"{self.front_plane_normal[1]:.6f}, {self.front_plane_normal[2]:.6f})"
+            )
+            print(
+                f"  Back slice-plane normal (inward): ({self.back_plane_normal[0]:.6f}, "
+                f"{self.back_plane_normal[1]:.6f}, {self.back_plane_normal[2]:.6f})"
+            )
+            print(
+                f"  Scan axis: ({self.scan_axis[0]:.6f}, "
                 f"{self.scan_axis[1]:.6f}, {self.scan_axis[2]:.6f})"
             )
             print(f"  Scan length: {self.scan_length_mm:.2f} mm")

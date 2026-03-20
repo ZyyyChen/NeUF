@@ -16,39 +16,15 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 
-# PySide6 removed for headless/non-GUI use. Provide a tiny Signal stub so
-# code that calls .emit() still works when the GUI is not present.
-# class _SignalStub:
-#     def __init__(self):
-#         self._slots = []
-
-#     def connect(self, fn):
-#         self._slots.append(fn)
-
-#     def emit(self, *args, **kwargs):
-#         for s in list(self._slots):
-#             try:
-#                 s(*args, **kwargs)
-#             except Exception:
-#                 # swallow exceptions from slots to avoid breaking training loop
-#                 pass
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 class NeUF:
-    # progress and new_values are created per-instance in __init__ when
-    # PySide6 is not available; keep them here only as documentation.
-
     def __init__(self, **kwargs):
-        # Running without PySide6: use local signal stubs in place of Qt signals
-        # so external code can still connect/emit if needed.
-        # self.progress = _SignalStub()
-        # self.new_values = _SignalStub()
-
         self.grad_weight = kwargs.get("grad_weight", 0.1)
         self.seed = kwargs.get("seed",19981708)
-        self.N_iters = kwargs.get("nb_iters_max",10000) #10000
+        self.N_iters = kwargs.get("nb_iters_max",8500) #8500
         self.i_plot = kwargs.get("plot_freq",100) #100
         self.i_save = kwargs.get("save_freq",100)
         self.baked_dataset = kwargs.get("baked_dataset",True)
@@ -202,7 +178,8 @@ class NeUF:
         C1 = None
         D1 = None
 
-        for i in range(self.start, self.N_iters + 1):
+        progress_bar = tqdm.trange(self.start, self.N_iters + 1, desc="Training", dynamic_ncols=True)
+        for i in progress_bar:
             # time.sleep(0.25)
             # print(i, end=" ")
             # if (self.i_plot >= 75):
@@ -227,9 +204,7 @@ class NeUF:
                 i_min = i_max
                 i_max += self.i_plot
                 with torch.no_grad():
-                    print("\n________________________\n", (time.time() - t) / self.i_plot,
-                          'secs per iter. Result obtained at',
-                          datetime.datetime.now(), '\n______________________\n')
+                    secs_per_iter = (time.time() - t) / self.i_plot
                     t = time.time()
                     total_time = t - start_time
                     time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -266,7 +241,7 @@ class NeUF:
                         plt.imsave(self.logPath + "/images/D1_gt.png", gt_D1.cpu().numpy(), cmap='gray')
                         
                         self.gt_saved = True
-                        print(f"Ground truth images saved to {self.logPath}/images/")
+                        tqdm.tqdm.write(f"Ground truth images saved to {self.logPath}/images/")
 
                     if self.precA1 is not None and self.precB1 is not None and self.precC1 is not None and self.precD1 is not None:
                         varA1 = (torch.sum(torch.square(torch.sub(self.precA1,A1))))
@@ -323,6 +298,13 @@ class NeUF:
                             params["loss_gt"],
                         ])
                     self.tb_writer.flush()
+                    progress_bar.set_postfix(
+                        secs_per_iter=f"{secs_per_iter:.4f}",
+                        loss_train=f"{params['loss_train']:.6f}" if params["loss_train"] is not None else "None",
+                        loss_valid=f"{params['loss_valid']:.6f}" if params["loss_valid"] is not None else "None",
+                        loss_gt=f"{params['loss_gt']:.6f}" if params["loss_gt"] is not None else "None",
+                        elapsed=time_str,
+                    )
 
             self.precA1 = A1
             self.precB1 = B1
@@ -381,6 +363,7 @@ class NeUF:
             losses.append(loss.detach().cpu())
 
         self.tb_writer.close()
+        progress_bar.close()
 
     def getReferences(self):
         return (torch.reshape(self.dataset.get_slice_valid_pixels(0), (self.dataset.px_height, self.dataset.px_width)),

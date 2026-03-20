@@ -86,15 +86,15 @@ def get_oriented_points_and_views(X_base_points, Y_base_points, position, rotati
     优化版本：使用矩阵乘法替代 apply_along_axis，速度提升 10-100 倍
     """
     # 构建局部坐标点 (N, 3)
-    local_points = np.stack((Y_base_points, np.zeros_like(Y_base_points), X_base_points), axis=1)
+    local_points = np.stack((Y_base_points, X_base_points, np.zeros_like(Y_base_points)), axis=1)
     
     # 使用旋转矩阵进行批量变换 (N, 3) @ (3, 3)^T = (N, 3)
     rotmat = rotation.as_rotmat()  # (3, 3)
     points = local_points @ rotmat.T + position  # 广播加法
     
     # 视线方向也是批量计算
-    local_viewdirs = np.stack((-np.ones_like(Y_base_points), 
-                                np.zeros_like(Y_base_points), 
+    local_viewdirs = np.stack((- np.ones_like(Y_base_points),
+                                np.zeros_like(Y_base_points),
                                 np.zeros_like(Y_base_points)), axis=1)
     viewdirs = local_viewdirs @ rotmat.T
     
