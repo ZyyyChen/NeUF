@@ -12,9 +12,39 @@ if REPO_ROOT not in sys.path:
 from export_slices import run_export_slices
 from segment_roi import run_segment_roi
 from export_segmentation import run_export_segmentation
+from volume_data import VolumeData
+
+
+def resolve_spacing_xyz(args):
+    spacing_xyz = [None, None, None]
+
+    if args.spacing is not None:
+        if args.spacing <= 0:
+            raise ValueError("--spacing must be > 0")
+        spacing_xyz = [float(args.spacing)] * 3
+
+    axis_overrides = [args.spacing_x, args.spacing_y, args.spacing_z]
+    if any(value is not None for value in axis_overrides):
+        if args.spacing is None and not all(value is not None for value in axis_overrides):
+            raise ValueError(
+                "Pass all of --spacing-x/--spacing-y/--spacing-z together, "
+                "or use --spacing for isotropic spacing with optional axis overrides."
+            )
+        for index, value in enumerate(axis_overrides):
+            if value is not None:
+                if value <= 0:
+                    raise ValueError("All spacing values must be > 0")
+                spacing_xyz[index] = float(value)
+
+    if all(value is None for value in spacing_xyz):
+        return None
+    return tuple(spacing_xyz)
 
 
 def main(args):
+    spacing_xyz = resolve_spacing_xyz(args)
+    seed_slice_count = int(args.num_slices)
+
     # Step 1: Export slices
     volume_data_path = os.path.join(args.input_folder,"volume_data.json")
     if not args.skip_slices:
@@ -29,11 +59,21 @@ def main(args):
                 output_dir=args.slices_out,
                 num_slices=args.num_slices,
                 axis=args.axis,
+                spacing_xyz=spacing_xyz,
             )
             volume_data_path = Path(volume_data_path_str)
+            try:
+                seed_slice_count = int(VolumeData.load(str(volume_data_path)).volume_shape[0])
+            except Exception:
+                seed_slice_count = int(args.num_slices)
             print(f"Slices saved to {args.slices_out}, took {int(time.time()-start)} seconds")
     else:
         print("[1/3] Skipped export slices.")
+        if Path(volume_data_path).exists():
+            try:
+                seed_slice_count = int(VolumeData.load(str(volume_data_path)).volume_shape[0])
+            except Exception:
+                seed_slice_count = int(args.num_slices)
 
     # Step 2: ROI segmentation
     phantoms = {1: "bluephantom",
@@ -44,7 +84,7 @@ def main(args):
         print("[2/3] Running ROI segmentation ...", flush=True)
         seed_tuple = (args.seed_x, args.seed_y) if args.seed_x is not None and args.seed_y is not None else None
         if args.select_seed_index:
-            seed_index = input(f"Enter seed slice index (0 to {args.num_slices - 1}): ")
+            seed_index = input(f"Enter seed slice index (0 to {max(0, seed_slice_count - 1)}): ")
             args.seed_index = int(seed_index)
         start = time.time()
         run_segment_roi(
@@ -99,8 +139,12 @@ if __name__ == "__main__":
     parser.add_argument("--mesh-out", type=Path, default=Path("D:\\0-Code\\NeUF\\data\\simu_56\\isosurface.glb"), help="Output GLB path for exported mesh")
 
     # Slices params
-    parser.add_argument("--num-slices", type=int, default=150)
+    parser.add_argument("--num-slices", type=int, default=150, help="Fallback slice count along X when no spacing is specified")
     parser.add_argument("--axis", type=str, choices=["x", "y", "z"], default="x")
+    parser.add_argument("--spacing", type=float, default=None, help="Target isotropic voxel spacing in mm for the exported volume")
+    parser.add_argument("--spacing-x", type=float, default=None, help="Target spacing in mm along export X")
+    parser.add_argument("--spacing-y", type=float, default=None, help="Target spacing in mm along export Y")
+    parser.add_argument("--spacing-z", type=float, default=None, help="Target spacing in mm along export Z")
     parser.add_argument("--skip-slices", action="store_true")
 
     # Segmentation params

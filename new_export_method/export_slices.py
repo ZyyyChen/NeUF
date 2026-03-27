@@ -17,8 +17,9 @@ import cv2
 fpath = os.path.join(os.path.dirname(__file__), "..")
 sys.path.append(fpath)
 
-from dataset_1 import Dataset, Quat, get_base_points, get_oriented_points_and_views
+from dataset import Dataset, Quat
 from slice_renderer import SliceRenderer
+from utils import get_base_points, get_oriented_points_and_views
 from nerf_network import NeRF
 from volume_data import VolumeData
 
@@ -77,6 +78,22 @@ def get_rotation():
     return rot
 
 
+def get_volume_shape_from_spacing(point_min, point_max, spacing_xyz):
+    spacing_xyz = np.asarray(spacing_xyz, dtype=np.float32)
+    if spacing_xyz.shape != (3,):
+        raise ValueError("spacing_xyz must contain exactly 3 values: spacing_x, spacing_y, spacing_z")
+    if np.any(spacing_xyz <= 0):
+        raise ValueError("All spacing values must be > 0")
+
+    bbox_extent = np.abs(np.asarray(point_max, dtype=np.float32) - np.asarray(point_min, dtype=np.float32))
+    volume_shape = tuple(
+        max(2, int(math.ceil(float(extent_mm) / float(target_spacing_mm))))
+        for extent_mm, target_spacing_mm in zip(bbox_extent, spacing_xyz)
+    )
+    actual_spacing_xyz = bbox_extent / np.asarray(volume_shape, dtype=np.float32)
+    return volume_shape, actual_spacing_xyz
+
+
 def get_all_scan_corners_and_viewdirs(dataset, volume_data, new_points=None, from_dataset=False, infos_json=None, nb_images=None):
     """Get the different scan viewdirs and corners for the different positions"""
     positions, rotations, scan_corners, scan_viewdirs = [], [], [], []
@@ -109,6 +126,8 @@ def get_new_acquisiton_pts(point_min, point_max, axis="x", num_points=50):
         axis_points = np.linspace(x_min, x_max, num_points)
         # y, z = (y_min + y_max) / 2, z_min
         y, z = y_min, (z_min + z_max) / 2
+    else:
+        raise NotImplementedError("Only axis='x' is currently supported by the new export pipeline")
 
     new_points = np.array([[x, y, z] for x in axis_points])
 
@@ -151,7 +170,8 @@ def run_export_slices(
         dataset_path,
         output_dir,
         num_slices=150,
-        axis= "x"
+        axis= "x",
+        spacing_xyz=None,
     ):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -171,14 +191,35 @@ def run_export_slices(
     nb_images = len(os.listdir(os.path.join(export_folder,"us")))
     print("nb_images: ", nb_images)
 
+    point_min = ckpt["bounding_box"][0].detach().cpu().numpy()
+    point_max = ckpt["bounding_box"][1].detach().cpu().numpy()
+
+    if spacing_xyz is None:
+        if int(num_slices) <= 0:
+            raise ValueError("num_slices must be > 0 when spacing_xyz is not provided")
+        volume_shape = (int(num_slices), int(dataset.px_height), int(dataset.px_width))
+        bbox_extent = np.abs(point_max - point_min)
+        actual_spacing_xyz = bbox_extent / np.asarray(volume_shape, dtype=np.float32)
+    else:
+        volume_shape, actual_spacing_xyz = get_volume_shape_from_spacing(point_min, point_max, spacing_xyz)
+
+    print(f"Export volume shape (x, y, z): {volume_shape}")
+    print(
+        "Export spacing (x, y, z) mm: "
+        f"({actual_spacing_xyz[0]:.4f}, {actual_spacing_xyz[1]:.4f}, {actual_spacing_xyz[2]:.4f})"
+    )
+
     volume_data = VolumeData(
-        point_min=ckpt["bounding_box"][0].detach().cpu().numpy(),
-        point_max=ckpt["bounding_box"][1].detach().cpu().numpy(),
-        volume_shape=(num_slices, dataset.px_height, dataset.px_width),
+        point_min=point_min,
+        point_max=point_max,
+        volume_shape=volume_shape,
         metadata={
             "dataset_path": str(dataset_path),
             "ckpt_path": str(model_path),
             "nb_images": nb_images,
+            "requested_spacing_xyz_mm": None if spacing_xyz is None else np.asarray(spacing_xyz, dtype=np.float32).tolist(),
+            "actual_spacing_xyz_mm": actual_spacing_xyz.astype(np.float32).tolist(),
+            "export_axis": axis,
             "dataset_info": {
                 "width": dataset.width,
                 "height": dataset.height,
@@ -191,12 +232,13 @@ def run_export_slices(
     volume_data_path = os.path.join(input_folder, "volume_data.json")
     volume_data.save(volume_data_path)
 
-    new_points = get_new_acquisiton_pts(volume_data.point_min, volume_data.point_max, axis, num_slices)
+    new_points = get_new_acquisiton_pts(volume_data.point_min, volume_data.point_max, axis, volume_shape[0])
     new_rot = get_rotation()
 
     bbox_size = volume_data.volume_size
-    # new_pix_grid = get_base_points(dataset.width,dataset.height,dataset.px_width,dataset.px_height)
-    new_pix_grid = get_base_points(bbox_size[2],bbox_size[1],dataset.px_width,dataset.px_height)
+    render_height_px = int(volume_shape[1])
+    render_width_px = int(volume_shape[2])
+    new_pix_grid = get_base_points(bbox_size[2], bbox_size[1], render_width_px, render_height_px)
 
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -209,7 +251,8 @@ def run_export_slices(
                                               Y=new_pix_grid[1], 
                                               pos=new_points[i], 
                                               rot=new_rot, 
-                                              reshaped=True)
+                                              reshaped=True,
+                                              grid_shape=(render_height_px, render_width_px))
             .detach()
             .cpu()
             .numpy()

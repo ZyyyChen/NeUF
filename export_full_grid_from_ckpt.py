@@ -27,10 +27,16 @@ def parse_args():
     parser.add_argument(
         "--spacing",
         type=float,
-        nargs=3,
+        nargs="+",
         default=None,
-        metavar=("SX", "SY", "SZ"),
-        help="Override voxel spacing in mm for x/y/z. Defaults to dataset pixel size for x/y and min(x, y) for z.",
+        metavar="S",
+        help="Override voxel spacing in mm. Pass 1 value for isotropic spacing, or 3 values for x/y/z.",
+    )
+    parser.add_argument(
+        "--resolution-scale",
+        type=float,
+        default=1.0,
+        help="Multiply voxel resolution uniformly in x/y/z by dividing spacing by this factor. Example: 2.0 halves spacing and doubles voxel counts per axis.",
     )
     parser.add_argument(
         "--point-min",
@@ -65,14 +71,14 @@ def parse_args():
         help="Only query points between the first and last slice boundary planes of the sequence. Outside voxels stay black.",
     )
     parser.add_argument(
-        "--skip-large-npy",
+        "--save-large-npy",
         action="store_true",
-        help="Skip saving large intermediate .npy arrays such as volume_zyx.npy / volume.npy / gt_*.npy.",
+        help="Save large intermediate .npy arrays such as volume_zyx.npy / volume.npy / gt_*.npy.",
     )
     parser.add_argument(
-        "--skip-gt-exports",
+        "--save-gt-exports",
         action="store_true",
-        help="Skip exporting gt_stacked_slices and voxelized GT observation volumes. Saves substantial disk space.",
+        help="Save GT side products such as gt_stacked_slices.",
     )
     return parser.parse_args()
 
@@ -122,6 +128,39 @@ def to_numpy_bbox(ckpt):
     return bb_min, bb_max
 
 
+def get_default_spacing_xyz(baked_dataset):
+    spacing_x = float(baked_dataset.roi_px_size_width_mm)
+    spacing_y = float(baked_dataset.roi_px_size_height_mm)
+    spacing_z = min(spacing_x, spacing_y)
+    spacing_xyz = np.array([spacing_x, spacing_y, spacing_z], dtype=np.float32)
+    if np.any(spacing_xyz <= 0):
+        raise ValueError(f"Invalid default spacing from dataset: {spacing_xyz.tolist()}")
+    return spacing_xyz
+
+
+def resolve_spacing_xyz(args, baked_dataset):
+    if args.resolution_scale <= 0:
+        raise ValueError("--resolution-scale must be > 0")
+
+    if args.spacing is None:
+        base_spacing_xyz = get_default_spacing_xyz(baked_dataset)
+    else:
+        spacing_values = np.array(args.spacing, dtype=np.float32)
+        if spacing_values.size == 1:
+            base_spacing_xyz = np.repeat(spacing_values[0], 3).astype(np.float32)
+        elif spacing_values.size == 3:
+            base_spacing_xyz = spacing_values.astype(np.float32)
+        else:
+            raise ValueError("--spacing expects either 1 value or 3 values (x y z)")
+        if np.any(base_spacing_xyz <= 0):
+            raise ValueError("--spacing values must all be > 0")
+
+    spacing_xyz = base_spacing_xyz / float(args.resolution_scale)
+    if np.any(spacing_xyz <= 0):
+        raise ValueError(f"Resolved spacing must be > 0, got {spacing_xyz.tolist()}")
+    return spacing_xyz.astype(np.float32), base_spacing_xyz.astype(np.float32)
+
+
 def build_axis(point_min, point_max, spacing_xyz):
     axes = []
     for dim in range(3):
@@ -166,14 +205,6 @@ def estimate_export_bytes(grid_shape_zyx, baked_dataset, save_large_npy, save_gt
         if save_large_npy:
             total += array_nbytes(stacked_shape, np.float32)
 
-        total += array_nbytes(grid_shape_zyx, np.float32)  # gt_observed_volume.raw
-        total += array_nbytes(grid_shape_zyx, np.uint32)   # gt_observation_count.raw
-        total += array_nbytes(grid_shape_zyx, np.uint8)    # gt_observed_mask.raw
-        if save_large_npy:
-            total += array_nbytes(grid_shape_zyx, np.float32)
-            total += array_nbytes(grid_shape_zyx, np.uint32)
-            total += array_nbytes(grid_shape_zyx, np.uint8)
-
     # Small side files: headers, metadata, axis vectors.
     total += 16 * 1024 * 1024
     return total
@@ -187,8 +218,8 @@ def ensure_sufficient_disk_space(output_dir: Path, required_bytes: int):
             f"  Output dir: {output_dir}\n"
             f"  Free space: {format_bytes(free_bytes)}\n"
             f"  Estimated required: {format_bytes(required_bytes)}\n"
-            "  Tip: delete older exports, choose another output drive, or rerun with "
-            "--skip-large-npy --skip-gt-exports."
+            "  Tip: delete older exports, choose another output drive, keep "
+            "--save-large-npy and --save-gt-exports disabled."
         )
 
 
@@ -618,21 +649,17 @@ def main():
     point_min = np.array(baked_dataset.point_min, dtype=np.float32) if args.point_min is None else np.array(args.point_min, dtype=np.float32)
     point_max = np.array(baked_dataset.point_max, dtype=np.float32) if args.point_max is None else np.array(args.point_max, dtype=np.float32)
 
-    if args.spacing is None:
-        spacing_x = float(baked_dataset.roi_px_size_width_mm)
-        spacing_y = float(baked_dataset.roi_px_size_height_mm)
-        spacing_z = min(spacing_x, spacing_y)
-        spacing_xyz = np.array([spacing_x, spacing_y, spacing_z], dtype=np.float32)
-    else:
-        spacing_xyz = np.array(args.spacing, dtype=np.float32)
+    spacing_xyz, base_spacing_xyz = resolve_spacing_xyz(args, baked_dataset)
 
     x_axis, y_axis, z_axis = build_axis(point_min, point_max, spacing_xyz)
+    print(f"Base spacing (x, y, z) mm: {tuple(float(v) for v in base_spacing_xyz)}")
+    print(f"Final spacing (x, y, z) mm: {tuple(float(v) for v in spacing_xyz)}")
     print(f"Grid shape (x, y, z): {(len(x_axis), len(y_axis), len(z_axis))}")
     required_bytes = estimate_export_bytes(
         (len(z_axis), len(y_axis), len(x_axis)),
         baked_dataset,
-        save_large_npy=not args.skip_large_npy,
-        save_gt_exports=not args.skip_gt_exports,
+        save_large_npy=args.save_large_npy,
+        save_gt_exports=args.save_gt_exports,
     )
     print(f"Estimated export disk usage: {format_bytes(required_bytes)}")
     ensure_sufficient_disk_space(output_dir, required_bytes)
@@ -660,22 +687,19 @@ def main():
         plane_mask_data=plane_mask_data,
     )
     print(f"Queried grid volume shape (z, y, x): {volume_zyx.shape}")
-    if not args.skip_large_npy:
+    if args.save_large_npy:
         np.save(output_dir / "volume_zyx.npy", volume_zyx)
     volume = convert_grid_zyx_to_hzw(volume_zyx).astype(np.float32, copy=False)
-    if not args.skip_large_npy:
+    if args.save_large_npy:
         np.save(output_dir / "volume.npy", volume)
-    np.save(output_dir / "x_axis.npy", x_axis)
-    np.save(output_dir / "y_axis.npy", y_axis)
-    np.save(output_dir / "z_axis.npy", z_axis)
+        np.save(output_dir / "x_axis.npy", x_axis)
+        np.save(output_dir / "y_axis.npy", y_axis)
+        np.save(output_dir / "z_axis.npy", z_axis)
     save_grid_mhd_hzw(volume, output_dir, "volume", spacing_xyz, element_type="MET_FLOAT")
 
     stacked_slice_volume = None
-    gt_observed_volume = None
-    gt_count_volume = None
-    gt_observed_mask = None
 
-    if not args.skip_gt_exports:
+    if args.save_gt_exports:
         stacked_slice_volume = build_stacked_slice_volume(baked_dataset)
     if stacked_slice_volume is not None:
         stacked_spacing_xyz = np.array(
@@ -700,7 +724,7 @@ def main():
             ],
             dtype=np.float32,
         )
-        if not args.skip_large_npy:
+        if args.save_large_npy:
             np.save(output_dir / "gt_stacked_slices.npy", stacked_slice_volume)
         save_stacked_mhd_wzh(
             stacked_slice_volume,
@@ -713,28 +737,12 @@ def main():
             ),
         )
 
-    if not args.skip_gt_exports:
-        gt_observed_volume_zyx, gt_count_volume_zyx, gt_observed_mask_zyx = voxelize_gt_observations(
-            baked_dataset,
-            point_min,
-            point_max,
-            spacing_xyz,
-        )
-        gt_observed_volume = convert_grid_zyx_to_hzw(gt_observed_volume_zyx).astype(np.float32, copy=False)
-        gt_count_volume = convert_grid_zyx_to_hzw(gt_count_volume_zyx).astype(np.uint32, copy=False)
-        gt_observed_mask = convert_grid_zyx_to_hzw(gt_observed_mask_zyx).astype(np.uint8, copy=False)
-        if not args.skip_large_npy:
-            np.save(output_dir / "gt_observed_volume.npy", gt_observed_volume)
-            np.save(output_dir / "gt_observation_count.npy", gt_count_volume)
-            np.save(output_dir / "gt_observed_mask.npy", gt_observed_mask)
-        save_grid_mhd_hzw(gt_observed_volume, output_dir, "gt_observed_volume", spacing_xyz, element_type="MET_FLOAT")
-        save_grid_mhd_hzw(gt_count_volume, output_dir, "gt_observation_count", spacing_xyz, element_type="MET_UINT")
-        save_grid_mhd_hzw(gt_observed_mask, output_dir, "gt_observed_mask", spacing_xyz, element_type="MET_UCHAR")
-
     metadata = {
         "ckpt": str(args.ckpt),
         "dataset_pkl": str(dataset_path),
+        "base_spacing_mm_xyz": base_spacing_xyz.tolist(),
         "spacing_mm_xyz": spacing_xyz.tolist(),
+        "resolution_scale": float(args.resolution_scale),
         "mhd_grid_axis_order": ["h", "z", "w"],
         "mhd_grid_axis_mapping": {"h": "-x", "z": "-z", "w": "-y"},
         "point_min_mm": point_min.tolist(),
@@ -750,7 +758,6 @@ def main():
         "shape_hzw": list(volume.shape),
         "gt_stacked_slices_shape_zhw": list(stacked_slice_volume.shape) if stacked_slice_volume is not None else None,
         "gt_stacked_mhd_axis_order": ["width", "Z", "height"] if stacked_slice_volume is not None else None,
-        "gt_observed_shape_hzw": list(gt_observed_volume.shape) if gt_observed_volume is not None else None,
         "use_bbox_mask": args.use_bbox_mask,
         "use_sequence_plane_mask": bool(plane_mask_data is not None),
         "sequence_plane_mask_source": plane_mask_data.get("source") if plane_mask_data is not None else None,
@@ -758,8 +765,8 @@ def main():
         "front_plane_normal_inward": plane_mask_data["front_normal"].tolist() if plane_mask_data is not None else None,
         "back_plane_point_mm": plane_mask_data["back_point"].tolist() if plane_mask_data is not None else None,
         "back_plane_normal_inward": plane_mask_data["back_normal"].tolist() if plane_mask_data is not None else None,
-        "skip_large_npy": args.skip_large_npy,
-        "skip_gt_exports": args.skip_gt_exports,
+        "save_large_npy": args.save_large_npy,
+        "save_gt_exports": args.save_gt_exports,
         "estimated_export_bytes": int(required_bytes),
     }
     with (output_dir / "metadata.json").open("w", encoding="utf-8") as f:

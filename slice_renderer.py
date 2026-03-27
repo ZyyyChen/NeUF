@@ -194,15 +194,19 @@ class SliceRenderer:
             return dens.to(device)
         return torch.reshape(dens, (self.height_px, self.width_px)).to(device)
 
-    def render_slice_for_chosen_grid(self, model, X, Y, pos, rot, reshaped=False, jitter=False):
+    def render_slice_for_chosen_grid(self, model, X, Y, pos, rot, reshaped=False, jitter=False, grid_shape=None):
         points, viewdirs = get_oriented_points_and_views(X, Y, pos, rot)
 
         points = torch.from_numpy(points.astype(dtype=np.float32)).to(device)
         viewdirs = torch.from_numpy(viewdirs.astype(dtype=np.float32)).to(device)
 
         if jitter :
-            w = self.width / (3 * self.width_px)
-            h = self.height / (3 * self.height_px)
+            if grid_shape is None:
+                grid_height, grid_width = self.height_px, self.width_px
+            else:
+                grid_height, grid_width = int(grid_shape[0]), int(grid_shape[1])
+            w = self.width / (3 * grid_width)
+            h = self.height / (3 * grid_height)
             thickness = min(w,h)
             jit = torch.stack( (w*torch.randn((points.shape[0],1)),thickness*torch.randn((points.shape[0],1)),h*torch.randn((points.shape[0],1)) ) ).to(device)
             points = torch.add(points,jit)
@@ -213,7 +217,9 @@ class SliceRenderer:
         dens = raw
         if not reshaped :
             return dens.to(device)
-        return torch.reshape(dens, (self.height_px, self.width_px)).to(device)
+        if grid_shape is None:
+            grid_shape = (self.height_px, self.width_px)
+        return torch.reshape(dens, (int(grid_shape[0]), int(grid_shape[1]))).to(device)
 
 
     def query_random_positions(self, model, indices, reshaped=False, jitter=False):
