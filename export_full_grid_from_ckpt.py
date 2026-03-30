@@ -14,7 +14,7 @@ from utils import get_base_points, get_oriented_points_and_views
 
 
 # python .\export_full_grid_from_ckpt.py --ckpt .\latest\ckpt.pkl --output .\exports\full_grid
-
+# python export_full_grid_from_ckpt.py --ckpt latest/ckpt.pkl --output export/full_grid
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -67,8 +67,9 @@ def parse_args():
     )
     parser.add_argument(
         "--use-sequence-plane-mask",
-        action="store_true",
-        help="Only query points between the first and last slice boundary planes of the sequence. Outside voxels stay black.",
+        action="store_false",
+        dest="disable_sequence_plane_mask",
+        help="Enable querying only points between the first and last slice boundary planes of the sequence. Outside voxels stay black.",
     )
     parser.add_argument(
         "--save-large-npy",
@@ -664,8 +665,9 @@ def main():
     print(f"Estimated export disk usage: {format_bytes(required_bytes)}")
     ensure_sufficient_disk_space(output_dir, required_bytes)
 
-    plane_mask_data = get_sequence_plane_mask_data(baked_dataset, dataset_path) if args.use_sequence_plane_mask else None
-    if args.use_sequence_plane_mask:
+    use_sequence_plane_mask = not args.disable_sequence_plane_mask
+    plane_mask_data = get_sequence_plane_mask_data(baked_dataset, dataset_path) if use_sequence_plane_mask else None
+    if use_sequence_plane_mask:
         if plane_mask_data is None:
             print("Sequence plane mask requested, but the baked dataset does not contain valid front/back plane metadata. Falling back to unmasked query.")
         else:
@@ -759,7 +761,7 @@ def main():
         "gt_stacked_slices_shape_zhw": list(stacked_slice_volume.shape) if stacked_slice_volume is not None else None,
         "gt_stacked_mhd_axis_order": ["width", "Z", "height"] if stacked_slice_volume is not None else None,
         "use_bbox_mask": args.use_bbox_mask,
-        "use_sequence_plane_mask": bool(plane_mask_data is not None),
+        "use_sequence_plane_mask": use_sequence_plane_mask and bool(plane_mask_data is not None),
         "sequence_plane_mask_source": plane_mask_data.get("source") if plane_mask_data is not None else None,
         "front_plane_point_mm": plane_mask_data["front_point"].tolist() if plane_mask_data is not None else None,
         "front_plane_normal_inward": plane_mask_data["front_normal"].tolist() if plane_mask_data is not None else None,

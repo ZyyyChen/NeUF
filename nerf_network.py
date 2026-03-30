@@ -184,13 +184,22 @@ class NeRF(nn.Module) :
         return outputs_flat
 
     def grad_vars(self):
-        ret = list(self.parameters())
-        if self.encoder_params :
-            ret += list(self.encoder_params)
-        if self.dir_encoder_params :
-            ret += list(self.dir_encoder_params)
+        params = list(self.parameters())
+        if self.encoder_params:
+            params += list(self.encoder_params)
+        if self.dir_encoder_params:
+            params += list(self.dir_encoder_params)
 
-        return ret
+        unique_params = []
+        seen_param_ids = set()
+        for param in params:
+            param_id = id(param)
+            if param_id in seen_param_ids:
+                continue
+            seen_param_ids.add(param_id)
+            unique_params.append(param)
+
+        return unique_params
 
     def get_encode_name(self):
         return self.encoding_type if self.use_encoding else "NONE"

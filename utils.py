@@ -1,12 +1,11 @@
-import json
 import numpy as np
 import torch
 
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-BOX_OFFSETS = torch.tensor([[[i, j, k] for i in [0, 1] for j in [0, 1] for k in [0, 1]]],
-                           device=device)
+BOX_OFFSETS = torch.tensor(
+    [[[i, j, k] for i in [0, 1] for j in [0, 1] for k in [0, 1]]],
+    dtype=torch.int32,
+)
 
 
 def hash(coords, log2_hashmap_size):
@@ -20,7 +19,8 @@ def hash(coords, log2_hashmap_size):
     for i in range(coords.shape[-1]):
         xor_result ^= coords[..., i] * primes[i]
 
-    return torch.tensor((1 << log2_hashmap_size) - 1).to(xor_result.device) & xor_result
+    hash_mask = xor_result.new_tensor((1 << log2_hashmap_size) - 1)
+    return hash_mask & xor_result
 
 
 
@@ -40,9 +40,12 @@ def get_voxel_vertices(xyz, bounding_box, resolution, log2_hashmap_size):
 
     bottom_left_idx = torch.floor((xyz - box_min) / grid_size).int()
     voxel_min_vertex = bottom_left_idx * grid_size + box_min
-    voxel_max_vertex = voxel_min_vertex + torch.tensor([1.0, 1.0, 1.0],device=device) * grid_size
+    voxel_max_vertex = voxel_min_vertex + torch.ones_like(grid_size) * grid_size
 
-    voxel_indices = bottom_left_idx.unsqueeze(1) + BOX_OFFSETS
+    voxel_indices = bottom_left_idx.unsqueeze(1) + BOX_OFFSETS.to(
+        device=bottom_left_idx.device,
+        dtype=bottom_left_idx.dtype,
+    )
     hashed_voxel_indices = hash(voxel_indices, log2_hashmap_size)
 
     return voxel_min_vertex, voxel_max_vertex, hashed_voxel_indices
@@ -99,4 +102,3 @@ def get_oriented_points_and_views(X_base_points, Y_base_points, position, rotati
     viewdirs = local_viewdirs @ rotmat.T
     
     return points, viewdirs
-

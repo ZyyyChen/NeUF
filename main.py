@@ -1,383 +1,561 @@
-from nerf_network import NeRF
-from dataset import Dataset
-from slice_renderer import SliceRenderer
-import tqdm
-import time
-from datetime import date
-import shutil
-import csv
+from __future__ import annotations
 
+import argparse
+import csv
+import datetime
+import shutil
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
+import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
-import time
-import datetime
-import os
-import numpy as np
-import matplotlib.pyplot as plt
+from dataset import Dataset
+from nerf_network import NeRF
+from slice_renderer import SliceRenderer
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEFAULT_DATASET_PATH = (
+    "/home/zchen/Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/"
+    "Recalage/Patient0/us_recal_original/baked_dataset.pkl"
+)
+VALIDATION_SLICE_NAMES = ("A1", "B1", "C1", "D1")
 
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+@dataclass(frozen=True)
+class RunPaths:
+    log_dir: Path
+    checkpoint_dir: Path
+    image_dir: Path
+    loss_dir: Path
+    latest_checkpoint: Path
 
 
 class NeUF:
     def __init__(self, **kwargs):
-        self.grad_weight = kwargs.get("grad_weight", 0.1)
-        self.seed = kwargs.get("seed",19981708)
-        self.N_iters = kwargs.get("nb_iters_max",8500) #8500
-        self.i_plot = kwargs.get("plot_freq",100) #100
-        self.i_save = kwargs.get("save_freq",100)
-        self.baked_dataset = kwargs.get("baked_dataset",True)
-        self.training_mode = kwargs.get("training_mode","Random") #Slice, Random, RandomSpace...
-        # self.training_mode = "Slice" #Slice, Random, RandomSpace...
-        self.points_per_iter = kwargs.get("points_per_iter",50000) #used with random trainings
-        self.jitter_training = False
+        self.grad_weight = float(kwargs.get("grad_weight", 0.1))
+        self.seed = int(kwargs.get("seed", 19981708))
+        self.N_iters = int(kwargs.get("nb_iters_max", 8500))
+        self.i_plot = int(kwargs.get("plot_freq", 100))
+        self.i_save = int(kwargs.get("save_freq", 100))
+        self.baked_dataset = bool(kwargs.get("baked_dataset", True))
+        self.training_mode = kwargs.get("training_mode", "Random")
+        self.points_per_iter = int(kwargs.get("points_per_iter", 50000))
+        self.jitter_training = bool(kwargs.get("jitter_training", False))
+        self.encoding = kwargs.get("encoding", "None")
+        self.datasetFolder = kwargs.get("dataset", DEFAULT_DATASET_PATH)
+        self.ckptFile = kwargs.get("checkpoint", "")
+        self.rootPoint = Path(kwargs.get("root", ".")).expanduser()
 
-        self.encoding = kwargs.get("encoding","None")
+        self._validate_configuration()
 
-        self.datasetFolder = kwargs.get(
-            "dataset",
-            "D:\\0-Code\\NeUF\\data\\cerebral_data\\Pre_traitement_echo_v2\\Recalage\\Patient0\\us_recal_original\\baked_dataset.pkl",
-        )
-
-
-        self.ckptFile = kwargs.get("checkpoint","")
-        # self.ckptFile = "latest\\ckpt.pkl"
-
-
-        self.rootPoint = kwargs.get("root",".")
-
-        ckpt = None
-        self.dataset = None
+        self.dataset: Dataset
+        self.nerf: NeRF
+        self.optimizer: torch.optim.Optimizer
+        self.slice_renderer: SliceRenderer
         self.start = 0
-        if self.ckptFile != "":
-            ckpt = torch.load(self.ckptFile)
 
-        if ckpt:
-            print("Restarting from checkpoint:", self.ckptFile)
-            np.random.seed(ckpt["seed"])
-            torch.random.manual_seed(ckpt["seed"])
-            self.seed = ckpt["seed"]
+        self.mse = torch.nn.MSELoss()
+        self.scharr_x, self.scharr_y = self._build_scharr_kernels()
+        self.previous_validation_slices: dict[str, torch.Tensor] = {}
+        self.gt_saved = False
+        self.tb_reference_images_logged = False
 
-            if (ckpt.get("baked", False)):
-                baked_dataset_path = ckpt.get("baked_dataset_file", ckpt.get("dataset_folder", self.datasetFolder))
-                self.dataset = Dataset.open_from_save(baked_dataset_path)
-            else:
-                dataset_path = ckpt.get("dataset_folder", ckpt.get("baked_dataset_file", self.datasetFolder))
-                self.dataset = Dataset(dataset_path)
+        self.random_permutation: Optional[torch.Tensor] = None
+        self.random_start_index = 0
 
-            self.nerf = NeRF(ckpt)
-
-            self.optimizer = torch.optim.Adam(params=self.nerf.grad_vars(), lr=5e-4, betas=(0.9, 0.999))
-            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-
-            self.start = ckpt["start"]
-
+        checkpoint = self._load_checkpoint(self.ckptFile)
+        if checkpoint is not None:
+            self._initialize_from_checkpoint(checkpoint)
         else:
-            np.random.seed(self.seed)
-            torch.random.manual_seed(self.seed)
-            if self.baked_dataset:
-                self.dataset = Dataset.open_from_save(self.datasetFolder)
-            else:
-                self.dataset = Dataset(self.datasetFolder)
-            self.nerf = NeRF()
-
-
-            if self.encoding == "Freq" :
-                self.nerf.init_base_encoding(use_directions=False,
-                                               use_encoding=True,
-                                               num_freq=16,
-                                               num_freq_dir=4)
-
-            elif self.encoding == "Hash" :
-                self.nerf.init_hash_encoding(bounding_box=self.dataset.get_bounding_box(),
-                                             use_encoding=True,
-                                             use_directions=False)
-
-            elif self.encoding == "None" :
-                self.nerf.init_hash_encoding(bounding_box=self.dataset.get_bounding_box(),
-                                             use_encoding=False,
-                                             use_directions=False)
-
-            else :
-                print("Unknown encoding: ", self.encoding)
-                exit(-1)
-
-
-            self.nerf.init_model(8, 256)
-            self.optimizer = torch.optim.Adam(params=self.nerf.grad_vars(), lr=5e-4, betas=(0.9, 0.999))
+            self._initialize_from_scratch()
 
         self.slice_renderer = SliceRenderer(self.dataset)
+        self.run_paths = self._create_run_paths()
+        self.logPath = str(self.run_paths.log_dir)
 
-        d = date.today().strftime("%d-%m-%Y")
-        logPath = f"{self.rootPoint}/logs/{d}"
-        if not os.path.exists(logPath):
-            os.makedirs(logPath)
+        self.tb_writer = SummaryWriter(log_dir=str(self.run_paths.log_dir / "tensorboard"))
+        self.loss_csv_path = self.run_paths.loss_dir / "loss_history.csv"
+        self._initialize_loss_csv()
 
-        baseLogPath = logPath + "/" + self.nerf.get_rep_name() + "_" + self.getDatasetName()
-        num = 0
-        while os.path.exists(baseLogPath + "_" + str(num)):
-            num += 1
-        self.logPath = baseLogPath + "_" + str(num)
-        os.makedirs(self.logPath, exist_ok=False)
-        os.makedirs(self.logPath + "/checkpoints", exist_ok=False)
-        os.makedirs(self.logPath + "/images", exist_ok=False)
-        os.makedirs("./latest", exist_ok=True)
-        
-        self.gt_saved = False  # Flag to save ground truth images only once
-        self.tb_writer = SummaryWriter(log_dir=os.path.join(self.logPath, "tensorboard"))
-        self.loss_csv_path = os.path.join(self.logPath, "losses", "loss_history.csv")
-        os.makedirs(os.path.join(self.logPath, "losses"), exist_ok=True)
-        with open(self.loss_csv_path, "w", newline="") as f:
-            writer = csv.writer(f)
+    def _validate_configuration(self) -> None:
+        if self.N_iters < 0:
+            raise ValueError(f"nb_iters_max must be >= 0, got {self.N_iters}")
+        if self.i_plot <= 0:
+            raise ValueError(f"plot_freq must be >= 1, got {self.i_plot}")
+        if self.i_save <= 0:
+            raise ValueError(f"save_freq must be >= 1, got {self.i_save}")
+        if self.points_per_iter <= 0:
+            raise ValueError(f"points_per_iter must be >= 1, got {self.points_per_iter}")
+
+    def _build_scharr_kernels(self) -> tuple[torch.Tensor, torch.Tensor]:
+        scharr_x = torch.tensor(
+            [[-3, 0, 3], [-10, 0, 10], [-3, 0, 3]],
+            dtype=torch.float32,
+            device=DEVICE,
+        ).unsqueeze(0).unsqueeze(0) / 32.0
+        scharr_y = torch.tensor(
+            [[-3, -10, -3], [0, 0, 0], [3, 10, 3]],
+            dtype=torch.float32,
+            device=DEVICE,
+        ).unsqueeze(0).unsqueeze(0) / 32.0
+        return scharr_x, scharr_y
+
+    def _load_checkpoint(self, checkpoint_path: str):
+        if not checkpoint_path:
+            return None
+        return torch.load(checkpoint_path, map_location=DEVICE)
+
+    def _initialize_from_checkpoint(self, checkpoint: dict) -> None:
+        print(f"Restarting from checkpoint: {self.ckptFile}")
+        checkpoint_seed = int(checkpoint["seed"])
+        np.random.seed(checkpoint_seed)
+        torch.manual_seed(checkpoint_seed)
+        self.seed = checkpoint_seed
+
+        if checkpoint.get("baked", False):
+            dataset_path = checkpoint.get(
+                "baked_dataset_file",
+                checkpoint.get("dataset_folder", self.datasetFolder),
+            )
+            self.dataset = Dataset.open_from_save(dataset_path)
+        else:
+            dataset_path = checkpoint.get(
+                "dataset_folder",
+                checkpoint.get("baked_dataset_file", self.datasetFolder),
+            )
+            self.dataset = Dataset(dataset_path)
+
+        self.nerf = NeRF(checkpoint)
+        self.optimizer = torch.optim.Adam(
+            params=self.nerf.grad_vars(),
+            lr=5e-4,
+            betas=(0.9, 0.999),
+        )
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.start = int(checkpoint["start"])
+
+    def _initialize_from_scratch(self) -> None:
+        np.random.seed(self.seed)
+        torch.manual_seed(self.seed)
+        self.dataset = self._load_dataset()
+        self.nerf = NeRF()
+        self._initialize_model_encoding()
+        self.nerf.init_model(8, 256)
+        self.optimizer = torch.optim.Adam(
+            params=self.nerf.grad_vars(),
+            lr=5e-4,
+            betas=(0.9, 0.999),
+        )
+
+    def _load_dataset(self) -> Dataset:
+        if self.baked_dataset:
+            return Dataset.open_from_save(self.datasetFolder)
+        return Dataset(self.datasetFolder)
+
+    def _initialize_model_encoding(self) -> None:
+        encoding_name = str(self.encoding).lower()
+        if encoding_name == "freq":
+            self.nerf.init_base_encoding(
+                use_directions=False,
+                use_encoding=True,
+                num_freq=16,
+                num_freq_dir=4,
+            )
+            return
+
+        if encoding_name == "hash":
+            self.nerf.init_hash_encoding(
+                bounding_box=self.dataset.get_bounding_box(),
+                use_encoding=True,
+                use_directions=False,
+            )
+            return
+
+        if encoding_name == "none":
+            self.nerf.init_hash_encoding(
+                bounding_box=self.dataset.get_bounding_box(),
+                use_encoding=False,
+                use_directions=False,
+            )
+            return
+
+        raise ValueError(f"Unknown encoding: {self.encoding}")
+
+    def _create_run_paths(self) -> RunPaths:
+        dated_log_dir = self.rootPoint / "logs" / datetime.date.today().strftime("%d-%m-%Y")
+        dated_log_dir.mkdir(parents=True, exist_ok=True)
+
+        base_name = f"{self.nerf.get_rep_name()}_{self.getDatasetName()}"
+        run_index = 0
+        log_dir = dated_log_dir / f"{base_name}_{run_index}"
+        while log_dir.exists():
+            run_index += 1
+            log_dir = dated_log_dir / f"{base_name}_{run_index}"
+
+        checkpoint_dir = log_dir / "checkpoints"
+        image_dir = log_dir / "images"
+        loss_dir = log_dir / "losses"
+        latest_dir = self.rootPoint / "latest"
+
+        checkpoint_dir.mkdir(parents=True, exist_ok=False)
+        image_dir.mkdir(parents=True, exist_ok=False)
+        loss_dir.mkdir(parents=True, exist_ok=False)
+        latest_dir.mkdir(parents=True, exist_ok=True)
+
+        return RunPaths(
+            log_dir=log_dir,
+            checkpoint_dir=checkpoint_dir,
+            image_dir=image_dir,
+            loss_dir=loss_dir,
+            latest_checkpoint=latest_dir / "ckpt.pkl",
+        )
+
+    def _initialize_loss_csv(self) -> None:
+        with self.loss_csv_path.open("w", newline="") as csv_file:
+            writer = csv.writer(csv_file)
             writer.writerow(["iteration", "loss_train", "loss_valid", "loss_gt"])
 
+    def _create_checkpoint_payload(self, iteration: int) -> dict:
+        params = self.nerf.get_save_dict()
+        params.update(
+            {
+                "seed": self.seed,
+                "baked": self.baked_dataset,
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "start": iteration,
+                "bounding_box": self.dataset.get_bounding_box(),
+            }
+        )
+        dataset_key = "baked_dataset_file" if self.baked_dataset else "dataset_folder"
+        params[dataset_key] = self.datasetFolder
+        return params
+
+    def _save_checkpoint(self, iteration: int) -> None:
+        checkpoint_path = self.run_paths.checkpoint_dir / f"{iteration}.pkl"
+        torch.save(self._create_checkpoint_payload(iteration), checkpoint_path)
+        shutil.copy2(checkpoint_path, self.run_paths.latest_checkpoint)
+
+    def _reshape_valid_slice(self, getter, index: int) -> Optional[torch.Tensor]:
+        if index >= len(self.dataset.slices_valid):
+            return None
+
+        slice_tensor = getter(index)
+        return torch.reshape(slice_tensor, (self.dataset.px_height, self.dataset.px_width))
+
+    def _iter_validation_indices(self):
+        return range(min(len(self.dataset.slices_valid), len(VALIDATION_SLICE_NAMES)))
+
+    def _render_validation_slices(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        rendered: dict[str, torch.Tensor] = {}
+        references: dict[str, torch.Tensor] = {}
+
+        with torch.no_grad():
+            for index in self._iter_validation_indices():
+                name = VALIDATION_SLICE_NAMES[index]
+                rendered[name] = self.slice_renderer.render_slice_from_dataset_valid(
+                    self.nerf,
+                    index,
+                    reshaped=True,
+                ).detach()
+                reference = self._reshape_valid_slice(self.dataset.get_slice_valid_pixels, index)
+                if reference is not None:
+                    references[name] = reference.detach()
+
+        return rendered, references
+
+    def _compute_validation_loss(
+        self,
+        rendered: dict[str, torch.Tensor],
+        references: dict[str, torch.Tensor],
+    ) -> Optional[float]:
+        if not rendered or not references:
+            return None
+
+        losses = [self.mse(rendered[name], references[name]).item() for name in rendered if name in references]
+        if not losses:
+            return None
+        return float(np.mean(losses))
+
+    def _compute_temporal_validation_loss(self, rendered: dict[str, torch.Tensor]) -> Optional[float]:
+        if not self.previous_validation_slices:
+            return None
+
+        deltas = []
+        for name, current_slice in rendered.items():
+            previous_slice = self.previous_validation_slices.get(name)
+            if previous_slice is None:
+                continue
+            deltas.append(torch.sum(torch.square(previous_slice - current_slice)).item())
+
+        if not deltas:
+            return None
+        return float(np.mean(deltas))
+
+    def _save_tensor_and_image(self, base_name: str, tensor: torch.Tensor) -> None:
+        cpu_tensor = tensor.detach().cpu()
+        torch.save(cpu_tensor, self.run_paths.image_dir / f"{base_name}.pt")
+        plt.imsave(self.run_paths.image_dir / f"{base_name}.png", cpu_tensor.numpy(), cmap="gray")
+
+    def _save_ground_truth_images(self, references: dict[str, torch.Tensor]) -> None:
+        if self.gt_saved or not references:
+            return
+
+        for name, reference in references.items():
+            self._save_tensor_and_image(f"{name}_gt", reference)
+
+        self.gt_saved = True
+        tqdm.tqdm.write(f"Ground truth images saved to {self.run_paths.image_dir}")
+
+    def _save_preview_images(self, iteration: int, rendered: dict[str, torch.Tensor]) -> None:
+        for name, tensor in rendered.items():
+            self._save_tensor_and_image(f"{name}_{iteration}", tensor)
+
+    def _prepare_tensorboard_image(self, tensor: torch.Tensor, normalize: bool = False) -> torch.Tensor:
+        image = tensor.detach().cpu().float()
+        if normalize:
+            image_min = torch.min(image)
+            image_max = torch.max(image)
+            if float(image_max - image_min) > 0:
+                image = (image - image_min) / (image_max - image_min)
+            else:
+                image = torch.zeros_like(image)
+        elif float(torch.max(image)) > 1.0:
+            image = image / 255.0
+
+        return torch.clamp(image, 0.0, 1.0)
+
+    def _write_tensorboard_images(
+        self,
+        iteration: int,
+        rendered: dict[str, torch.Tensor],
+        references: dict[str, torch.Tensor],
+    ) -> None:
+        for name, prediction in rendered.items():
+            self.tb_writer.add_image(
+                f"validation/{name}/prediction",
+                self._prepare_tensorboard_image(prediction),
+                iteration,
+                dataformats="HW",
+            )
+
+            reference = references.get(name)
+            if reference is not None and not self.tb_reference_images_logged:
+                self.tb_writer.add_image(
+                    f"validation/{name}/reference",
+                    self._prepare_tensorboard_image(reference),
+                    iteration,
+                    dataformats="HW",
+                )
+
+            if reference is not None:
+                abs_diff = torch.abs(prediction.detach().cpu() - reference.detach().cpu())
+                self.tb_writer.add_image(
+                    f"validation/{name}/abs_diff",
+                    self._prepare_tensorboard_image(abs_diff, normalize=True),
+                    iteration,
+                    dataformats="HW",
+                )
+
+        self.tb_reference_images_logged = True
+
+    def _write_metrics(
+        self,
+        iteration: int,
+        loss_train: Optional[float],
+        loss_valid: Optional[float],
+        loss_gt: Optional[float],
+    ) -> None:
+        if loss_train is not None:
+            self.tb_writer.add_scalar("loss/train", loss_train, iteration)
+        if loss_valid is not None:
+            self.tb_writer.add_scalar("loss/valid", loss_valid, iteration)
+        if loss_gt is not None:
+            self.tb_writer.add_scalar("loss/gt", loss_gt, iteration)
+
+        with self.loss_csv_path.open("a", newline="") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow([iteration, loss_train, loss_valid, loss_gt])
+
+        self.tb_writer.flush()
+
+    def _run_validation(
+        self,
+        iteration: int,
+        train_losses: list[float],
+        start_time: float,
+        last_plot_time: float,
+    ) -> tuple[Optional[dict], float]:
+        now = time.time()
+        secs_per_iter = (now - last_plot_time) / self.i_plot
+        total_time = now - start_time
+        elapsed = str(datetime.timedelta(seconds=int(total_time)))
+
+        rendered, references = self._render_validation_slices()
+        if not rendered:
+            return None, now
+
+        loss_train = float(np.mean(train_losses)) if train_losses else None
+        loss_valid = self._compute_validation_loss(rendered, references)
+        loss_gt = self._compute_temporal_validation_loss(rendered)
+
+        self._save_ground_truth_images(references)
+        self._save_preview_images(iteration, rendered)
+        self._write_tensorboard_images(iteration, rendered, references)
+        self._write_metrics(iteration, loss_train, loss_valid, loss_gt)
+        self.previous_validation_slices = {
+            name: tensor.detach().clone() for name, tensor in rendered.items()
+        }
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        params = {
+            name: rendered.get(name) for name in VALIDATION_SLICE_NAMES
+        }
+        params.update(
+            {
+                "iteration": iteration,
+                "time": elapsed,
+                "loss_train": loss_train,
+                "loss_valid": loss_valid,
+                "loss_gt": loss_gt,
+                "i_plot": self.i_plot,
+                "secs_per_iter": secs_per_iter,
+            }
+        )
+        return params, now
+
+    def _next_random_indices(self) -> torch.Tensor:
+        if self.random_permutation is None:
+            self.random_permutation = torch.randperm(
+                len(self.dataset.points),
+                device=self.dataset.points.device,
+            )
+            self.random_start_index = 0
+
+        stop_index = self.random_start_index + self.points_per_iter
+        if stop_index <= len(self.random_permutation):
+            indices = self.random_permutation[self.random_start_index:stop_index]
+        else:
+            first_chunk = self.random_permutation[self.random_start_index:]
+            overflow = stop_index - len(self.random_permutation)
+            second_chunk = self.random_permutation[:overflow]
+            indices = torch.cat((first_chunk, second_chunk), dim=0)
+
+        self.random_start_index = stop_index % len(self.random_permutation)
+        return indices
+
+    def _sample_training_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.training_mode == "Slice":
+            slice_index = np.random.randint(len(self.dataset.slices))
+            target = self.dataset.get_slice_pixels(slice_index).to(DEVICE)
+            density = self.slice_renderer.render_slice_from_dataset(
+                self.nerf,
+                slice_index,
+                jitter=self.jitter_training,
+            )
+            return target, density
+
+        if self.training_mode == "Random":
+            indices = self._next_random_indices()
+            target = self.dataset.get_indices_pixels(indices)
+            density = self.slice_renderer.query_random_positions(self.nerf, indices, reshaped=False)
+            return target, density
+
+        raise ValueError(f"Training mode '{self.training_mode}' is not implemented")
+
+    def _compute_gradient_loss(self, target: torch.Tensor, density: torch.Tensor) -> torch.Tensor:
+        target_slice = torch.reshape(
+            target,
+            (self.dataset.px_height, self.dataset.px_width),
+        ).unsqueeze(0).unsqueeze(0)
+        density_slice = torch.reshape(
+            density,
+            (self.dataset.px_height, self.dataset.px_width),
+        ).unsqueeze(0).unsqueeze(0)
+
+        target_grad_x = torch.nn.functional.conv2d(target_slice, self.scharr_x, padding=1)
+        target_grad_y = torch.nn.functional.conv2d(target_slice, self.scharr_y, padding=1)
+        density_grad_x = torch.nn.functional.conv2d(density_slice, self.scharr_x, padding=1)
+        density_grad_y = torch.nn.functional.conv2d(density_slice, self.scharr_y, padding=1)
+
+        return self.mse(density_grad_x, target_grad_x) + self.mse(density_grad_y, target_grad_y)
+
+    def _compute_training_loss(self, target: torch.Tensor, density: torch.Tensor) -> torch.Tensor:
+        loss = self.mse(density, target)
+        if self.training_mode == "Slice":
+            loss = loss + self.grad_weight * self._compute_gradient_loss(target, density)
+        return loss
+
+    def _update_progress_bar(self, progress_bar, params: Optional[dict]) -> None:
+        if params is None:
+            return
+
+        progress_bar.set_postfix(
+            secs_per_iter=f"{params['secs_per_iter']:.4f}",
+            loss_train=f"{params['loss_train']:.6f}" if params["loss_train"] is not None else "None",
+            loss_valid=f"{params['loss_valid']:.6f}" if params["loss_valid"] is not None else "None",
+            loss_gt=f"{params['loss_gt']:.6f}" if params["loss_gt"] is not None else "None",
+            elapsed=params["time"],
+        )
+
     def run(self):
-
-        t = time.time()
         start_time = time.time()
-        loss_gt = None
-        loss_valid = 0
-        losses = []
+        last_plot_time = start_time
+        train_losses: list[float] = []
 
-        mse = torch.nn.MSELoss()
-        # mse = torch.nn.L1Loss()
-        
-        # 梯度一致性损失的Scharr算子
-        self.scharr_x = torch.tensor([
-            [-3, 0, 3],
-            [-10, 0, 10],
-            [-3, 0, 3]
-        ], dtype=torch.float32).unsqueeze(0).unsqueeze(0) / 32.0
-        
-        self.scharr_y = torch.tensor([
-            [-3, -10, -3],
-            [0, 0, 0],
-            [3, 10, 3]
-        ], dtype=torch.float32).unsqueeze(0).unsqueeze(0) / 32.0
-        
-        self.scharr_x = self.scharr_x.to(device)
-        self.scharr_y = self.scharr_y.to(device)
-        
-        i_min = -self.i_plot
-        i_max = 0
-        # generator = np.random.default_rng(self.seed)
+        progress_bar = tqdm.trange(
+            self.start,
+            self.N_iters + 1,
+            desc="Training",
+            dynamic_ncols=True,
+        )
 
+        try:
+            for iteration in progress_bar:
+                if iteration != 0 and iteration % self.i_save == 0:
+                    self._save_checkpoint(iteration)
 
-        perm = torch.randperm(len(self.dataset.points))
-        start_index = 0
-        stop_index = self.points_per_iter
-        indices = None
-
-        self.precA1 = None
-        self.precB1 = None
-        self.precC1 = None
-        self.precD1 = None
-        A1 = None
-        B1 = None
-        C1 = None
-        D1 = None
-
-        progress_bar = tqdm.trange(self.start, self.N_iters + 1, desc="Training", dynamic_ncols=True)
-        for i in progress_bar:
-            # time.sleep(0.25)
-            # print(i, end=" ")
-            # if (self.i_plot >= 75):
-                # self.progress.emit(i, i_min, i_max)
-            if i % self.i_save == 0 and i != 0:
-                params = self.nerf.get_save_dict()
-                params.update({
-                    "seed": self.seed,
-                    "baked": self.baked_dataset,
-                    "dataset_folder" if not self.baked_dataset else "baked_dataset_file": self.datasetFolder,
-                    "optimizer_state_dict": self.optimizer.state_dict(),
-                    "start": i,
-                    "bounding_box": self.dataset.get_bounding_box()
-                })
-                ckpt_fileName = self.logPath + "/checkpoints/" + str(i) + ".pkl"
-                torch.save(params, ckpt_fileName)
-                shutil.copy(ckpt_fileName,self.rootPoint+"/latest/ckpt.pkl")
-
-            if i % self.i_plot == 0:
-                # pbar.reset()
-
-                i_min = i_max
-                i_max += self.i_plot
-                with torch.no_grad():
-                    secs_per_iter = (time.time() - t) / self.i_plot
-                    t = time.time()
-                    total_time = t - start_time
-                    time_str = str(datetime.timedelta(seconds=int(total_time)))
-
-                    A1 = self.slice_renderer.render_slice_from_dataset_valid(self.nerf, 0,reshaped=True)
-                    B1 = self.slice_renderer.render_slice_from_dataset_valid(self.nerf, 1,reshaped=True)
-                    C1 = self.slice_renderer.render_slice_from_dataset_valid(self.nerf, 2,reshaped=True)
-                    D1 = self.slice_renderer.render_slice_from_dataset_valid(self.nerf, 3,reshaped=True)
-
-                    lossA1 = mse(A1, torch.reshape(self.dataset.get_slice_valid_pixels(0), (self.dataset.px_height, self.dataset.px_width)))
-                    lossB1 = mse(B1, torch.reshape(self.dataset.get_slice_valid_pixels(1), (self.dataset.px_height, self.dataset.px_width)))
-                    lossC1 = mse(C1, torch.reshape(self.dataset.get_slice_valid_pixels(2), (self.dataset.px_height, self.dataset.px_width)))
-                    lossD1 = mse(D1, torch.reshape(self.dataset.get_slice_valid_pixels(3), (self.dataset.px_height, self.dataset.px_width)))
-
-                    loss_valid = (lossA1 + lossC1 + lossB1 + lossD1) / 4
-                    
-                    # Save ground truth images only once
-                    if not self.gt_saved:
-                        gt_A1 = torch.reshape(self.dataset.get_slice_valid_pixels(0), (self.dataset.px_height, self.dataset.px_width))
-                        gt_B1 = torch.reshape(self.dataset.get_slice_valid_pixels(1), (self.dataset.px_height, self.dataset.px_width))
-                        gt_C1 = torch.reshape(self.dataset.get_slice_valid_pixels(2), (self.dataset.px_height, self.dataset.px_width))
-                        gt_D1 = torch.reshape(self.dataset.get_slice_valid_pixels(3), (self.dataset.px_height, self.dataset.px_width))
-                        
-                        # Save raw tensors (cpu) for later inspection or re-use
-                        torch.save(gt_A1.cpu(), self.logPath + "/images/A1_gt.pt")
-                        torch.save(gt_B1.cpu(), self.logPath + "/images/B1_gt.pt")
-                        torch.save(gt_C1.cpu(), self.logPath + "/images/C1_gt.pt")
-                        torch.save(gt_D1.cpu(), self.logPath + "/images/D1_gt.pt")
-                        
-                        # Save quick PNG visualizations (grayscale)
-                        plt.imsave(self.logPath + "/images/A1_gt.png", gt_A1.cpu().numpy(), cmap='gray')
-                        plt.imsave(self.logPath + "/images/B1_gt.png", gt_B1.cpu().numpy(), cmap='gray')
-                        plt.imsave(self.logPath + "/images/C1_gt.png", gt_C1.cpu().numpy(), cmap='gray')
-                        plt.imsave(self.logPath + "/images/D1_gt.png", gt_D1.cpu().numpy(), cmap='gray')
-                        
-                        self.gt_saved = True
-                        tqdm.tqdm.write(f"Ground truth images saved to {self.logPath}/images/")
-
-                    if self.precA1 is not None and self.precB1 is not None and self.precC1 is not None and self.precD1 is not None:
-                        varA1 = (torch.sum(torch.square(torch.sub(self.precA1,A1))))
-                        varB1 = (torch.sum(torch.square(torch.sub(self.precB1,B1))))
-                        varC1 = (torch.sum(torch.square(torch.sub(self.precC1,C1))))
-                        varD1 = (torch.sum(torch.square(torch.sub(self.precD1,D1))))
-
-                        loss_gt = (varA1 + varC1 + varB1 + varD1) / 4
-
-                    params = {
-                        "A1": torch.reshape(A1, (self.dataset.px_height, self.dataset.px_width)),
-                        "B1": torch.reshape(B1, (self.dataset.px_height, self.dataset.px_width)),
-                        "C1": torch.reshape(C1, (self.dataset.px_height, self.dataset.px_width)),
-                        "D1": torch.reshape(D1, (self.dataset.px_height, self.dataset.px_width)),
-                        "iteration": i,
-                        "time": time_str,
-                        "loss_train": float(np.mean(losses)) if losses else (float(loss_gt) if loss_gt is not None else None),
-                        "loss_valid": float(loss_valid.detach().cpu()),
-                        "loss_gt": float(loss_gt.detach().cpu()) if loss_gt is not None else None,
-                        "i_plot": self.i_plot
-                    }
-                    # self.new_values.emit(params)
-                    # Save preview images and raw tensors to the run folder so training
-                    # records keep a history of rendered slices for this iteration.
-                    img_dir = os.path.join(self.logPath, "images")
-                    try:
-                        # save raw tensors (cpu) for later inspection or re-use
-                        torch.save(A1.cpu(), os.path.join(img_dir, f"A1_{i}.pt"))
-                        torch.save(B1.cpu(), os.path.join(img_dir, f"B1_{i}.pt"))
-                        torch.save(C1.cpu(), os.path.join(img_dir, f"C1_{i}.pt"))
-                        torch.save(D1.cpu(), os.path.join(img_dir, f"D1_{i}.pt"))
-
-                        # save quick PNG visualizations (grayscale)
-                        plt.imsave(os.path.join(img_dir, f"A1_{i}.png"), A1.cpu().numpy(), cmap='gray')
-                        plt.imsave(os.path.join(img_dir, f"B1_{i}.png"), B1.cpu().numpy(), cmap='gray')
-                        plt.imsave(os.path.join(img_dir, f"C1_{i}.png"), C1.cpu().numpy(), cmap='gray')
-                        plt.imsave(os.path.join(img_dir, f"D1_{i}.png"), D1.cpu().numpy(), cmap='gray')
-                    except Exception as e:
-                        # Don't stop training if saving fails; just warn
-                        print("Warning: failed to save preview images/tensors:", e)
-
-                    if params["loss_train"] is not None:
-                        self.tb_writer.add_scalar("loss/train", params["loss_train"], i)
-                    if params["loss_valid"] is not None:
-                        self.tb_writer.add_scalar("loss/valid", params["loss_valid"], i)
-                    if params["loss_gt"] is not None:
-                        self.tb_writer.add_scalar("loss/gt", params["loss_gt"], i)
-                    with open(self.loss_csv_path, "a", newline="") as f:
-                        writer = csv.writer(f)
-                        writer.writerow([
-                            i,
-                            params["loss_train"],
-                            params["loss_valid"],
-                            params["loss_gt"],
-                        ])
-                    self.tb_writer.flush()
-                    progress_bar.set_postfix(
-                        secs_per_iter=f"{secs_per_iter:.4f}",
-                        loss_train=f"{params['loss_train']:.6f}" if params["loss_train"] is not None else "None",
-                        loss_valid=f"{params['loss_valid']:.6f}" if params["loss_valid"] is not None else "None",
-                        loss_gt=f"{params['loss_gt']:.6f}" if params["loss_gt"] is not None else "None",
-                        elapsed=time_str,
+                if iteration % self.i_plot == 0:
+                    params, last_plot_time = self._run_validation(
+                        iteration,
+                        train_losses,
+                        start_time,
+                        last_plot_time,
                     )
+                    self._update_progress_bar(progress_bar, params)
 
-            self.precA1 = A1
-            self.precB1 = B1
-            self.precC1 = C1
-            self.precD1 = D1
-
-            if self.training_mode == "Slice":
-                img_i = np.random.randint(len(self.dataset.slices))
-                # target = self.dataset.slices[img_i].image.to(device)
-                target = self.dataset.get_slice_pixels(img_i).to(device)
-                density = self.slice_renderer.render_slice_from_dataset(self.nerf, img_i, jitter=self.jitter_training)
-
-            elif self.training_mode == "Random":
-                # indices = generator.choice(len(self.dataset.points), self.points_per_iter, replace=False)
-                if(stop_index > start_index) :
-                    indices = perm[start_index:stop_index]
-                else :
-                    indices = perm[start_index:-1]
-                    indices = torch.cat((indices,perm[0:stop_index]))
-                start_index = stop_index
-                stop_index = (start_index+self.points_per_iter)
-
-                if(stop_index >= len(self.dataset.points)) :
-                    stop_index = stop_index - len(self.dataset.points) + 1
-
-                target = self.dataset.get_indices_pixels(indices)
-                density = self.slice_renderer.query_random_positions(self.nerf,indices,reshaped=False)
-            else :
-                print("Training mode: ", self.training_mode, "not recognized or implemented")
-                exit(-1)
-
-            self.optimizer.zero_grad()
-
-            loss = mse(density, target)
-            
-            # 添加梯度一致性损失
-            if self.training_mode == "Slice":
-                # 对Slice模式，计算整个切片的梯度一致性
-                target_slice = torch.reshape(target, (self.dataset.px_height, self.dataset.px_width)).unsqueeze(0).unsqueeze(0)
-                density_slice = torch.reshape(density, (self.dataset.px_height, self.dataset.px_width)).unsqueeze(0).unsqueeze(0)
-                
-                # 计算梯度
-                target_grad_x = torch.nn.functional.conv2d(target_slice, self.scharr_x, padding=1)
-                target_grad_y = torch.nn.functional.conv2d(target_slice, self.scharr_y, padding=1)
-                
-                density_grad_x = torch.nn.functional.conv2d(density_slice, self.scharr_x, padding=1)
-                density_grad_y = torch.nn.functional.conv2d(density_slice, self.scharr_y, padding=1)
-                
-                # 梯度一致性损失
-                grad_loss = mse(density_grad_x, target_grad_x) + mse(density_grad_y, target_grad_y)
-                loss = loss + self.grad_weight * grad_loss
-            
-            loss.backward()
-            self.optimizer.step()
-
-            losses.append(loss.detach().cpu())
-
-        self.tb_writer.close()
-        progress_bar.close()
+                target, density = self._sample_training_batch()
+                self.optimizer.zero_grad()
+                loss = self._compute_training_loss(target, density)
+                loss.backward()
+                self.optimizer.step()
+                train_losses.append(float(loss.detach().cpu()))
+        finally:
+            self.tb_writer.close()
+            progress_bar.close()
 
     def getReferences(self):
-        return (torch.reshape(self.dataset.get_slice_valid_pixels(0), (self.dataset.px_height, self.dataset.px_width)),
-                torch.reshape(self.dataset.get_slice_valid_pixels(1), (self.dataset.px_height, self.dataset.px_width)),
-                torch.reshape(self.dataset.get_slice_valid_pixels(2), (self.dataset.px_height, self.dataset.px_width)),
-                torch.reshape(self.dataset.get_slice_valid_pixels(3), (self.dataset.px_height, self.dataset.px_width)))
+        references = [
+            self._reshape_valid_slice(self.dataset.get_slice_valid_pixels, index)
+            for index in range(len(VALIDATION_SLICE_NAMES))
+        ]
+        return tuple(references)
 
     def getGT(self):
-        if self.dataset.has_gt :
-            return (torch.reshape(self.dataset.get_slice_valid_gt(0), (self.dataset.px_height, self.dataset.px_width)),
-                    torch.reshape(self.dataset.get_slice_valid_gt(1), (self.dataset.px_height, self.dataset.px_width)),
-                    torch.reshape(self.dataset.get_slice_valid_gt(2), (self.dataset.px_height, self.dataset.px_width)),
-                    torch.reshape(self.dataset.get_slice_valid_gt(3), (self.dataset.px_height, self.dataset.px_width)))
-        return (None,None,None,None)
+        if not self.dataset.has_gt:
+            return (None, None, None, None)
+
+        gts = [
+            self._reshape_valid_slice(self.dataset.get_slice_valid_gt, index)
+            for index in range(len(VALIDATION_SLICE_NAMES))
+        ]
+        return tuple(gts)
 
     def getEncodingName(self):
         return self.nerf.get_encode_name()
@@ -386,6 +564,43 @@ class NeUF:
         return self.dataset.name
 
 
-if __name__ == "__main__":
-    neuf = NeUF(encoding = "Hash")
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train a NeUF model")
+    parser.add_argument("--dataset", default=DEFAULT_DATASET_PATH, help="Dataset folder or baked dataset path")
+    parser.add_argument("--checkpoint", default="", help="Checkpoint to resume from")
+    parser.add_argument("--encoding", default="Hash", choices=["Hash", "Freq", "None"])
+    parser.add_argument("--training-mode", default="Random", choices=["Random", "Slice"])
+    parser.add_argument("--points-per-iter", type=int, default=50000)
+    parser.add_argument("--nb-iters-max", type=int, default=8500)
+    parser.add_argument("--plot-freq", type=int, default=100)
+    parser.add_argument("--save-freq", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=19981708)
+    parser.add_argument("--grad-weight", type=float, default=0.1)
+    parser.add_argument("--root", default=".", help="Root folder for logs and latest checkpoint")
+    parser.add_argument("--raw-dataset", action="store_true", help="Treat --dataset as an unbaked folder")
+    parser.add_argument("--jitter-training", action="store_true", help="Enable point jitter during training")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    neuf = NeUF(
+        dataset=args.dataset,
+        checkpoint=args.checkpoint,
+        encoding=args.encoding,
+        training_mode=args.training_mode,
+        points_per_iter=args.points_per_iter,
+        nb_iters_max=args.nb_iters_max,
+        plot_freq=args.plot_freq,
+        save_freq=args.save_freq,
+        seed=args.seed,
+        grad_weight=args.grad_weight,
+        root=args.root,
+        baked_dataset=not args.raw_dataset,
+        jitter_training=args.jitter_training,
+    )
     neuf.run()
+
+
+if __name__ == "__main__":
+    main()
