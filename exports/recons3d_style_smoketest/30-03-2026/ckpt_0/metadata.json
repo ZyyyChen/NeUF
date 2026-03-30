@@ -1,0 +1,86 @@
+{
+  "method": "recons3d_style_masked_columnwise",
+  "ckpt": "latest/ckpt.pkl",
+  "dataset_pkl": "/home/zchen/Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Recalage/Patient0/us_recal_original/baked_dataset.pkl",
+  "bounds_dataset_pkl": "/home/zchen/Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Recalage/Patient0/us_recal_original/baked_dataset.pkl",
+  "grid_shape_zyx": [
+    37,
+    40,
+    48
+  ],
+  "spacing_mm_xyz": [
+    20.0,
+    20.0,
+    20.0
+  ],
+  "base_spacing_mm_xyz": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "resolution_scale": 0.05,
+  "point_min_mm": [
+    -471.5,
+    172.82444763183594,
+    -699.1565551757812
+  ],
+  "point_max_mm": [
+    471.5,
+    970.5919799804688,
+    28.666547775268555
+  ],
+  "row_k": 3,
+  "column_k": 2,
+  "slice_neighbours": 1,
+  "use_sequence_plane_mask": true,
+  "sequence_plane_mask_requested": true,
+  "sequence_plane_mask_source": "slice planes from /home/zchen/Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Recalage/Patient0/us_recal_original/infos.json",
+  "canonical_origin_mm": [
+    -0.0,
+    468.0098571777344,
+    12.056872367858887
+  ],
+  "canonical_row_axis": [
+    -1.4136393584056095e-16,
+    0.7352170944213867,
+    -0.6778317093849182
+  ],
+  "canonical_col_axis": [
+    -1.0,
+    -1.03933179324479e-16,
+    9.582095950016735e-17
+  ],
+  "canonical_sweep_axis": [
+    0.0,
+    0.677831768989563,
+    0.7352170944213867
+  ],
+  "canonical_row_bounds_mm": [
+    -9.598823517560959,
+    577.6647338867188
+  ],
+  "canonical_col_bounds_mm": [
+    -481.5,
+    481.5
+  ],
+  "slice_sweep_min_mm": -14.176798820495605,
+  "slice_sweep_max_mm": 19.566123962402344,
+  "num_slices_used": 245,
+  "active_voxels": 1440,
+  "filled_voxels": 871,
+  "total_voxels": 71040,
+  "anchor_points_shape": [
+    944,
+    2
+  ],
+  "mhd_grid_axis_order": [
+    "h",
+    "z",
+    "w"
+  ],
+  "mhd_grid_axis_mapping": {
+    "h": "-x",
+    "z": "-z",
+    "w": "-y"
+  }
+}

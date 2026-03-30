@@ -67,6 +67,7 @@ class Dataset:
 
         infos_json = self._load_infos(config)
         frame_keys = self._get_selected_frame_keys(infos_json, config.image_step)
+        self._compute_trimmed_height(config, frame_keys)
         frames = self._load_frames(config, infos_json, frame_keys)
 
         if not frames:
@@ -135,6 +136,7 @@ class Dataset:
         self.reverse_quat = config.reverse_quat
         self.nb_valid = config.nb_valid
         self.infos_json_path = ""
+        self.trimmed_px_height = 0
 
     def _apply_random_seed(self, seed: int) -> None:
         effective_seed = DEFAULT_SPLIT_SEED if seed == -1 else seed
@@ -212,6 +214,34 @@ class Dataset:
 
         frame_keys = sorted((key for key in infos_json.keys() if key != "infos"), key=lambda key: int(key))
         return frame_keys[::image_step]
+
+    def _compute_trimmed_height(self, config: DatasetLoadConfig, frame_keys: list[str]) -> None:
+        """Pre-scan all images to find the maximum non-black height, then update
+        self.trimmed_px_height and the physical self.height proportionally."""
+        roi_px_height = self.roi_2d["height"] if self.roi_2d else self.orig_px_height
+
+        max_trimmed = 0
+        for key in tqdm(frame_keys, desc="Computing trimmed heights"):
+            path = self._build_frame_path(
+                config.folder, config.img_folder, config.prefix, key, config.suffix
+            )
+            img = read_image(str(path), ImageReadMode.GRAY)
+            if self.roi_2d:
+                img = crop(
+                    img,
+                    self.roi_2d["y"], self.roi_2d["x"],
+                    self.roi_2d["height"], self.roi_2d["width"],
+                )
+            img = torch.squeeze(img)  # (H, W)
+            nonzero_rows = (img.sum(dim=-1) > 0).nonzero(as_tuple=False)
+            h = int(nonzero_rows[-1].item()) + 1 if len(nonzero_rows) > 0 else roi_px_height
+            max_trimmed = max(max_trimmed, h)
+
+        self.trimmed_px_height = max_trimmed
+        if roi_px_height > 0 and self.height > 0:
+            self.height = self.height * max_trimmed / roi_px_height
+
+        print(f"Auto-trimmed height: {max_trimmed} px (from {roi_px_height} px)")
 
     def _load_frames(self, config: DatasetLoadConfig, infos_json: dict, frame_keys: list[str]) -> list[FrameRecord]:
         frames: list[FrameRecord] = []
@@ -533,7 +563,12 @@ class Dataset:
                 self.roi_2d["width"],
             )
 
-        return torch.squeeze(image.float()).to(DEVICE)
+        image = torch.squeeze(image.float()).to(DEVICE)
+
+        if self.trimmed_px_height > 0:
+            image = image[: self.trimmed_px_height, :]
+
+        return image
 
     def get_bounding_box(self):
         return self.point_min_dev, self.point_max_dev

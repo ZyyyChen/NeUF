@@ -14,7 +14,7 @@ from utils import get_base_points, get_oriented_points_and_views
 
 
 # python .\export_full_grid_from_ckpt.py --ckpt .\latest\ckpt.pkl --output .\exports\full_grid
-# python export_full_grid_from_ckpt.py --ckpt latest/ckpt.pkl --output export/full_grid
+# python export_full_grid_from_ckpt.py --ckpt latest/ckpt.pkl --output exports/full_grid
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -66,10 +66,10 @@ def parse_args():
         help="Only query points inside checkpoint bounding box",
     )
     parser.add_argument(
-        "--use-sequence-plane-mask",
-        action="store_false",
+        "--disable-sequence-plane-mask",
+        action="store_true",
         dest="disable_sequence_plane_mask",
-        help="Enable querying only points between the first and last slice boundary planes of the sequence. Outside voxels stay black.",
+        help="Disable querying only points between the first and last slice boundary planes of the sequence.",
     )
     parser.add_argument(
         "--save-large-npy",
