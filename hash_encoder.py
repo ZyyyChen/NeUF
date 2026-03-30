@@ -74,7 +74,7 @@ class HashEncoder(nn.Module):
         return torch.cat(x_embedded_all, dim=-1)
 
 
-def get_hash_encoder(use_encoding, bounding_box, n_levels=16, n_features_per_level=2,
+def get_hash_encoder(use_encoding, bounding_box, n_levels=16, n_features_per_level=4,
                 log2_hashmap_size=19, base_resolution=16, finest_resolution=512):
     if not use_encoding:
         return nn.Identity(), 3, []
