@@ -53,6 +53,10 @@ def parse_args():
     parser.add_argument("--ckpt", type=Path, required=True, help="Path to checkpoint .pkl")
     parser.add_argument("--output", type=Path, required=True, help="Output directory")
     parser.add_argument(
+        "--exact-output-dir", type=Path, default=None,
+        help="Write directly into this directory instead of auto-creating a dated ckpt_* folder.",
+    )
+    parser.add_argument(
         "--k", type=int, default=3,
         help="Number of nearest neighbours for IDW interpolation (default: 3)",
     )
@@ -88,6 +92,10 @@ def parse_args():
         help="Number of voxels queried per KDTree batch (default: 200000).",
     )
     parser.add_argument(
+        "--query-workers", type=int, default=-1,
+        help="Worker threads passed to KDTree.query (default: -1, use all local cores).",
+    )
+    parser.add_argument(
         "--use-bbox-mask",
         action="store_true",
         help="Only interpolate voxels inside the checkpoint bounding box.",
@@ -97,6 +105,14 @@ def parse_args():
         action="store_true",
         dest="disable_sequence_plane_mask",
         help="Disable querying only voxels between the first and last slice boundary planes.",
+    )
+    parser.add_argument(
+        "--shard-rank", type=int, default=0,
+        help="Index of this z-shard among --shard-world-size shards (default: 0).",
+    )
+    parser.add_argument(
+        "--shard-world-size", type=int, default=1,
+        help="Total number of z-shards used to split the export (default: 1).",
     )
     return parser.parse_args()
 
@@ -117,6 +133,21 @@ def make_dated_output_dir(base_output_dir: Path, ckpt_path: Path) -> Path:
             candidate.mkdir(parents=True, exist_ok=False)
             return candidate
         num += 1
+
+
+def resolve_output_dir(base_output_dir: Path, ckpt_path: Path, exact_output_dir: Path | None) -> Path:
+    if exact_output_dir is None:
+        return make_dated_output_dir(base_output_dir, ckpt_path)
+
+    exact_output_dir = exact_output_dir.expanduser()
+    if exact_output_dir.exists():
+        if any(exact_output_dir.iterdir()):
+            raise FileExistsError(
+                f"Exact output directory already exists and is not empty: {exact_output_dir}"
+            )
+    else:
+        exact_output_dir.mkdir(parents=True, exist_ok=False)
+    return exact_output_dir
 
 
 def load_dataset_from_ckpt(ckpt_path: Path):
@@ -174,6 +205,18 @@ def build_axes(point_min: np.ndarray, point_max: np.ndarray, spacing_xyz: np.nda
         axis = point_min[dim] + (np.arange(count, dtype=np.float32) + 0.5) * spacing_xyz[dim]
         axes.append(axis)
     return axes  # [x_axis, y_axis, z_axis]
+
+
+def get_shard_range(total_count: int, shard_rank: int, shard_world_size: int) -> tuple[int, int]:
+    if shard_world_size <= 0:
+        raise ValueError("--shard-world-size must be >= 1")
+    if shard_rank < 0 or shard_rank >= shard_world_size:
+        raise ValueError(
+            f"--shard-rank must be in [0, {shard_world_size - 1}], got {shard_rank}"
+        )
+    start = (total_count * shard_rank) // shard_world_size
+    stop = (total_count * (shard_rank + 1)) // shard_world_size
+    return start, stop
 
 
 def save_mhd(volume_zyx: np.ndarray, output_dir: Path, spacing_xyz: np.ndarray) -> None:
@@ -398,6 +441,7 @@ def knn_interpolate(
     k: int,
     max_dist: float | None,
     chunk_size: int,
+    query_workers: int,
 ) -> np.ndarray:
     """
     Inverse-distance-weighted interpolation for query_points using a pre-built KDTree.
@@ -410,7 +454,7 @@ def knn_interpolate(
         stop = min(start + chunk_size, len(query_points))
         batch = query_points[start:stop]
 
-        dists, idxs = tree.query(batch, k=k, workers=-1)
+        dists, idxs = tree.query(batch, k=k, workers=query_workers)
 
         if k == 1:
             dists = dists[:, None]
@@ -443,7 +487,7 @@ def knn_interpolate(
 
 def main():
     args = parse_args()
-    output_dir = make_dated_output_dir(args.output, args.ckpt)
+    output_dir = resolve_output_dir(args.output, args.ckpt, args.exact_output_dir)
     print(f"Output directory: {output_dir}")
     print(f"Checkpoint/data load device: {LOAD_DEVICE}")
 
@@ -470,11 +514,26 @@ def main():
     x_axis, y_axis, z_axis = build_axes(point_min, point_max, spacing_xyz)
     bb_min, bb_max = to_numpy_bbox(ckpt)
 
-    grid_shape = (len(z_axis), len(y_axis), len(x_axis))
-    print(f"Grid shape (z, y, x): {grid_shape}")
+    full_grid_shape = (len(z_axis), len(y_axis), len(x_axis))
+    shard_z_start, shard_z_stop = get_shard_range(
+        len(z_axis), args.shard_rank, args.shard_world_size
+    )
+    local_z_axis = z_axis[shard_z_start:shard_z_stop]
+    if len(local_z_axis) == 0:
+        raise ValueError(
+            "Resolved shard contains no z slices. Reduce --shard-world-size or use a finer grid."
+        )
+
+    grid_shape = (len(local_z_axis), len(y_axis), len(x_axis))
+    print(f"Global grid shape (z, y, x): {full_grid_shape}")
+    print(
+        f"Shard {args.shard_rank}/{args.shard_world_size - 1}: "
+        f"z indices [{shard_z_start}, {shard_z_stop}) -> local grid {grid_shape}"
+    )
     print(f"Spacing (x, y, z) mm: {spacing_xyz.tolist()}")
     print(f"Point min (x, y, z) mm: {point_min.tolist()}")
     print(f"Point max (x, y, z) mm: {point_max.tolist()}")
+    print(f"KDTree query workers: {args.query_workers}")
 
     use_sequence_plane_mask = not args.disable_sequence_plane_mask
     plane_mask_data = get_sequence_plane_mask_data(baked_dataset, dataset_path) if use_sequence_plane_mask else None
@@ -504,7 +563,7 @@ def main():
 
     # ---- Build query grid ----
     print("Building query grid...")
-    query_points = build_query_points(x_axis, y_axis, z_axis)
+    query_points = build_query_points(x_axis, y_axis, local_z_axis)
 
     active_mask = np.ones((query_points.shape[0],), dtype=bool)
     if args.use_bbox_mask:
@@ -512,15 +571,15 @@ def main():
     if plane_mask_data is not None:
         active_mask &= compute_sequence_plane_mask(query_points, plane_mask_data)
 
-    total_voxels = query_points.shape[0]
+    local_total_voxels = query_points.shape[0]
     active_voxels = int(np.count_nonzero(active_mask))
-    print(f"Total voxels to fill: {total_voxels:,}")
+    print(f"Local voxels to fill: {local_total_voxels:,}")
     if args.use_bbox_mask or plane_mask_data is not None:
-        print(f"Active voxels after masking: {active_voxels:,} / {total_voxels:,}")
+        print(f"Active voxels after masking: {active_voxels:,} / {local_total_voxels:,}")
 
     # ---- KNN interpolation ----
     print(f"\nRunning KNN interpolation (k={args.k}, max_dist={args.max_dist})...")
-    flat_values = np.zeros(total_voxels, dtype=np.float32)
+    flat_values = np.zeros(local_total_voxels, dtype=np.float32)
     if active_voxels > 0:
         flat_values[active_mask] = knn_interpolate(
             tree,
@@ -529,12 +588,16 @@ def main():
             k=args.k,
             max_dist=args.max_dist,
             chunk_size=args.chunk_size,
+            query_workers=args.query_workers,
         )
 
     volume_zyx = flat_values.reshape(grid_shape)  # (nz, ny, nx)
 
     filled = np.count_nonzero(flat_values)
-    print(f"Filled voxels: {filled:,} / {total_voxels:,} ({100*filled/total_voxels:.1f}%)")
+    print(
+        f"Filled voxels: {filled:,} / {local_total_voxels:,} "
+        f"({100 * filled / local_total_voxels:.1f}%)"
+    )
     print(f"Intensity range: [{volume_zyx.min():.2f}, {volume_zyx.max():.2f}]")
 
     # ---- Save ----
@@ -554,6 +617,7 @@ def main():
         "point_min_mm": point_min.tolist(),
         "point_max_mm": point_max.tolist(),
         "grid_shape_zyx": list(grid_shape),
+        "global_grid_shape_zyx": list(full_grid_shape),
         "total_observation_points": int(len(src_points)),
         "use_bbox_mask": bool(args.use_bbox_mask),
         "use_sequence_plane_mask": bool(plane_mask_data is not None),
@@ -561,7 +625,14 @@ def main():
         "sequence_plane_mask_source": None if plane_mask_data is None else plane_mask_data.get("source"),
         "active_voxels_after_masking": int(active_voxels),
         "filled_voxels": int(filled),
-        "total_voxels": int(total_voxels),
+        "total_voxels": int(local_total_voxels),
+        "global_total_voxels": int(np.prod(full_grid_shape, dtype=np.int64)),
+        "query_workers": int(args.query_workers),
+        "shard_rank": int(args.shard_rank),
+        "shard_world_size": int(args.shard_world_size),
+        "shard_axis": "z",
+        "shard_z_start": int(shard_z_start),
+        "shard_z_stop": int(shard_z_stop),
         "mhd_grid_axis_order": ["h", "z", "w"],
         "mhd_grid_axis_mapping": {"h": "-x", "z": "-z", "w": "-y"},
     }

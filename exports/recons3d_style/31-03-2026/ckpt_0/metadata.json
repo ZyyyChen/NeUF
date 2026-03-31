@@ -4,21 +4,21 @@
   "dataset_pkl": "/home/zchen/Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Recalage/Patient0/us_recal_original/baked_dataset.pkl",
   "bounds_dataset_pkl": "/home/zchen/Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Recalage/Patient0/us_recal_original/baked_dataset.pkl",
   "grid_shape_zyx": [
-    37,
-    40,
-    48
+    728,
+    798,
+    943
   ],
   "spacing_mm_xyz": [
-    20.0,
-    20.0,
-    20.0
+    1.0,
+    1.0,
+    1.0
   ],
   "base_spacing_mm_xyz": [
     1.0,
     1.0,
     1.0
   ],
-  "resolution_scale": 0.05,
+  "resolution_scale": 1.0,
   "point_min_mm": [
     -471.5,
     172.82444763183594,
@@ -56,19 +56,19 @@
     0.7352170944213867
   ],
   "canonical_row_bounds_mm": [
-    -9.598823517560959,
-    577.6647338867188
+    -0.09882351756095886,
+    568.1647338867188
   ],
   "canonical_col_bounds_mm": [
-    -481.5,
-    481.5
+    -472.0,
+    472.0
   ],
   "slice_sweep_min_mm": -14.176798820495605,
   "slice_sweep_max_mm": 19.566123962402344,
   "num_slices_used": 245,
-  "active_voxels": 1440,
-  "filled_voxels": 871,
-  "total_voxels": 71040,
+  "active_voxels": 9354560,
+  "filled_voxels": 5985321,
+  "total_voxels": 547830192,
   "anchor_points_shape": [
     944,
     2

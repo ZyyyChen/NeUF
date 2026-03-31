@@ -195,7 +195,7 @@ def estimate_export_bytes(grid_shape_zyx, baked_dataset, save_large_npy, save_gt
     total = 0
 
     # Main queried volume: one raw always, plus optional zyx/hzw npy snapshots.
-    total += array_nbytes(grid_shape_zyx, np.float32)
+    total += array_nbytes(grid_shape_zyx, np.uint8)
     if save_large_npy:
         total += 2 * array_nbytes(grid_shape_zyx, np.float32)
 
@@ -366,6 +366,32 @@ def save_stacked_mhd_wzh(volume_zhw, output_dir: Path, base_name: str, spacing_w
     volume_hzw = np.flip(volume_hzw, axis=0)
     dim_sizes = (volume_zhw.shape[2], volume_zhw.shape[0], volume_zhw.shape[1])
     save_mhd_array(volume_hzw.astype(np.float32), output_dir, base_name, dim_sizes, spacing_wzh, element_type="MET_FLOAT")
+
+
+def stretch_volume_to_uint8_preserve_zero_background(
+    volume: np.ndarray,
+) -> tuple[np.ndarray, float | None, float | None, int]:
+    volume = np.asarray(volume, dtype=np.float32)
+    volume_uint8 = np.zeros_like(volume, dtype=np.uint8)
+    foreground_mask = volume != 0.0
+    foreground_count = int(np.count_nonzero(foreground_mask))
+
+    if foreground_count == 0:
+        return volume_uint8, None, None, foreground_count
+
+    foreground_values = volume[foreground_mask]
+    min_val = float(np.min(foreground_values))
+    max_val = float(np.max(foreground_values))
+    value_range = max_val - min_val
+
+    if value_range > 0.0:
+        # Reserve 0 for background and spread foreground into 1..255.
+        scaled = ((foreground_values - min_val) / value_range * 254.0) + 1.0
+        volume_uint8[foreground_mask] = scaled.astype(np.uint8)
+    else:
+        volume_uint8[foreground_mask] = 255
+
+    return volume_uint8, min_val, max_val, foreground_count
 
 
 def normalize_vector(vec):
@@ -692,12 +718,26 @@ def main():
     if args.save_large_npy:
         np.save(output_dir / "volume_zyx.npy", volume_zyx)
     volume = convert_grid_zyx_to_hzw(volume_zyx).astype(np.float32, copy=False)
+    (
+        volume_uint8,
+        volume_export_min,
+        volume_export_max,
+        volume_foreground_count,
+    ) = stretch_volume_to_uint8_preserve_zero_background(volume)
+    if volume_foreground_count > 0:
+        print(
+            "Export intensity normalization: "
+            f"background stays 0, foreground min-max "
+            f"[{volume_export_min:.6f}, {volume_export_max:.6f}] -> [1, 255]"
+        )
+    else:
+        print("Export intensity normalization: volume is all background zeros")
     if args.save_large_npy:
         np.save(output_dir / "volume.npy", volume)
         np.save(output_dir / "x_axis.npy", x_axis)
         np.save(output_dir / "y_axis.npy", y_axis)
         np.save(output_dir / "z_axis.npy", z_axis)
-    save_grid_mhd_hzw(volume, output_dir, "volume", spacing_xyz, element_type="MET_FLOAT")
+    save_grid_mhd_hzw(volume_uint8, output_dir, "volume", spacing_xyz, element_type="MET_UCHAR")
 
     stacked_slice_volume = None
 
@@ -758,6 +798,11 @@ def main():
         "bounding_box_min_mm": bb_min.tolist(),
         "bounding_box_max_mm": bb_max.tolist(),
         "shape_hzw": list(volume.shape),
+        "export_element_type": "MET_UCHAR",
+        "export_intensity_normalization": "preserve_zero_background_foreground_min_max_to_1_255",
+        "export_intensity_normalization_min": volume_export_min,
+        "export_intensity_normalization_max": volume_export_max,
+        "export_intensity_normalization_foreground_voxels": volume_foreground_count,
         "gt_stacked_slices_shape_zhw": list(stacked_slice_volume.shape) if stacked_slice_volume is not None else None,
         "gt_stacked_mhd_axis_order": ["width", "Z", "height"] if stacked_slice_volume is not None else None,
         "use_bbox_mask": args.use_bbox_mask,
