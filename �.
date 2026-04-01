@@ -1,0 +1,9 @@
+#!/bin/sh
+#PBS -l walltime=24:00:00
+#PBS -N interactif
+#PBS -l nodes=1:ppn=16:gpus=1:gpu48
+#PBS -q gpu
+#PBS -l mem=128gb
+#PBS -M ziyi.chen@creatis.insa-lyon.fr
+#PBS -o /home/zchen/history/output.txt
+#PBS -e /home/zchen/history/error.txt

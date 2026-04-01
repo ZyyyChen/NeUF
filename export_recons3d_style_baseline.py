@@ -88,6 +88,10 @@ def parse_args():
         help="Number of in-plane neighbours used to fill residual holes after recons voxelization.",
     )
     parser.add_argument(
+        "--hole-fill-max-iters", type=int, default=3,
+        help="Maximum number of iterative plane-wise hole-filling passes (default: 3).",
+    )
+    parser.add_argument(
         "--disable-hole-fill",
         action="store_true",
         help="Skip the final in-plane hole-filling pass.",
@@ -595,6 +599,22 @@ def build_recons_mask_2d(xp, zp, pts_aug=9, closing_size=3):
     return closed.astype(np.uint8)
 
 
+def build_planewise_support_mask(occupied_mask_zyx, closing_size=3):
+    structure = np.ones((closing_size, closing_size), dtype=bool)
+    support_mask = np.zeros_like(occupied_mask_zyx, dtype=bool)
+
+    for z_idx in tqdm(range(occupied_mask_zyx.shape[0]), desc="Stage 3 support mask"):
+        occupied_2d = occupied_mask_zyx[z_idx]
+        if not np.any(occupied_2d):
+            continue
+
+        filled = binary_fill_holes(occupied_2d)
+        closed = binary_closing(filled, structure=structure)
+        support_mask[z_idx] = occupied_2d | closed
+
+    return support_mask
+
+
 def coord_to_fill_fortran(mask_2d):
     idx_mask = np.flatnonzero(mask_2d.ravel(order="F") > 0)
     X, Z = mask_2d.shape
@@ -927,6 +947,8 @@ def main():
     args = parse_args()
     if args.hole_fill_k <= 0:
         raise ValueError("--hole-fill-k must be >= 1")
+    if args.hole_fill_max_iters <= 0:
+        raise ValueError("--hole-fill-max-iters must be >= 1")
 
     output_dir = make_dated_output_dir(args.output, args.ckpt)
     print(f"Output directory: {output_dir}")
@@ -1036,26 +1058,46 @@ def main():
     if np.any(fill_from_stage2):
         volume_zyx[fill_from_stage2] = stage2_sum[fill_from_stage2] / stage2_count[fill_from_stage2].astype(np.float32)
     filled_mask = observed_mask | fill_from_stage2
-    support_mask = observed_mask | stage2_mask
     print(f"Recons intermediate samples voxelized: {recons_added:,}")
     print(f"Full-grid voxels filled by stage 2: {int(np.count_nonzero(fill_from_stage2)):,}")
     print(f"Sagittal slices contributing in stage 2: {contributing_sag_slices:,} / {data_recal.shape[1]:,}")
 
     hole_filled_voxels = 0
+    hole_fill_iterations = 0
+    support_mask = build_planewise_support_mask(filled_mask)
+    print(f"Plane-wise stage 3 support voxels: {int(np.count_nonzero(support_mask)):,}")
     if args.disable_hole_fill:
         print("Stage 3/3: hole filling disabled.")
     else:
         print("Stage 3/3: filling remaining blank full-grid voxels plane-wise...")
-        hole_filled_voxels = fill_remaining_holes(
-            volume_zyx,
-            filled_mask,
-            support_mask,
-            x_axis,
-            y_axis,
-            args.hole_fill_k,
-            args.chunk_size,
-        )
+        for iter_idx in range(1, args.hole_fill_max_iters + 1):
+            residual_before = int(np.count_nonzero(support_mask & (~filled_mask)))
+            print(f"  Stage 3 iteration {iter_idx}: residual support holes before fill = {residual_before:,}")
+            if residual_before == 0:
+                break
+
+            filled_this_iter = fill_remaining_holes(
+                volume_zyx,
+                filled_mask,
+                support_mask,
+                x_axis,
+                y_axis,
+                args.hole_fill_k,
+                args.chunk_size,
+            )
+            hole_filled_voxels += int(filled_this_iter)
+            hole_fill_iterations = iter_idx
+            print(f"  Stage 3 iteration {iter_idx}: filled = {filled_this_iter:,}")
+            if filled_this_iter == 0:
+                break
+
+            if iter_idx < args.hole_fill_max_iters:
+                support_mask = build_planewise_support_mask(filled_mask)
+
+        support_mask = build_planewise_support_mask(filled_mask)
+        residual_after = int(np.count_nonzero(support_mask & (~filled_mask)))
         print(f"Residual full-grid voxels filled in stage 3: {hole_filled_voxels:,}")
+        print(f"Residual support holes after stage 3: {residual_after:,}")
 
     filled = int(np.count_nonzero(filled_mask))
     supported = int(np.count_nonzero(support_mask))
@@ -1094,6 +1136,7 @@ def main():
         "recons_offset_x": float(offset_x),
         "recons_offset_z": float(offset_z),
         "hole_fill_k": int(args.hole_fill_k),
+        "hole_fill_max_iters": int(args.hole_fill_max_iters),
         "hole_fill_enabled": bool(not args.disable_hole_fill),
         "use_sequence_plane_mask": bool(plane_mask_data is not None),
         "sequence_plane_mask_requested": bool(use_sequence_plane_mask),
@@ -1104,6 +1147,7 @@ def main():
         "stage2_filled_voxels": int(np.count_nonzero(fill_from_stage2)),
         "stage2_contributing_sagittal_slices": int(contributing_sag_slices),
         "hole_filled_voxels": int(hole_filled_voxels),
+        "hole_fill_iterations": int(hole_fill_iterations),
         "supported_voxels": int(supported),
         "filled_voxels": int(filled),
         "total_voxels": int(total_voxels),

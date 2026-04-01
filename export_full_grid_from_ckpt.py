@@ -339,29 +339,29 @@ def save_mhd_named(volume_zyx, output_dir: Path, base_name: str, spacing_xyz, po
     mhd_path.write_text(header, encoding="ascii")
 
 
-def convert_grid_zyx_to_hzw(volume_zyx):
+def convert_grid_zyx_to_mhd(volume_zyx):
     # NeUF axes to exported volume axes:
     # h = -x, z = -z, w = -y
 
-    volume_hzw = volume_zyx
+    volume_mhd = volume_zyx
     # volume_hzw = np.transpose(volume_zyx, (1, 0, 2))
     # volume_hzw = np.flip(volume_hzw, axis=0)
-    volume_hzw = np.flip(volume_hzw, axis=2)
+    volume_mhd = np.flip(volume_mhd, axis=2)
     # volume_hzw = np.flip(volume_hzw, axis=1)
 
-    return volume_hzw
+    return volume_mhd
 
 
-def save_grid_mhd_hzw(volume_hzw, output_dir: Path, base_name: str, spacing_xyz, element_type="MET_FLOAT"):
+def save_grid_mhd_zyx(volume_mhd, output_dir: Path, base_name: str, spacing_xyz, element_type="MET_FLOAT"):
     # Match the notebook logic that already reads back correctly in MITK:
     # keep the array in (h, z, w), write it directly to raw,
     # and store DimSize / ElementSpacing in reversed order.
-    dim_sizes = (volume_hzw.shape[2], volume_hzw.shape[1], volume_hzw.shape[0])
+    dim_sizes = (volume_mhd.shape[2], volume_mhd.shape[1], volume_mhd.shape[0])
     spacing_sizes = (spacing_xyz[1], spacing_xyz[2], spacing_xyz[0])
-    save_mhd_array(volume_hzw, output_dir, base_name, dim_sizes, spacing_sizes, element_type=element_type)
+    save_mhd_array(volume_mhd, output_dir, base_name, dim_sizes, spacing_sizes, element_type=element_type)
 
 
-def save_stacked_mhd_wzh(volume_zhw, output_dir: Path, base_name: str, spacing_wzh):
+def save_stacked_mhd_zyx(volume_zhw, output_dir: Path, base_name: str, spacing_wzh):
     volume_hzw = np.transpose(volume_zhw, (1, 0, 2))
     volume_hzw = np.flip(volume_hzw, axis=0)
     dim_sizes = (volume_zhw.shape[2], volume_zhw.shape[0], volume_zhw.shape[1])
@@ -717,7 +717,7 @@ def main():
     print(f"Queried grid volume shape (z, y, x): {volume_zyx.shape}")
     if args.save_large_npy:
         np.save(output_dir / "volume_zyx.npy", volume_zyx)
-    volume = convert_grid_zyx_to_hzw(volume_zyx).astype(np.float32, copy=False)
+    volume = convert_grid_zyx_to_mhd(volume_zyx).astype(np.float32, copy=False)
     (
         volume_uint8,
         volume_export_min,
@@ -737,7 +737,7 @@ def main():
         np.save(output_dir / "x_axis.npy", x_axis)
         np.save(output_dir / "y_axis.npy", y_axis)
         np.save(output_dir / "z_axis.npy", z_axis)
-    save_grid_mhd_hzw(volume_uint8, output_dir, "volume", spacing_xyz, element_type="MET_UCHAR")
+    save_grid_mhd_zyx(volume_uint8, output_dir, "volume", spacing_xyz, element_type="MET_UCHAR")
 
     stacked_slice_volume = None
 
@@ -768,7 +768,7 @@ def main():
         )
         if args.save_large_npy:
             np.save(output_dir / "gt_stacked_slices.npy", stacked_slice_volume)
-        save_stacked_mhd_wzh(
+        save_stacked_mhd_zyx(
             stacked_slice_volume,
             output_dir,
             "gt_stacked_slices",

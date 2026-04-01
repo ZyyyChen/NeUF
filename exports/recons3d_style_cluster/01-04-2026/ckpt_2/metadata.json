@@ -1,0 +1,94 @@
+{
+  "method": "saved_recons3d_then_voxelize_to_full_grid",
+  "ckpt": "/misc/raid/zchen/Code/NeUF/latest/ckpt.pkl",
+  "dataset_pkl": "/home/zchen/Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Recalage/Patient0/us_recal_original/baked_dataset.pkl",
+  "bounds_dataset_pkl": "/home/zchen/Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Recalage/Patient0/us_recal_original/baked_dataset.pkl",
+  "recons_ref": "Patient0_J35_2",
+  "data_recal_mat": "/home/zchen/Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Recalage/Patient0/data_recal_Patient0_J35_2_d_0.5.mat",
+  "recons_points_mat": "/home/zchen/Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Reconstruction_3D/Patient0/data_3D_Patient0_J35_2_reconstruction_points.mat",
+  "recons_sagplan_mat": "/home/zchen/Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Reconstruction_3D/Patient0/data_3D_Patient0_J35_2_sagplan_params.mat",
+  "grid_shape_zyx": [
+    728,
+    798,
+    943
+  ],
+  "spacing_mm_xyz": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "base_spacing_mm_xyz": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "resolution_scale": 1.0,
+  "point_min_mm": [
+    -471.5,
+    172.82444763183594,
+    -699.1565551757812
+  ],
+  "point_max_mm": [
+    471.5,
+    970.5919799804688,
+    28.666547775268555
+  ],
+  "data_recal_shape": [
+    242,
+    944,
+    708
+  ],
+  "delta_x_cc_mm": 1.0,
+  "delta_x_seqdyn_mm": 1.0,
+  "saved_idx_sag": 478,
+  "x_transform": [
+    -29.99999999681971,
+    372.4532473335893,
+    -0.07999999999999996,
+    1.2000279020113267,
+    18.987066915341938,
+    0.002218638879647406,
+    -0.20141920395035143
+  ],
+  "xp_min_max": [
+    1.0,
+    309.8604736328125
+  ],
+  "zp_min_max": [
+    323.0076599121094,
+    1478.7838134765625
+  ],
+  "recons_mask_shape_xz": [
+    311,
+    1480
+  ],
+  "recons_mask_voxels_per_plane": 214720,
+  "recons_offset_x": 83.64138649796158,
+  "recons_offset_z": 1.0,
+  "hole_fill_k": 4,
+  "hole_fill_max_iters": 3,
+  "hole_fill_enabled": true,
+  "use_sequence_plane_mask": true,
+  "sequence_plane_mask_requested": true,
+  "sequence_plane_mask_source": "slice planes from /home/zchen/Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Recalage/Patient0/us_recal_original/infos.json",
+  "observed_voxels": 138669093,
+  "stage2_grid_voxels": 73476980,
+  "stage2_added_samples": 84140340,
+  "stage2_filled_voxels": 73476980,
+  "stage2_contributing_sagittal_slices": 940,
+  "hole_filled_voxels": 72082906,
+  "hole_fill_iterations": 1,
+  "supported_voxels": 284228979,
+  "filled_voxels": 284228979,
+  "total_voxels": 547830192,
+  "mhd_grid_axis_order": [
+    "h",
+    "z",
+    "w"
+  ],
+  "mhd_grid_axis_mapping": {
+    "h": "-x",
+    "z": "-z",
+    "w": "-y"
+  }
+}
