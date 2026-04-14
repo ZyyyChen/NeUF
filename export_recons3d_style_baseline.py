@@ -552,8 +552,11 @@ def determine_transform_v2(coord_pts_img_ref, coord_pts_img_seqdyn, data_recal):
 def data_transform_v2(data_recal, X_transform):
     Cx, Ct, vx, vt, delta, omega, theta = X_transform
 
-    n_rows = data_recal.shape[0]
-    n_cols = data_recal.shape[2]
+    # data_recal is indexed as (frame, sagittal, depth).
+    # We want r to represent in-frame depth and t to represent the frame/sweep index,
+    # so the reconstructed common-grid coordinates are stored as [depth_idx, frame_idx].
+    n_rows = data_recal.shape[2]
+    n_cols = data_recal.shape[0]
 
     r = np.arange(1, n_rows + 1, dtype=np.float64).reshape(-1, 1)
     t = np.arange(1, n_cols + 1, dtype=np.float64).reshape(1, -1)
@@ -565,6 +568,8 @@ def data_transform_v2(data_recal, X_transform):
     offset_z = np.abs(np.minimum(np.min(zp), 0.0)) + 1.0
     xp += offset_x
     zp += offset_z
+    np.save("xp.npy", xp)
+    np.save("zp.npy", zp)
     return xp.astype(np.float32), zp.astype(np.float32), float(offset_x), float(offset_z)
 
 
@@ -632,17 +637,21 @@ def coord_to_fill_fortran(mask_2d):
 def precompute_recons_neighbours(coord_mask_xz, xp, zp, nb_pts=3):
     if nb_pts != 3:
         raise ValueError("This exporter currently supports the recons3D default nb_pts=3 only.")
+    if xp.shape != zp.shape:
+        raise ValueError(f"xp/zp shape mismatch: {xp.shape} vs {zp.shape}")
 
     n_voxels = coord_mask_xz.shape[0]
-    n_frames, n_depth = xp.shape
+    n_depth, n_frames = xp.shape
 
-    best_mid = np.full((n_voxels,), -1, dtype=np.int32)
+    # xp/zp are indexed as [depth_idx, frame_idx].
+    # For each frame, varying depth traces one curvilinear sweep in the common x-z plane.
+    best_frame = np.full((n_voxels,), -1, dtype=np.int32)
     best_first = np.full((n_voxels,), np.inf, dtype=np.float32)
-    best_idxs = np.zeros((n_voxels, nb_pts), dtype=np.int32)
+    best_depth_idxs = np.zeros((n_voxels, nb_pts), dtype=np.int32)
     best_dists = np.full((n_voxels, nb_pts), np.inf, dtype=np.float32)
 
-    for depth_idx in tqdm(range(n_depth), desc="Stage 2 KNN columns (pass 1/2)"):
-        points_i = np.column_stack((xp[:, depth_idx], zp[:, depth_idx])).astype(np.float32, copy=False)
+    for frame_idx in tqdm(range(n_frames), desc="Stage 2 KNN sweep curves (pass 1/2)"):
+        points_i = np.column_stack((xp[:, frame_idx], zp[:, frame_idx])).astype(np.float32, copy=False)
         tree = cKDTree(points_i)
         dists, idxs = tree.query(coord_mask_xz, k=nb_pts, workers=-1)
         if nb_pts == 1:
@@ -651,63 +660,63 @@ def precompute_recons_neighbours(coord_mask_xz, xp, zp, nb_pts=3):
         update = dists[:, 0] < best_first
         if np.any(update):
             best_first[update] = dists[update, 0].astype(np.float32, copy=False)
-            best_mid[update] = depth_idx
-            best_idxs[update] = idxs[update].astype(np.int32, copy=False)
+            best_frame[update] = frame_idx
+            best_depth_idxs[update] = idxs[update].astype(np.int32, copy=False)
             best_dists[update] = dists[update].astype(np.float32, copy=False)
 
-    left_col = np.where(best_mid > 0, best_mid - 1, -1).astype(np.int32)
-    right_col = np.where(best_mid < n_depth - 1, best_mid + 1, -1).astype(np.int32)
+    left_frame = np.where(best_frame > 0, best_frame - 1, -1).astype(np.int32)
+    right_frame = np.where(best_frame < n_frames - 1, best_frame + 1, -1).astype(np.int32)
 
     left_first = np.full((n_voxels,), np.inf, dtype=np.float32)
     right_first = np.full((n_voxels,), np.inf, dtype=np.float32)
-    left_idxs = np.zeros((n_voxels, nb_pts), dtype=np.int32)
-    right_idxs = np.zeros((n_voxels, nb_pts), dtype=np.int32)
+    left_depth_idxs = np.zeros((n_voxels, nb_pts), dtype=np.int32)
+    right_depth_idxs = np.zeros((n_voxels, nb_pts), dtype=np.int32)
     left_dists = np.full((n_voxels, nb_pts), np.inf, dtype=np.float32)
     right_dists = np.full((n_voxels, nb_pts), np.inf, dtype=np.float32)
 
-    needed_cols = sorted(set(left_col[left_col >= 0].tolist()) | set(right_col[right_col >= 0].tolist()))
-    for depth_idx in tqdm(needed_cols, desc="Stage 2 KNN columns (pass 2/2)"):
-        points_i = np.column_stack((xp[:, depth_idx], zp[:, depth_idx])).astype(np.float32, copy=False)
+    needed_frames = sorted(set(left_frame[left_frame >= 0].tolist()) | set(right_frame[right_frame >= 0].tolist()))
+    for frame_idx in tqdm(needed_frames, desc="Stage 2 KNN sweep curves (pass 2/2)"):
+        points_i = np.column_stack((xp[:, frame_idx], zp[:, frame_idx])).astype(np.float32, copy=False)
         tree = cKDTree(points_i)
         dists, idxs = tree.query(coord_mask_xz, k=nb_pts, workers=-1)
         if nb_pts == 1:
             dists = dists[:, None]
             idxs = idxs[:, None]
 
-        mask_left = left_col == depth_idx
+        mask_left = left_frame == frame_idx
         if np.any(mask_left):
             left_first[mask_left] = dists[mask_left, 0].astype(np.float32, copy=False)
-            left_idxs[mask_left] = idxs[mask_left].astype(np.int32, copy=False)
+            left_depth_idxs[mask_left] = idxs[mask_left].astype(np.int32, copy=False)
             left_dists[mask_left] = dists[mask_left].astype(np.float32, copy=False)
 
-        mask_right = right_col == depth_idx
+        mask_right = right_frame == frame_idx
         if np.any(mask_right):
             right_first[mask_right] = dists[mask_right, 0].astype(np.float32, copy=False)
-            right_idxs[mask_right] = idxs[mask_right].astype(np.int32, copy=False)
+            right_depth_idxs[mask_right] = idxs[mask_right].astype(np.int32, copy=False)
             right_dists[mask_right] = dists[mask_right].astype(np.float32, copy=False)
 
     choose_right = np.zeros((n_voxels,), dtype=bool)
-    interior = (best_mid > 0) & (best_mid < n_depth - 1)
+    interior = (best_frame > 0) & (best_frame < n_frames - 1)
     choose_right[interior] = right_first[interior] < left_first[interior]
-    choose_right[best_mid == 0] = True
+    choose_right[best_frame == 0] = True
 
-    neighbour_col = np.where(choose_right, right_col, left_col).astype(np.int32)
-    neighbour_idxs = np.where(choose_right[:, None], right_idxs, left_idxs).astype(np.int32)
+    neighbour_frame = np.where(choose_right, right_frame, left_frame).astype(np.int32)
+    neighbour_depth_idxs = np.where(choose_right[:, None], right_depth_idxs, left_depth_idxs).astype(np.int32)
     neighbour_dists = np.where(choose_right[:, None], right_dists, left_dists).astype(np.float32)
 
-    base_depth_cols = np.concatenate([
-        np.repeat(best_mid[:, None], nb_pts, axis=1),
-        np.repeat(neighbour_col[:, None], nb_pts, axis=1),
+    base_frame_idxs = np.concatenate([
+        np.repeat(best_frame[:, None], nb_pts, axis=1),
+        np.repeat(neighbour_frame[:, None], nb_pts, axis=1),
     ], axis=1).astype(np.int32)
-    base_frame_idxs = np.concatenate([best_idxs, neighbour_idxs], axis=1).astype(np.int32)
+    base_depth_idxs = np.concatenate([best_depth_idxs, neighbour_depth_idxs], axis=1).astype(np.int32)
     base_dists = np.concatenate([best_dists, neighbour_dists], axis=1).astype(np.float32)
 
     return {
         "coord_mask_xz": coord_mask_xz.astype(np.float32),
-        "best_mid_col": best_mid.astype(np.int32),
-        "neighbour_col": neighbour_col.astype(np.int32),
-        "base_depth_cols": base_depth_cols,
+        "best_mid_frame": best_frame.astype(np.int32),
+        "neighbour_frame": neighbour_frame.astype(np.int32),
         "base_frame_idxs": base_frame_idxs,
+        "base_depth_idxs": base_depth_idxs,
         "base_dists": base_dists,
     }
 
@@ -788,9 +797,13 @@ def voxelize_recons_intermediate(
         raise ValueError(
             f"Frame-count mismatch between data_recal ({n_frames}) and infos.json ({len(frame_records)})."
         )
+    if len(depth_axis) != data_recal.shape[2]:
+        raise ValueError(f"Depth-axis mismatch: {len(depth_axis)} vs {data_recal.shape[2]}")
+    if len(sag_axis) != n_sag:
+        raise ValueError(f"Sag-axis mismatch: {len(sag_axis)} vs {n_sag}")
 
-    base_depth_cols = recons_knn["base_depth_cols"]
     base_frame_idxs = recons_knn["base_frame_idxs"]
+    base_depth_idxs = recons_knn["base_depth_idxs"]
     base_dists = recons_knn["base_dists"]
     num_samples = base_frame_idxs.shape[1]
     num_voxels = base_frame_idxs.shape[0]
@@ -825,9 +838,15 @@ def voxelize_recons_intermediate(
 
         for sample_idx in range(num_samples):
             frame_idx = base_frame_idxs[:, sample_idx]
-            depth_idx = base_depth_cols[:, sample_idx]
+            depth_idx = base_depth_idxs[:, sample_idx]
             dist = base_dists[:, sample_idx]
-            valid = (depth_idx >= 0) & np.isfinite(dist)
+            valid = (
+                (frame_idx >= 0) &
+                (frame_idx < n_frames) &
+                (depth_idx >= 0) &
+                (depth_idx < plane_j.shape[1]) &
+                np.isfinite(dist)
+            )
             if not np.any(valid):
                 continue
 

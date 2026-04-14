@@ -1,0 +1,36 @@
+{
+  "ref": "Patient0_J35_2",
+  "data_recal_shape": [
+    242,
+    944,
+    708
+  ],
+  "xp_shape": [
+    708,
+    242
+  ],
+  "zp_shape": [
+    708,
+    242
+  ],
+  "data_3D_shape": [
+    724,
+    944,
+    905
+  ],
+  "data_3D_mask_shape": [
+    724,
+    944,
+    905
+  ],
+  "idx_sag": 478,
+  "delta_X_cc": 1.0,
+  "delta_X_seqdyn": 1.0,
+  "offset_x": 31.487239308294672,
+  "offset_z": 1.0,
+  "dataset_pkl": "/home/zchen/Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Recalage/Patient0/us_recal_original/baked_dataset.pkl",
+  "infos_json_path": "/home/zchen/Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Recalage/Patient0/us_recal_original/infos.json",
+  "output_mhd": "/home/zchen/Code/NeUF/exports/recons3d_exact_from_saved/test_patient0_j35_2.mhd",
+  "output_grid_h5": "/home/zchen/Code/NeUF/exports/recons3d_exact_from_saved/test_patient0_j35_2.h5",
+  "reconstruction_total_seconds": 477.46506823506206
+}

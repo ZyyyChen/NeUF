@@ -1,6 +1,7 @@
 import argparse
 import json
 import shutil
+import h5py
 from datetime import date
 from pathlib import Path
 
@@ -14,13 +15,17 @@ from utils import get_base_points, get_oriented_points_and_views
 
 
 # python .\export_full_grid_from_ckpt.py --ckpt .\latest\ckpt.pkl --output .\exports\full_grid
-# python export_full_grid_from_ckpt.py --ckpt latest/ckpt.pkl --output exports/full_grid
+# python export_full_grid_from_ckpt.py --ckpt latest/ckpt.pkl --output exports/full_grid --recons-common-grid-h5 /home/zchen/Code/NeUF/exports/recons3d_style_cluster/03-04-2026/ckpt_3/recons_common_grid.h5
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Export a full 3D grid volume from a NeUF checkpoint."
+        description=(
+            "Export a 3D volume from a NeUF checkpoint. "
+            "Supports the default baked-dataset full grid, an explicit Cartesian grid, "
+            "or the exact recons_common_grid.h5 support grid."
+        )
     )
     parser.add_argument("--ckpt", type=Path, required=True, help="Path to checkpoint .pkl")
     parser.add_argument("--output", type=Path, required=True, help="Output directory")
@@ -80,6 +85,30 @@ def parse_args():
         "--save-gt-exports",
         action="store_true",
         help="Save GT side products such as gt_stacked_slices.",
+    )
+    parser.add_argument(
+        "--x-axis-npy",
+        type=Path,
+        default=None,
+        help="Optional path to a 1D float32 .npy file of voxel-center x coordinates in mm.",
+    )
+    parser.add_argument(
+        "--y-axis-npy",
+        type=Path,
+        default=None,
+        help="Optional path to a 1D float32 .npy file of voxel-center y coordinates in mm.",
+    )
+    parser.add_argument(
+        "--z-axis-npy",
+        type=Path,
+        default=None,
+        help="Optional path to a 1D float32 .npy file of voxel-center z coordinates in mm.",
+    )
+    parser.add_argument(
+        "--recons-common-grid-h5",
+        type=Path,
+        default=None,
+        help="Optional path to a recons_common_grid.h5 bundle produced by export_recons3d_style_baseline.py.",
     )
     return parser.parse_args()
 
@@ -171,6 +200,143 @@ def build_axis(point_min, point_max, spacing_xyz):
         axis = point_min[dim] + (np.arange(count, dtype=np.float32) + 0.5) * spacing
         axes.append(axis)
     return axes
+
+
+def load_axis_npy(path: Path, axis_name: str):
+    axis = np.load(path)
+    axis = np.asarray(axis, dtype=np.float32).reshape(-1)
+    if axis.ndim != 1 or axis.size == 0:
+        raise ValueError(f"{axis_name} axis must be a non-empty 1D array, got shape {axis.shape}.")
+    if not np.all(np.isfinite(axis)):
+        raise ValueError(f"{axis_name} axis contains non-finite values.")
+    if axis.size > 1:
+        diffs = np.diff(axis.astype(np.float64))
+        if np.any(diffs <= 0):
+            raise ValueError(f"{axis_name} axis must be strictly increasing.")
+    return axis.astype(np.float32, copy=False)
+
+
+def infer_uniform_spacing_from_axis(axis: np.ndarray, axis_name: str):
+    if axis.size < 2:
+        raise ValueError(
+            f"{axis_name} axis must contain at least 2 entries to infer spacing for MHD export."
+        )
+    diffs = np.diff(axis.astype(np.float64))
+    spacing = float(np.mean(diffs))
+    atol = max(1e-5, abs(spacing) * 1e-4)
+    if not np.allclose(diffs, spacing, rtol=1e-4, atol=atol):
+        raise ValueError(
+            f"{axis_name} axis must be uniformly spaced for Cartesian MHD export. "
+            f"Observed step range: [{float(diffs.min())}, {float(diffs.max())}]"
+        )
+    return np.float32(spacing)
+
+
+def resolve_query_grid_spec(args, baked_dataset):
+    has_recons_grid = args.recons_common_grid_h5 is not None
+    has_axis_files = any(v is not None for v in (args.x_axis_npy, args.y_axis_npy, args.z_axis_npy))
+    has_minimal_cartesian = any(v is not None for v in (args.point_min, args.point_max, args.spacing))
+
+    if has_recons_grid and (has_axis_files or has_minimal_cartesian):
+        raise ValueError(
+            "--recons-common-grid-h5 cannot be combined with --x-axis-npy/--y-axis-npy/--z-axis-npy "
+            "or with --point-min/--point-max/--spacing."
+        )
+
+    if has_axis_files:
+        if not all(v is not None for v in (args.x_axis_npy, args.y_axis_npy, args.z_axis_npy)):
+            raise ValueError(
+                "When using direct Cartesian axes, you must provide all of "
+                "--x-axis-npy, --y-axis-npy, and --z-axis-npy."
+            )
+        if has_minimal_cartesian:
+            raise ValueError(
+                "--x-axis-npy/--y-axis-npy/--z-axis-npy cannot be combined with "
+                "--point-min/--point-max/--spacing."
+            )
+
+        x_axis = load_axis_npy(args.x_axis_npy, "x")
+        y_axis = load_axis_npy(args.y_axis_npy, "y")
+        z_axis = load_axis_npy(args.z_axis_npy, "z")
+        spacing_xyz = np.array([
+            infer_uniform_spacing_from_axis(x_axis, "x"),
+            infer_uniform_spacing_from_axis(y_axis, "y"),
+            infer_uniform_spacing_from_axis(z_axis, "z"),
+        ], dtype=np.float32)
+        point_min = np.array([
+            float(x_axis[0] - 0.5 * spacing_xyz[0]),
+            float(y_axis[0] - 0.5 * spacing_xyz[1]),
+            float(z_axis[0] - 0.5 * spacing_xyz[2]),
+        ], dtype=np.float32)
+        point_max = np.array([
+            float(x_axis[-1] + 0.5 * spacing_xyz[0]),
+            float(y_axis[-1] + 0.5 * spacing_xyz[1]),
+            float(z_axis[-1] + 0.5 * spacing_xyz[2]),
+        ], dtype=np.float32)
+        return {
+            "mode": "cartesian",
+            "source": "external_axes_npy",
+            "x_axis": x_axis,
+            "y_axis": y_axis,
+            "z_axis": z_axis,
+            "point_min": point_min,
+            "point_max": point_max,
+            "spacing_xyz": spacing_xyz,
+            "base_spacing_xyz": spacing_xyz.copy(),
+        }
+
+    if has_recons_grid:
+        bundle_path = args.recons_common_grid_h5
+        if not bundle_path.exists():
+            raise FileNotFoundError(f"recons_common_grid bundle not found: {bundle_path}")
+        with h5py.File(bundle_path, "r") as f:
+            required_keys = [
+                "data_3d_mask_uint8",
+                "coord_mask_xz_zero_based",
+                "active_sag_indices_zero_based",
+            ]
+            missing = [k for k in required_keys if k not in f]
+            if missing:
+                raise KeyError(
+                    f"{bundle_path} is missing required datasets for recons-grid export: {missing}"
+                )
+            common_shape = tuple(int(v) for v in f["data_3d_mask_uint8"].shape)
+            support_voxels = int(f["coord_mask_xz_zero_based"].shape[0])
+            active_sag_count = int(f["active_sag_indices_zero_based"].shape[0])
+            has_cached_world_coords = "support_world_coords_mm" in f
+        return {
+            "mode": "recons_common_grid",
+            "source": "recons_common_grid_h5",
+            "bundle_path": bundle_path,
+            "common_shape_x_sag_z": common_shape,
+            "support_voxels_per_plane": support_voxels,
+            "active_sag_count": active_sag_count,
+            "has_cached_world_coords": has_cached_world_coords,
+        }
+
+    point_min = (
+        np.array(baked_dataset.point_min, dtype=np.float32)
+        if args.point_min is None
+        else np.array(args.point_min, dtype=np.float32)
+    )
+    point_max = (
+        np.array(baked_dataset.point_max, dtype=np.float32)
+        if args.point_max is None
+        else np.array(args.point_max, dtype=np.float32)
+    )
+    spacing_xyz, base_spacing_xyz = resolve_spacing_xyz(args, baked_dataset)
+    x_axis, y_axis, z_axis = build_axis(point_min, point_max, spacing_xyz)
+    return {
+        "mode": "cartesian",
+        "source": "baked_dataset_defaults" if not has_minimal_cartesian else "point_min_point_max_spacing",
+        "x_axis": np.asarray(x_axis, dtype=np.float32),
+        "y_axis": np.asarray(y_axis, dtype=np.float32),
+        "z_axis": np.asarray(z_axis, dtype=np.float32),
+        "point_min": point_min,
+        "point_max": point_max,
+        "spacing_xyz": spacing_xyz,
+        "base_spacing_xyz": base_spacing_xyz,
+    }
 
 
 def flip_volume_xy(volume_zyx):
@@ -359,6 +525,188 @@ def save_grid_mhd_zyx(volume_mhd, output_dir: Path, base_name: str, spacing_xyz,
     dim_sizes = (volume_mhd.shape[2], volume_mhd.shape[1], volume_mhd.shape[0])
     spacing_sizes = (spacing_xyz[1], spacing_xyz[2], spacing_xyz[0])
     save_mhd_array(volume_mhd, output_dir, base_name, dim_sizes, spacing_sizes, element_type=element_type)
+
+
+def save_recons_common_grid_mhd(volume_x_sag_z, output_dir: Path, base_name: str = "volume", mask_x_sag_z=None):
+    """Save a volume defined on the recons common grid as MITK-readable MHD/raw.
+
+    The recons common grid is stored internally as (x_common, sagittal, z_common).
+    Historic recons3D MITK exports are read correctly when the raw array is
+    written as (z_common, x_common, sagittal) with the MHD header declaring
+    DimSize = (sagittal, x_common, z_common).
+    """
+    volume_mitk = np.transpose(volume_x_sag_z, (2, 0, 1))
+    x_common, sagittal, z_common = [int(v) for v in volume_x_sag_z.shape]
+    save_mhd_array(
+        volume_mitk,
+        output_dir,
+        base_name,
+        dim_sizes=(sagittal, x_common, z_common),
+        spacing_sizes=(1.0, 1.0, 1.0),
+        element_type="MET_UCHAR",
+    )
+
+    if mask_x_sag_z is not None:
+        mask_mitk = np.transpose(mask_x_sag_z, (2, 0, 1))
+        save_mhd_array(
+            mask_mitk,
+            output_dir,
+            f"{base_name}_mask",
+            dim_sizes=(sagittal, x_common, z_common),
+            spacing_sizes=(1.0, 1.0, 1.0),
+            element_type="MET_UCHAR",
+        )
+
+
+def build_recons_world_column(frame_positions, frame_rotmats, depth_axis, sag_value):
+    local_column = np.stack(
+        (
+            depth_axis,
+            np.full_like(depth_axis, sag_value, dtype=np.float32),
+            np.zeros_like(depth_axis, dtype=np.float32),
+        ),
+        axis=1,
+    ).astype(np.float32)
+    world = np.einsum("dc,fkc->fdk", local_column, frame_rotmats) + frame_positions[:, None, :]
+    return world.astype(np.float32, copy=False)
+
+
+def compute_recons_world_coords_for_sag_slice(compact_bundle, sag_idx):
+    I_complet_1 = compact_bundle["I_complet_1"].astype(np.int64, copy=False)
+    d_complet_1 = compact_bundle["d_complet_1"].astype(np.float64, copy=False)
+    d_complet_1_1 = compact_bundle["d_complet_1_1"].astype(np.float64, copy=False)
+
+    w_primary = 1.0 / np.maximum(d_complet_1, 1e-8)
+    w_sagadj = 1.0 / np.maximum(d_complet_1_1, 1e-8)
+    sum_w = np.sum(w_primary, axis=1) + 2.0 * np.sum(w_sagadj, axis=1)
+    sum_w[sum_w == 0] = 1.0
+
+    world_j = build_recons_world_column(
+        compact_bundle["frame_positions_mm"],
+        compact_bundle["frame_rotmats"],
+        compact_bundle["depth_axis_mm"],
+        float(compact_bundle["sag_axis_mm"][sag_idx]),
+    )
+    world_m1 = build_recons_world_column(
+        compact_bundle["frame_positions_mm"],
+        compact_bundle["frame_rotmats"],
+        compact_bundle["depth_axis_mm"],
+        float(compact_bundle["sag_axis_mm"][sag_idx - 1]),
+    )
+    world_p1 = build_recons_world_column(
+        compact_bundle["frame_positions_mm"],
+        compact_bundle["frame_rotmats"],
+        compact_bundle["depth_axis_mm"],
+        float(compact_bundle["sag_axis_mm"][sag_idx + 1]),
+    )
+
+    world_j_flat = world_j.reshape(-1, 3)
+    world_m1_flat = world_m1.reshape(-1, 3)
+    world_p1_flat = world_p1.reshape(-1, 3)
+
+    accum_world = np.zeros((I_complet_1.shape[0], 3), dtype=np.float64)
+    for k in range(I_complet_1.shape[1]):
+        idx_k = I_complet_1[:, k]
+        accum_world += w_primary[:, k, None] * world_j_flat[idx_k]
+        accum_world += w_sagadj[:, k, None] * (
+            world_m1_flat[idx_k] + world_p1_flat[idx_k]
+        )
+
+    return (accum_world / sum_w[:, None]).astype(np.float32)
+
+
+def query_recons_common_grid(model, ckpt, bundle_path: Path, chunk_size, use_bbox_mask, plane_mask_data=None):
+    bb_min, bb_max = to_numpy_bbox(ckpt)
+    bb_min_dev = torch.from_numpy(bb_min).to(DEVICE)
+    bb_size_dev = torch.from_numpy(bb_max - bb_min).to(DEVICE)
+
+    with h5py.File(bundle_path, "r") as f:
+        volume_shape = tuple(int(v) for v in f["data_3d_mask_uint8"].shape)
+        volume_x_sag_z = np.zeros(volume_shape, dtype=np.float32)
+        mask_x_sag_z = np.asarray(f["data_3d_mask_uint8"], dtype=np.uint8)
+        coord_mask_xz = np.asarray(f["coord_mask_xz_zero_based"], dtype=np.int64)
+        active_sag_indices = np.asarray(f["active_sag_indices_zero_based"], dtype=np.int64)
+
+        support_world_ds = f["support_world_coords_mm"] if "support_world_coords_mm" in f else None
+        compact_bundle = None
+        if support_world_ds is None:
+            required_compact = [
+                "frame_positions_mm",
+                "frame_rotmats",
+                "depth_axis_mm",
+                "sag_axis_mm",
+                "I_complet_1",
+                "d_complet_1",
+                "d_complet_1_1",
+            ]
+            missing = [k for k in required_compact if k not in f]
+            if missing:
+                raise KeyError(
+                    f"{bundle_path} does not contain cached world coords or the compact mapping fields {missing}."
+                )
+            compact_bundle = {
+                "frame_positions_mm": np.asarray(f["frame_positions_mm"], dtype=np.float32),
+                "frame_rotmats": np.asarray(f["frame_rotmats"], dtype=np.float32),
+                "depth_axis_mm": np.asarray(f["depth_axis_mm"], dtype=np.float32),
+                "sag_axis_mm": np.asarray(f["sag_axis_mm"], dtype=np.float32),
+                "I_complet_1": np.asarray(f["I_complet_1"], dtype=np.int32),
+                "d_complet_1": np.asarray(f["d_complet_1"], dtype=np.float32),
+                "d_complet_1_1": np.asarray(f["d_complet_1_1"], dtype=np.float32),
+            }
+
+        total_points = int(len(active_sag_indices) * coord_mask_xz.shape[0])
+        total_active = 0
+
+        with torch.no_grad():
+            for out_idx, sag_idx in enumerate(tqdm(active_sag_indices, desc="Querying recons common grid")):
+                if support_world_ds is not None:
+                    query_world = np.asarray(support_world_ds[out_idx], dtype=np.float32)
+                else:
+                    query_world = compute_recons_world_coords_for_sag_slice(compact_bundle, int(sag_idx))
+
+                active_mask = np.ones((query_world.shape[0],), dtype=bool)
+                if use_bbox_mask:
+                    active_mask &= np.all((query_world >= bb_min) & (query_world <= bb_max), axis=1)
+                if plane_mask_data is not None:
+                    active_mask &= compute_sequence_plane_mask(query_world, plane_mask_data)
+
+                active_indices = np.flatnonzero(active_mask)
+                if active_indices.size == 0:
+                    continue
+
+                total_active += int(active_indices.size)
+                query_points = query_world[active_indices]
+                point_values = np.zeros((query_world.shape[0],), dtype=np.float32)
+
+                for start in range(0, query_points.shape[0], chunk_size):
+                    stop = min(start + chunk_size, query_points.shape[0])
+                    batch_points = torch.from_numpy(query_points[start:stop]).to(DEVICE)
+                    batch_dirs = torch.zeros_like(batch_points, device=DEVICE)
+
+                    if model.encoding_type != "HASH" or not model.use_encoding:
+                        batch_points = ((batch_points - bb_min_dev) / bb_size_dev) * 2.0 - 1.0
+
+                    batch_values = model.query(batch_points, batch_dirs).reshape(-1)
+                    point_values[active_indices[start:stop]] = (
+                        batch_values.detach().cpu().numpy().astype(np.float32, copy=False)
+                    )
+
+                volume_x_sag_z[
+                    coord_mask_xz[:, 0],
+                    int(sag_idx),
+                    coord_mask_xz[:, 1],
+                ] = point_values
+
+    if use_bbox_mask or plane_mask_data is not None:
+        print(f"Active queried voxels after masking: {total_active} / {total_points}")
+
+    return volume_x_sag_z, mask_x_sag_z, {
+        "total_points": total_points,
+        "active_points": total_active,
+        "active_sag_indices_zero_based": active_sag_indices.tolist(),
+        "support_voxels_per_plane": int(coord_mask_xz.shape[0]),
+        "used_cached_world_coords": support_world_ds is not None,
+    }
 
 
 def save_stacked_mhd_zyx(volume_zhw, output_dir: Path, base_name: str, spacing_wzh):
@@ -672,24 +1020,7 @@ def main():
     ckpt, model = load_checkpoint(args.ckpt)
     baked_dataset, dataset_path = load_dataset_from_ckpt(ckpt)
     bb_min, bb_max = to_numpy_bbox(ckpt)
-
-    point_min = np.array(baked_dataset.point_min, dtype=np.float32) if args.point_min is None else np.array(args.point_min, dtype=np.float32)
-    point_max = np.array(baked_dataset.point_max, dtype=np.float32) if args.point_max is None else np.array(args.point_max, dtype=np.float32)
-
-    spacing_xyz, base_spacing_xyz = resolve_spacing_xyz(args, baked_dataset)
-
-    x_axis, y_axis, z_axis = build_axis(point_min, point_max, spacing_xyz)
-    print(f"Base spacing (x, y, z) mm: {tuple(float(v) for v in base_spacing_xyz)}")
-    print(f"Final spacing (x, y, z) mm: {tuple(float(v) for v in spacing_xyz)}")
-    print(f"Grid shape (x, y, z): {(len(x_axis), len(y_axis), len(z_axis))}")
-    required_bytes = estimate_export_bytes(
-        (len(z_axis), len(y_axis), len(x_axis)),
-        baked_dataset,
-        save_large_npy=args.save_large_npy,
-        save_gt_exports=args.save_gt_exports,
-    )
-    print(f"Estimated export disk usage: {format_bytes(required_bytes)}")
-    ensure_sufficient_disk_space(output_dir, required_bytes)
+    grid_spec = resolve_query_grid_spec(args, baked_dataset)
 
     use_sequence_plane_mask = not args.disable_sequence_plane_mask
     plane_mask_data = get_sequence_plane_mask_data(baked_dataset, dataset_path) if use_sequence_plane_mask else None
@@ -703,6 +1034,123 @@ def main():
             print(f"  Front plane normal (inward): {plane_mask_data['front_normal']}")
             print(f"  Back plane point: {plane_mask_data['back_point']}")
             print(f"  Back plane normal (inward): {plane_mask_data['back_normal']}")
+    if grid_spec["mode"] == "recons_common_grid":
+        common_shape = tuple(int(v) for v in grid_spec["common_shape_x_sag_z"])
+        required_bytes = 2 * array_nbytes(common_shape, np.uint8)
+        if args.save_large_npy:
+            required_bytes += array_nbytes(common_shape, np.float32)
+            required_bytes += array_nbytes(common_shape, np.uint8)
+        required_bytes += 16 * 1024 * 1024
+
+        print(f"Grid source mode: {grid_spec['source']}")
+        print(f"recons_common_grid.h5: {grid_spec['bundle_path']}")
+        print(f"Common-grid shape (x, sagittal, z): {common_shape}")
+        print(f"Support voxels per active sagittal slice: {grid_spec['support_voxels_per_plane']:,}")
+        print(f"Active sagittal slices: {grid_spec['active_sag_count']:,}")
+        print(f"Using cached world coords from bundle: {grid_spec['has_cached_world_coords']}")
+        print(f"Estimated export disk usage: {format_bytes(required_bytes)}")
+        ensure_sufficient_disk_space(output_dir, required_bytes)
+        if args.save_gt_exports:
+            print("GT stacked-slice exports are not applicable to recons_common_grid mode and will be skipped.")
+
+        volume_x_sag_z, mask_x_sag_z, recons_query_meta = query_recons_common_grid(
+            model,
+            ckpt,
+            grid_spec["bundle_path"],
+            args.chunk_size,
+            args.use_bbox_mask,
+            plane_mask_data=plane_mask_data,
+        )
+        print(f"Queried common-grid volume shape (x, sagittal, z): {volume_x_sag_z.shape}")
+        (
+            volume_uint8,
+            volume_export_min,
+            volume_export_max,
+            volume_foreground_count,
+        ) = stretch_volume_to_uint8_preserve_zero_background(volume_x_sag_z)
+        if volume_foreground_count > 0:
+            print(
+                "Export intensity normalization: "
+                f"background stays 0, foreground min-max "
+                f"[{volume_export_min:.6f}, {volume_export_max:.6f}] -> [1, 255]"
+            )
+        else:
+            print("Export intensity normalization: volume is all background zeros")
+
+        if args.save_large_npy:
+            np.save(output_dir / "volume_x_sag_z.npy", volume_x_sag_z)
+            np.save(output_dir / "volume_mask_x_sag_z.npy", mask_x_sag_z)
+
+        save_recons_common_grid_mhd(
+            volume_uint8,
+            output_dir,
+            base_name="volume",
+            mask_x_sag_z=mask_x_sag_z,
+        )
+
+        metadata = {
+            "ckpt": str(args.ckpt),
+            "dataset_pkl": str(dataset_path),
+            "grid_source_mode": grid_spec["source"],
+            "grid_source_bundle_h5": str(grid_spec["bundle_path"]),
+            "bounding_box_min_mm": bb_min.tolist(),
+            "bounding_box_max_mm": bb_max.tolist(),
+            "shape_x_sag_z": list(volume_x_sag_z.shape),
+            "shape_hzw": [int(volume_x_sag_z.shape[1]), int(volume_x_sag_z.shape[0]), int(volume_x_sag_z.shape[2])],
+            "export_element_type": "MET_UCHAR",
+            "export_intensity_normalization": "preserve_zero_background_foreground_min_max_to_1_255",
+            "export_intensity_normalization_min": volume_export_min,
+            "export_intensity_normalization_max": volume_export_max,
+            "export_intensity_normalization_foreground_voxels": volume_foreground_count,
+            "mhd_grid_axis_order": ["sagittal", "x_common", "z_common"],
+            "mhd_grid_axis_mapping": {"sagittal": "common-grid sagittal index", "x_common": "common-grid x", "z_common": "common-grid z"},
+            "mitk_raw_array_shape_z_x_sag": [int(volume_x_sag_z.shape[2]), int(volume_x_sag_z.shape[0]), int(volume_x_sag_z.shape[1])],
+            "use_bbox_mask": args.use_bbox_mask,
+            "use_sequence_plane_mask": use_sequence_plane_mask and bool(plane_mask_data is not None),
+            "sequence_plane_mask_source": plane_mask_data.get("source") if plane_mask_data is not None else None,
+            "front_plane_point_mm": plane_mask_data["front_point"].tolist() if plane_mask_data is not None else None,
+            "front_plane_normal_inward": plane_mask_data["front_normal"].tolist() if plane_mask_data is not None else None,
+            "back_plane_point_mm": plane_mask_data["back_point"].tolist() if plane_mask_data is not None else None,
+            "back_plane_normal_inward": plane_mask_data["back_normal"].tolist() if plane_mask_data is not None else None,
+            "save_large_npy": args.save_large_npy,
+            "save_gt_exports": False,
+            "estimated_export_bytes": int(required_bytes),
+            "recons_support_mask_voxels": int(np.count_nonzero(mask_x_sag_z)),
+            "recons_query_total_points": int(recons_query_meta["total_points"]),
+            "recons_query_active_points": int(recons_query_meta["active_points"]),
+            "recons_support_voxels_per_plane": int(recons_query_meta["support_voxels_per_plane"]),
+            "recons_active_sag_indices_zero_based": recons_query_meta["active_sag_indices_zero_based"],
+            "recons_used_cached_world_coords": bool(recons_query_meta["used_cached_world_coords"]),
+        }
+        with (output_dir / "metadata.json").open("w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+
+        print(f"Saved recons common-grid volume to: {output_dir}")
+        print(f"Saved volume shape (x, sagittal, z): {volume_x_sag_z.shape}")
+        print(f"MHD saved to: {output_dir / 'volume.mhd'}")
+        print(f"Mask MHD saved to: {output_dir / 'volume_mask.mhd'}")
+        return
+
+    point_min = grid_spec["point_min"]
+    point_max = grid_spec["point_max"]
+    spacing_xyz = grid_spec["spacing_xyz"]
+    base_spacing_xyz = grid_spec["base_spacing_xyz"]
+    x_axis = grid_spec["x_axis"]
+    y_axis = grid_spec["y_axis"]
+    z_axis = grid_spec["z_axis"]
+
+    print(f"Grid source mode: {grid_spec['source']}")
+    print(f"Base spacing (x, y, z) mm: {tuple(float(v) for v in base_spacing_xyz)}")
+    print(f"Final spacing (x, y, z) mm: {tuple(float(v) for v in spacing_xyz)}")
+    print(f"Grid shape (x, y, z): {(len(x_axis), len(y_axis), len(z_axis))}")
+    required_bytes = estimate_export_bytes(
+        (len(z_axis), len(y_axis), len(x_axis)),
+        baked_dataset,
+        save_large_npy=args.save_large_npy,
+        save_gt_exports=args.save_gt_exports,
+    )
+    print(f"Estimated export disk usage: {format_bytes(required_bytes)}")
+    ensure_sufficient_disk_space(output_dir, required_bytes)
 
     volume_zyx = query_grid(
         model,
@@ -758,14 +1206,6 @@ def main():
             ],
             dtype=np.float32,
         )
-        stacked_point_min = np.array(
-            [
-                float(np.min(x_axis)),
-                float(np.min(y_axis)),
-                0.0,
-            ],
-            dtype=np.float32,
-        )
         if args.save_large_npy:
             np.save(output_dir / "gt_stacked_slices.npy", stacked_slice_volume)
         save_stacked_mhd_zyx(
@@ -782,6 +1222,7 @@ def main():
     metadata = {
         "ckpt": str(args.ckpt),
         "dataset_pkl": str(dataset_path),
+        "grid_source_mode": grid_spec["source"],
         "base_spacing_mm_xyz": base_spacing_xyz.tolist(),
         "spacing_mm_xyz": spacing_xyz.tolist(),
         "resolution_scale": float(args.resolution_scale),
@@ -816,6 +1257,10 @@ def main():
         "save_gt_exports": args.save_gt_exports,
         "estimated_export_bytes": int(required_bytes),
     }
+    if grid_spec["source"] == "external_axes_npy":
+        metadata["x_axis_npy"] = str(args.x_axis_npy)
+        metadata["y_axis_npy"] = str(args.y_axis_npy)
+        metadata["z_axis_npy"] = str(args.z_axis_npy)
     with (output_dir / "metadata.json").open("w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
