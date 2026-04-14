@@ -22,6 +22,7 @@ data/
 *.raw
 *.mat
 *.pkl
+*.h5
 
 # optional large docs
 *.pptx
