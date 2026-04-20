@@ -25,6 +25,11 @@ DEFAULT_DATASET_PATH = (
     "Recalage/Patient0/us_recal_original/baked_dataset.pkl"
 )
 VALIDATION_SLICE_NAMES = ("A1", "B1", "C1", "D1")
+DEFAULT_HASH_N_LEVELS = 16
+DEFAULT_HASH_N_FEATURES_PER_LEVEL = 2
+DEFAULT_HASH_LOG2_HASHMAP_SIZE = 19
+DEFAULT_HASH_BASE_RESOLUTION = 16
+DEFAULT_HASH_FINEST_RESOLUTION = 512
 
 
 @dataclass(frozen=True)
@@ -52,6 +57,20 @@ class NeUF:
         self.ckptFile = kwargs.get("checkpoint", "")
         self.rootPoint = Path(kwargs.get("root", ".")).expanduser()
 
+        self.hash_n_levels = int(kwargs.get("hash_n_levels", DEFAULT_HASH_N_LEVELS))
+        self.hash_n_features_per_level = int(
+            kwargs.get("hash_n_features_per_level", DEFAULT_HASH_N_FEATURES_PER_LEVEL)
+        )
+        self.hash_log2_hashmap_size = int(
+            kwargs.get("hash_log2_hashmap_size", DEFAULT_HASH_LOG2_HASHMAP_SIZE)
+        )
+        self.hash_base_resolution = int(
+            kwargs.get("hash_base_resolution", DEFAULT_HASH_BASE_RESOLUTION)
+        )
+        self.hash_finest_resolution = int(
+            kwargs.get("hash_finest_resolution", DEFAULT_HASH_FINEST_RESOLUTION)
+        )
+
         self._validate_configuration()
 
         self.dataset: Dataset
@@ -74,6 +93,7 @@ class NeUF:
             self._initialize_from_checkpoint(checkpoint)
         else:
             self._initialize_from_scratch()
+        self._print_hash_configuration()
 
         self.slice_renderer = SliceRenderer(self.dataset)
         self.run_paths = self._create_run_paths()
@@ -92,6 +112,59 @@ class NeUF:
             raise ValueError(f"save_freq must be >= 1, got {self.i_save}")
         if self.points_per_iter <= 0:
             raise ValueError(f"points_per_iter must be >= 1, got {self.points_per_iter}")
+        if self.hash_n_levels < 2:
+            raise ValueError(f"hash_n_levels must be >= 2, got {self.hash_n_levels}")
+        if self.hash_n_features_per_level <= 0:
+            raise ValueError(
+                "hash_n_features_per_level must be >= 1, "
+                f"got {self.hash_n_features_per_level}"
+            )
+        if self.hash_log2_hashmap_size <= 0:
+            raise ValueError(
+                f"hash_log2_hashmap_size must be >= 1, got {self.hash_log2_hashmap_size}"
+            )
+        if self.hash_base_resolution <= 0:
+            raise ValueError(
+                f"hash_base_resolution must be >= 1, got {self.hash_base_resolution}"
+            )
+        if self.hash_finest_resolution < self.hash_base_resolution:
+            raise ValueError(
+                "hash_finest_resolution must be >= hash_base_resolution, "
+                f"got {self.hash_finest_resolution} < {self.hash_base_resolution}"
+            )
+
+    @staticmethod
+    def _hash_per_level_scale(n_levels: int, base_resolution: float, finest_resolution: float) -> float:
+        return (finest_resolution / base_resolution) ** (1.0 / (n_levels - 1))
+
+    @staticmethod
+    def _to_float(value) -> float:
+        if isinstance(value, torch.Tensor):
+            return float(value.detach().cpu())
+        return float(value)
+
+    def _print_hash_configuration(self) -> None:
+        if self.nerf.get_encode_name() != "HASH":
+            return
+
+        encoder = self.nerf.encode
+        n_levels = int(encoder.n_levels)
+        base_resolution = self._to_float(encoder.base_resolution)
+        finest_resolution = self._to_float(encoder.finest_resolution)
+        per_level_scale = self._hash_per_level_scale(
+            n_levels,
+            base_resolution,
+            finest_resolution,
+        )
+        print(
+            "HashGrid config: "
+            f"L={n_levels}, "
+            f"N_min={base_resolution:g}, "
+            f"N_max={finest_resolution:g}, "
+            f"per_level_scale={per_level_scale:.3f}, "
+            f"features_per_level={encoder.n_features_per_level}, "
+            f"log2_hashmap_size={encoder.log2_hashmap_size}"
+        )
 
     def _build_scharr_kernels(self) -> tuple[torch.Tensor, torch.Tensor]:
         scharr_x = torch.tensor(
@@ -172,6 +245,11 @@ class NeUF:
         if encoding_name == "hash":
             self.nerf.init_hash_encoding(
                 bounding_box=self.dataset.get_bounding_box(),
+                n_levels=self.hash_n_levels,
+                n_features_per_level=self.hash_n_features_per_level,
+                log2_hashmap_size=self.hash_log2_hashmap_size,
+                base_resolution=self.hash_base_resolution,
+                finest_resolution=self.hash_finest_resolution,
                 use_encoding=True,
                 use_directions=False,
             )
@@ -180,6 +258,11 @@ class NeUF:
         if encoding_name == "none":
             self.nerf.init_hash_encoding(
                 bounding_box=self.dataset.get_bounding_box(),
+                n_levels=self.hash_n_levels,
+                n_features_per_level=self.hash_n_features_per_level,
+                log2_hashmap_size=self.hash_log2_hashmap_size,
+                base_resolution=self.hash_base_resolution,
+                finest_resolution=self.hash_finest_resolution,
                 use_encoding=False,
                 use_directions=False,
             )
@@ -579,6 +662,50 @@ def parse_args():
     parser.add_argument("--root", default=".", help="Root folder for logs and latest checkpoint")
     parser.add_argument("--raw-dataset", action="store_true", help="Treat --dataset as an unbaked folder")
     parser.add_argument("--jitter-training", action="store_true", help="Enable point jitter during training")
+
+    hash_group = parser.add_argument_group(
+        "HashGrid experiment parameters",
+        "Experiment 1 changes --hash-n-max with --hash-n-levels 16. "
+        "Experiment 2 keeps --hash-n-max 512 and changes --hash-n-levels.",
+    )
+    hash_group.add_argument(
+        "--hash-n-levels",
+        "--hash-levels",
+        dest="hash_n_levels",
+        type=int,
+        default=DEFAULT_HASH_N_LEVELS,
+        help="HashGrid level count L.",
+    )
+    hash_group.add_argument(
+        "--hash-n-max",
+        "--hash-finest-resolution",
+        dest="hash_finest_resolution",
+        type=int,
+        default=DEFAULT_HASH_FINEST_RESOLUTION,
+        help="HashGrid finest resolution N_max.",
+    )
+    hash_group.add_argument(
+        "--hash-n-min",
+        "--hash-base-resolution",
+        dest="hash_base_resolution",
+        type=int,
+        default=DEFAULT_HASH_BASE_RESOLUTION,
+        help="HashGrid base resolution N_min.",
+    )
+    hash_group.add_argument(
+        "--hash-n-features-per-level",
+        dest="hash_n_features_per_level",
+        type=int,
+        default=DEFAULT_HASH_N_FEATURES_PER_LEVEL,
+        help="HashGrid feature count per level.",
+    )
+    hash_group.add_argument(
+        "--hash-log2-hashmap-size",
+        dest="hash_log2_hashmap_size",
+        type=int,
+        default=DEFAULT_HASH_LOG2_HASHMAP_SIZE,
+        help="HashGrid log2 hashmap size.",
+    )
     return parser.parse_args()
 
 
@@ -598,6 +725,11 @@ def main():
         root=args.root,
         baked_dataset=not args.raw_dataset,
         jitter_training=args.jitter_training,
+        hash_n_levels=args.hash_n_levels,
+        hash_n_features_per_level=args.hash_n_features_per_level,
+        hash_log2_hashmap_size=args.hash_log2_hashmap_size,
+        hash_base_resolution=args.hash_base_resolution,
+        hash_finest_resolution=args.hash_finest_resolution,
     )
     neuf.run()
 

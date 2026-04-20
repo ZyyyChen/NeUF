@@ -1,0 +1,15 @@
+experiment=exp2_G_L8_Nmax512
+ckpt=/misc/raid/zchen/Code/NeUF/experiments/hash_grid_nmax/exp2_G_L8_Nmax512/exp2_G_L8_Nmax512_latest.pkl
+output_root=/misc/raid/zchen/Code/NeUF/exports/hash_grid_nmax_full_grid/exp2_G_L8_Nmax512
+chunk_size=131072
+resolution_scale=1.0
+spacing=default
+recons_common_grid_h5=none
+use_bbox_mask=0
+disable_sequence_plane_mask=0
+save_large_npy=0
+save_gt_exports=0
+start_time=2026-04-17T11:09:05+02:00
+command= /home/zchen/.conda/envs/neuf/bin/python /misc/raid/zchen/Code/NeUF/export_full_grid_from_ckpt.py --ckpt /misc/raid/zchen/Code/NeUF/experiments/hash_grid_nmax/exp2_G_L8_Nmax512/exp2_G_L8_Nmax512_latest.pkl --output /misc/raid/zchen/Code/NeUF/exports/hash_grid_nmax_full_grid/exp2_G_L8_Nmax512 --chunk-size 131072 --resolution-scale 1.0
+end_time=2026-04-17T11:10:39+02:00
+latest_output=/misc/raid/zchen/Code/NeUF/exports/hash_grid_nmax_full_grid/exp2_G_L8_Nmax512/17-04-2026/exp2_G_L8_Nmax512_latest_0

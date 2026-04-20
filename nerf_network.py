@@ -67,7 +67,7 @@ class NeRF(nn.Module) :
 
 
     def init_hash_encoding(self, bounding_box, n_levels=16, n_features_per_level=2,
-                       log2_hashmap_size=19, base_resolution=16, finest_resolution=512, use_directions=True, use_encoding=True):
+                       log2_hashmap_size=19, base_resolution=16, finest_resolution=256, use_directions=True, use_encoding=True):
         if self.encoding_initialized :
             print("encoding initialized twice")
             exit(-1)

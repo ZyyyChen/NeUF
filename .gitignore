@@ -23,6 +23,7 @@ data/
 *.mat
 *.pkl
 *.h5
+*.dcm
 
 # optional large docs
 *.pptx
@@ -33,7 +34,6 @@ __pycache__/
 
 # ppt files
 *.ppt
-
 
 
 

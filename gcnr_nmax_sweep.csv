@@ -1,0 +1,8 @@
+experiment,gcnr,bg_mean,bg_std,tg_mean,tg_std,bg_n,tg_n,raw_path
+exp1_A_L16_Nmax512,0.95928,40.81690216064453,5.814910888671875,63.94224166870117,5.194983005523682,125000,125000,/home/zchen/Code/NeUF/exports/hash_grid_nmax_full_grid/exp1_A_L16_Nmax512/17-04-2026/exp1_A_L16_Nmax512_latest_0/volume.raw
+exp1_B_L16_Nmax256,0.9649840000000001,40.795135498046875,5.820204257965088,64.27304077148438,5.088505744934082,125000,125000,/home/zchen/Code/NeUF/exports/hash_grid_nmax_full_grid/exp1_B_L16_Nmax256/17-04-2026/exp1_B_L16_Nmax256_latest_0/volume.raw
+exp1_C_L16_Nmax128,0.968672,39.56803894042969,5.447205066680908,62.31687927246094,4.628427028656006,125000,125000,/home/zchen/Code/NeUF/exports/hash_grid_nmax_full_grid/exp1_C_L16_Nmax128/17-04-2026/exp1_C_L16_Nmax128_latest_0/volume.raw
+exp1_D_L16_Nmax64,0.98776,37.757625579833984,4.628141403198242,59.01990509033203,3.6552937030792236,125000,125000,/home/zchen/Code/NeUF/exports/hash_grid_nmax_full_grid/exp1_D_L16_Nmax64/17-04-2026/exp1_D_L16_Nmax64_latest_0/volume.raw
+exp1_E_L16_Nmax32,0.991472,29.58407974243164,3.38459849357605,45.84578323364258,2.431112051010132,125000,125000,/home/zchen/Code/NeUF/exports/hash_grid_nmax_full_grid/exp1_E_L16_Nmax32/17-04-2026/exp1_E_L16_Nmax32_latest_0/volume.raw
+exp2_F_L12_Nmax512,0.963256,39.27212142944336,5.6319708824157715,61.5596809387207,4.791995525360107,125000,125000,/home/zchen/Code/NeUF/exports/hash_grid_nmax_full_grid/exp2_F_L12_Nmax512/17-04-2026/exp2_F_L12_Nmax512_latest_0/volume.raw
+exp2_G_L8_Nmax512,0.964568,38.253662109375,5.436863899230957,59.956207275390625,4.685950756072998,125000,125000,/home/zchen/Code/NeUF/exports/hash_grid_nmax_full_grid/exp2_G_L8_Nmax512/17-04-2026/exp2_G_L8_Nmax512_latest_0/volume.raw

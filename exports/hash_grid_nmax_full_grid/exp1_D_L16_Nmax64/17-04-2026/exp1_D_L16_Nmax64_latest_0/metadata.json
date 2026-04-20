@@ -1,0 +1,98 @@
+{
+  "ckpt": "/misc/raid/zchen/Code/NeUF/experiments/hash_grid_nmax/exp1_D_L16_Nmax64/exp1_D_L16_Nmax64_latest.pkl",
+  "dataset_pkl": "/misc/raid/zchen/Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Recalage/Patient0/us_recal_original/baked_dataset.pkl",
+  "grid_source_mode": "baked_dataset_defaults",
+  "base_spacing_mm_xyz": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "spacing_mm_xyz": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "resolution_scale": 1.0,
+  "mhd_grid_axis_order": [
+    "h",
+    "z",
+    "w"
+  ],
+  "mhd_grid_axis_mapping": {
+    "h": "-x",
+    "z": "-z",
+    "w": "-y"
+  },
+  "point_min_mm": [
+    -471.5,
+    172.82444763183594,
+    -699.1565551757812
+  ],
+  "point_max_mm": [
+    471.5,
+    970.5919799804688,
+    28.666547775268555
+  ],
+  "dataset_point_min_mm": [
+    -471.5,
+    172.82444763183594,
+    -699.1565551757812
+  ],
+  "dataset_point_max_mm": [
+    471.5,
+    970.5919799804688,
+    28.666547775268555
+  ],
+  "dataset_roi_px_size_mm": [
+    1.0,
+    1.0
+  ],
+  "bounding_box_min_mm": [
+    -471.5,
+    172.82444763183594,
+    -699.1565551757812
+  ],
+  "bounding_box_max_mm": [
+    471.5,
+    970.5919799804688,
+    28.666547775268555
+  ],
+  "shape_hzw": [
+    728,
+    798,
+    943
+  ],
+  "export_element_type": "MET_UCHAR",
+  "export_intensity_normalization": "preserve_zero_background_foreground_min_max_to_1_255",
+  "export_intensity_normalization_min": -0.024514131247997284,
+  "export_intensity_normalization_max": 271.01031494140625,
+  "export_intensity_normalization_foreground_voxels": 336696251,
+  "gt_stacked_slices_shape_zhw": null,
+  "gt_stacked_mhd_axis_order": null,
+  "use_bbox_mask": false,
+  "use_sequence_plane_mask": true,
+  "sequence_plane_mask_source": "slice planes from /home/zchen/Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Recalage/Patient0/us_recal_original/infos.json",
+  "front_plane_point_mm": [
+    -0.0,
+    455.5425109863281,
+    4.157106876373291
+  ],
+  "front_plane_normal_inward": [
+    0.0,
+    0.9166889786720276,
+    -0.3996014893054962
+  ],
+  "back_plane_point_mm": [
+    -0.0,
+    478.4701232910156,
+    29.025772094726562
+  ],
+  "back_plane_normal_inward": [
+    -0.0,
+    -0.7184500694274902,
+    -0.6955785751342773
+  ],
+  "save_large_npy": false,
+  "save_gt_exports": false,
+  "estimated_export_bytes": 564607408
+}
