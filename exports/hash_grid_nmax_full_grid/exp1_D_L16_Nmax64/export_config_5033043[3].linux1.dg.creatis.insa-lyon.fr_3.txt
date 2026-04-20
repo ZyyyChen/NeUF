@@ -1,0 +1,15 @@
+experiment=exp1_D_L16_Nmax64
+ckpt=/misc/raid/zchen/Code/NeUF/experiments/hash_grid_nmax/exp1_D_L16_Nmax64/exp1_D_L16_Nmax64_latest.pkl
+output_root=/misc/raid/zchen/Code/NeUF/exports/hash_grid_nmax_full_grid/exp1_D_L16_Nmax64
+chunk_size=131072
+resolution_scale=1.0
+spacing=default
+recons_common_grid_h5=none
+use_bbox_mask=0
+disable_sequence_plane_mask=0
+save_large_npy=0
+save_gt_exports=0
+start_time=2026-04-20T14:43:26+02:00
+command= /home/zchen/.conda/envs/neuf/bin/python /misc/raid/zchen/Code/NeUF/export_full_grid_from_ckpt.py --ckpt /misc/raid/zchen/Code/NeUF/experiments/hash_grid_nmax/exp1_D_L16_Nmax64/exp1_D_L16_Nmax64_latest.pkl --output /misc/raid/zchen/Code/NeUF/exports/hash_grid_nmax_full_grid/exp1_D_L16_Nmax64 --chunk-size 131072 --resolution-scale 1.0
+end_time=2026-04-20T14:46:24+02:00
+latest_output=/misc/raid/zchen/Code/NeUF/exports/hash_grid_nmax_full_grid/exp1_D_L16_Nmax64/20-04-2026/exp1_D_L16_Nmax64_latest_0

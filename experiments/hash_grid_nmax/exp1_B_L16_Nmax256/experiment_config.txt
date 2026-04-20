@@ -16,5 +16,4 @@ dataset=/misc/raid/zchen/Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Rec
 root=/misc/raid/zchen/Code/NeUF/experiments/hash_grid_nmax/exp1_B_L16_Nmax256
 latest_checkpoint=/misc/raid/zchen/Code/NeUF/experiments/hash_grid_nmax/exp1_B_L16_Nmax256/latest/ckpt.pkl
 named_checkpoint=/misc/raid/zchen/Code/NeUF/experiments/hash_grid_nmax/exp1_B_L16_Nmax256/exp1_B_L16_Nmax256_latest.pkl
-start_time=2026-04-16T19:48:13+02:00
-end_time=2026-04-16T19:57:28+02:00
+start_time=2026-04-20T16:14:54+02:00

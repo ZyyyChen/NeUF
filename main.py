@@ -81,6 +81,7 @@ class NeUF:
 
         self.mse = torch.nn.MSELoss()
         self.scharr_x, self.scharr_y = self._build_scharr_kernels()
+        self.tv_weight = float(kwargs.get("tv_weight", 0.1))
         self.previous_validation_slices: dict[str, torch.Tensor] = {}
         self.gt_saved = False
         self.tb_reference_images_logged = False
@@ -533,20 +534,23 @@ class NeUF:
         self.random_start_index = stop_index % len(self.random_permutation)
         return indices
 
-    def _sample_training_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _sample_training_batch(self):
         if self.training_mode == "Slice":
             slice_index = np.random.randint(len(self.dataset.slices))
             target = self.dataset.get_slice_pixels(slice_index).to(DEVICE)
             density = self.slice_renderer.render_slice_from_dataset(
-                self.nerf,
-                slice_index,
-                jitter=self.jitter_training,
+                self.nerf, slice_index, jitter=self.jitter_training,
             )
             return target, density
 
         if self.training_mode == "Random":
             indices = self._next_random_indices()
             target = self.dataset.get_indices_pixels(indices)
+
+            # 暂存当前batch的points和viewdirs，供smoothness loss使用
+            self._current_points = self.dataset.get_indices_points(indices)
+            self._current_viewdirs = self.dataset.get_indices_viewdirs(indices)
+
             density = self.slice_renderer.query_random_positions(self.nerf, indices, reshaped=False)
             return target, density
 
@@ -569,12 +573,30 @@ class NeUF:
 
         return self.mse(density_grad_x, target_grad_x) + self.mse(density_grad_y, target_grad_y)
 
-    def _compute_training_loss(self, target: torch.Tensor, density: torch.Tensor) -> torch.Tensor:
+    def _compute_training_loss(self, target, density):
         loss = self.mse(density, target)
+        
         if self.training_mode == "Slice":
             loss = loss + self.grad_weight * self._compute_gradient_loss(target, density)
+            loss = loss + self.tv_weight * self._compute_tv_loss(density)
+        
+        elif self.training_mode == "Random":
+            # 随机采样附近的点，约束密度连续性
+            loss = loss + self.tv_weight * self._compute_spatial_smoothness(self._current_points)
+        
         return loss
 
+    def _compute_spatial_smoothness(self, points):
+        """在3D空间中对邻域点施加平滑约束"""
+        with torch.no_grad():
+            delta = 0.3  # mm级别的偏移，需根据你的pixel_size调整
+            noise = delta * torch.randn_like(points)
+            perturbed = points + noise
+        
+        d_orig = self.nerf.query(points, torch.zeros_like(points))
+        d_perturbed = self.nerf.query(perturbed, torch.zeros_like(perturbed))
+        return torch.mean(torch.abs(d_orig - d_perturbed))
+    
     def _update_progress_bar(self, progress_bar, params: Optional[dict]) -> None:
         if params is None:
             return

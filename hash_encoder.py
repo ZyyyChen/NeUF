@@ -18,7 +18,8 @@ class HashEncoder(nn.Module):
         self.base_resolution = torch.tensor(base_resolution)
         self.finest_resolution = torch.tensor(finest_resolution)
         self.out_dim = self.n_levels * self.n_features_per_level
-
+        self.level_weights = nn.Parameter(torch.ones(n_levels))
+        
         self.b = torch.exp((torch.log(self.finest_resolution)-torch.log(self.base_resolution))/(n_levels-1))
 
         self.embeddings = nn.ModuleList([nn.Embedding(2**self.log2_hashmap_size,
@@ -67,6 +68,8 @@ class HashEncoder(nn.Module):
             voxel_embedds = self.embeddings[i](hashed_voxel_indices)
 
             x_embedded = self.trilinear_interp(inputs, voxel_min_vertex, voxel_max_vertex, voxel_embedds)
+            gate = torch.sigmoid(self.level_weights[i])
+            x_embedded = x_embedded * gate
             x_embedded_all.append(x_embedded)
 
 
@@ -74,7 +77,8 @@ class HashEncoder(nn.Module):
         return torch.cat(x_embedded_all, dim=-1)
 
 
-def get_hash_encoder(use_encoding, bounding_box, n_levels=16, n_features_per_level=4,
+
+def get_hash_encoder(use_encoding, bounding_box, n_levels=12, n_features_per_level=4,
                 log2_hashmap_size=19, base_resolution=16, finest_resolution=512):
     if not use_encoding:
         return nn.Identity(), 3, []
