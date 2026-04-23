@@ -15,7 +15,7 @@ set -euo pipefail
 REPO_DIR="${REPO_DIR:-/misc/raid/zchen/Code/NeUF}"
 PYTHON_BIN="${PYTHON_BIN:-/home/zchen/.conda/envs/neuf/bin/python}"
 SCRIPT_PATH="${REPO_DIR}/export_full_grid_from_ckpt.py"
-CKPT_DIR="${CKPT_DIR:-/home/zchen/Code/NeUF/logs/22-04-2026/HASH_Patient0_1/checkpoints}"
+CKPT_DIR="${CKPT_DIR:-/home/zchen/Code/NeUF/logs/23-04-2026/HASH_Patient0_0/checkpoints}"
 CKPT_STEPS="${CKPT_STEPS:-2000 5000 8000 10000}"
 CKPT_PATH="${CKPT_PATH:-}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_DIR}/exports/full_grid}"
