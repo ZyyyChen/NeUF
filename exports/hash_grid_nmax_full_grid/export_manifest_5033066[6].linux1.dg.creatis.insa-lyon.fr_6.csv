@@ -1,0 +1,2 @@
+experiment,ckpt,output_root,latest_output,start_time,end_time
+exp2_G_L8_Nmax512,/misc/raid/zchen/Code/NeUF/experiments/hash_grid_nmax/exp2_G_L8_Nmax512/exp2_G_L8_Nmax512_latest.pkl,/misc/raid/zchen/Code/NeUF/exports/hash_grid_nmax_full_grid/exp2_G_L8_Nmax512,/misc/raid/zchen/Code/NeUF/exports/hash_grid_nmax_full_grid/exp2_G_L8_Nmax512/20-04-2026/exp2_G_L8_Nmax512_latest_1,2026-04-20T16:58:19+02:00,2026-04-20T17:00:14+02:00

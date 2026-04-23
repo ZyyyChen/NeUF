@@ -1,1 +1,2 @@
 experiment,description,hash_n_levels,hash_n_min,hash_n_max,per_level_scale,root,latest_checkpoint,named_checkpoint,start_time,end_time
+exp1_C_L16_Nmax128,experiment_1_lower_Nmax,16,16,128,1.149,/misc/raid/zchen/Code/NeUF/experiments/hash_grid_nmax/exp1_C_L16_Nmax128,/misc/raid/zchen/Code/NeUF/experiments/hash_grid_nmax/exp1_C_L16_Nmax128/latest/ckpt.pkl,/misc/raid/zchen/Code/NeUF/experiments/hash_grid_nmax/exp1_C_L16_Nmax128/exp1_C_L16_Nmax128_latest.pkl,2026-04-20T16:14:53+02:00,2026-04-20T16:46:36+02:00

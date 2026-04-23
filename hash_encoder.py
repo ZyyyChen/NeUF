@@ -18,9 +18,9 @@ class HashEncoder(nn.Module):
         self.base_resolution = torch.tensor(base_resolution)
         self.finest_resolution = torch.tensor(finest_resolution)
         self.out_dim = self.n_levels * self.n_features_per_level
-        self.level_weights = nn.Parameter(torch.ones(n_levels))
         
         self.b = torch.exp((torch.log(self.finest_resolution)-torch.log(self.base_resolution))/(n_levels-1))
+        self.level_weights = nn.Parameter(torch.zeros(n_levels))
 
         self.embeddings = nn.ModuleList([nn.Embedding(2**self.log2_hashmap_size,
                                         self.n_features_per_level) for i in range(n_levels)])
@@ -56,8 +56,10 @@ class HashEncoder(nn.Module):
 
         return c
 
-    def forward(self, inputs):
-        # x is 3D point position: B x 3
+    def forward(self, inputs, active_levels=None):
+        if active_levels is None:
+            active_levels = self.n_levels
+
         x_embedded_all = []
         for i in range(self.n_levels):
             resolution = torch.floor(self.base_resolution * self.b ** i)
@@ -68,8 +70,11 @@ class HashEncoder(nn.Module):
             voxel_embedds = self.embeddings[i](hashed_voxel_indices)
 
             x_embedded = self.trilinear_interp(inputs, voxel_min_vertex, voxel_max_vertex, voxel_embedds)
-            gate = torch.sigmoid(self.level_weights[i])
-            x_embedded = x_embedded * gate
+            if i < active_levels:
+                gate = torch.sigmoid(self.level_weights[i])
+                x_embedded = x_embedded * gate
+            else:
+                x_embedded = torch.zeros_like(x_embedded)
             x_embedded_all.append(x_embedded)
 
 

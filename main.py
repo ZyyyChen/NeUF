@@ -29,7 +29,7 @@ DEFAULT_HASH_N_LEVELS = 16
 DEFAULT_HASH_N_FEATURES_PER_LEVEL = 2
 DEFAULT_HASH_LOG2_HASHMAP_SIZE = 19
 DEFAULT_HASH_BASE_RESOLUTION = 16
-DEFAULT_HASH_FINEST_RESOLUTION = 512
+DEFAULT_HASH_FINEST_RESOLUTION = 256
 
 
 @dataclass(frozen=True)
@@ -44,14 +44,23 @@ class RunPaths:
 class NeUF:
     def __init__(self, **kwargs):
         self.grad_weight = float(kwargs.get("grad_weight", 0.1))
+        self.grad_clip_norm = float(kwargs.get("grad_clip_norm", 1.0))
         self.seed = int(kwargs.get("seed", 19981708))
-        self.N_iters = int(kwargs.get("nb_iters_max", 8500))
+        self.N_iters = int(kwargs.get("nb_iters_max", 10000))
         self.i_plot = int(kwargs.get("plot_freq", 100))
         self.i_save = int(kwargs.get("save_freq", 100))
         self.baked_dataset = bool(kwargs.get("baked_dataset", True))
         self.training_mode = kwargs.get("training_mode", "Random")
         self.points_per_iter = int(kwargs.get("points_per_iter", 50000))
         self.jitter_training = bool(kwargs.get("jitter_training", False))
+        self.patch_size = int(kwargs.get("patch_size", 32))
+        self.grad_blur_kernel_size = int(kwargs.get("grad_blur_kernel_size", 6))
+        self.grad_blur_sigma = float(kwargs.get("grad_blur_sigma", 1.5))
+        self.tv_weight = float(kwargs.get("tv_weight", 15))
+        self.slice_mix_interval = int(kwargs.get("slice_mix_interval", 10))
+        self.smoothness_delta = float(kwargs.get("smoothness_delta", 0.3))
+        self.lr = float(kwargs.get("lr", 5e-4))
+        self.lr_decay_factor = float(kwargs.get("lr_decay_factor", 0.1))
         self.encoding = kwargs.get("encoding", "None")
         self.datasetFolder = kwargs.get("dataset", DEFAULT_DATASET_PATH)
         self.ckptFile = kwargs.get("checkpoint", "")
@@ -70,6 +79,9 @@ class NeUF:
         self.hash_finest_resolution = int(
             kwargs.get("hash_finest_resolution", DEFAULT_HASH_FINEST_RESOLUTION)
         )
+        self.progressive_training = bool(kwargs.get("progressive_training", False))
+        self.progressive_start_levels = int(kwargs.get("progressive_start_levels", 4))
+        self.progressive_step_interval = int(kwargs.get("progressive_step_interval", 1000))
 
         self._validate_configuration()
 
@@ -79,15 +91,18 @@ class NeUF:
         self.slice_renderer: SliceRenderer
         self.start = 0
 
-        self.mse = torch.nn.MSELoss()
+        # self.criterion = torch.nn.MSELoss()
+        self.criterion = torch.nn.L1Loss()
         self.scharr_x, self.scharr_y = self._build_scharr_kernels()
-        self.tv_weight = float(kwargs.get("tv_weight", 0.1))
         self.previous_validation_slices: dict[str, torch.Tensor] = {}
         self.gt_saved = False
         self.tb_reference_images_logged = False
 
         self.random_permutation: Optional[torch.Tensor] = None
         self.random_start_index = 0
+        self.training_slice_starts: Optional[torch.Tensor] = None
+        self._current_points = None
+        self._current_viewdirs = None
 
         checkpoint = self._load_checkpoint(self.ckptFile)
         if checkpoint is not None:
@@ -97,6 +112,8 @@ class NeUF:
         self._print_hash_configuration()
 
         self.slice_renderer = SliceRenderer(self.dataset)
+        self.training_slice_starts = self._build_training_slice_starts()
+        self._validate_dataset_configuration()
         self.run_paths = self._create_run_paths()
         self.logPath = str(self.run_paths.log_dir)
 
@@ -111,8 +128,28 @@ class NeUF:
             raise ValueError(f"plot_freq must be >= 1, got {self.i_plot}")
         if self.i_save <= 0:
             raise ValueError(f"save_freq must be >= 1, got {self.i_save}")
+        if self.training_mode not in {"Random", "Slice", "Patch"}:
+            raise ValueError(f"Unknown training mode: {self.training_mode}")
         if self.points_per_iter <= 0:
             raise ValueError(f"points_per_iter must be >= 1, got {self.points_per_iter}")
+        if self.patch_size <= 0:
+            raise ValueError(f"patch_size must be >= 1, got {self.patch_size}")
+        if self.grad_blur_kernel_size <= 0:
+            raise ValueError(
+                f"grad_blur_kernel_size must be >= 1, got {self.grad_blur_kernel_size}"
+            )
+        if self.grad_blur_sigma <= 0:
+            raise ValueError(f"grad_blur_sigma must be > 0, got {self.grad_blur_sigma}")
+        if self.tv_weight < 0:
+            raise ValueError(f"tv_weight must be >= 0, got {self.tv_weight}")
+        if self.grad_clip_norm < 0:
+            raise ValueError(f"grad_clip_norm must be >= 0, got {self.grad_clip_norm}")
+        if self.lr <= 0:
+            raise ValueError(f"lr must be > 0, got {self.lr}")
+        if not (0 < self.lr_decay_factor <= 1):
+            raise ValueError(
+                f"lr_decay_factor must be in (0, 1], got {self.lr_decay_factor}"
+            )
         if self.hash_n_levels < 2:
             raise ValueError(f"hash_n_levels must be >= 2, got {self.hash_n_levels}")
         if self.hash_n_features_per_level <= 0:
@@ -133,6 +170,37 @@ class NeUF:
                 "hash_finest_resolution must be >= hash_base_resolution, "
                 f"got {self.hash_finest_resolution} < {self.hash_base_resolution}"
             )
+        if self.progressive_start_levels <= 0:
+            raise ValueError(
+                "progressive_start_levels must be >= 1, "
+                f"got {self.progressive_start_levels}"
+            )
+        if self.progressive_step_interval <= 0:
+            raise ValueError(
+                "progressive_step_interval must be >= 1, "
+                f"got {self.progressive_step_interval}"
+            )
+
+    def _validate_dataset_configuration(self) -> None:
+        if self.training_mode != "Patch":
+            return
+
+        if self.patch_size > self.dataset.px_height or self.patch_size > self.dataset.px_width:
+            raise ValueError(
+                "patch_size must fit inside one training slice, "
+                f"got patch_size={self.patch_size}, "
+                f"slice={self.dataset.px_width}x{self.dataset.px_height}"
+            )
+
+        patch_area = self.patch_size ** 2
+        if self.points_per_iter < patch_area:
+            raise ValueError(
+                "points_per_iter must be at least patch_size**2 in Patch mode, "
+                f"got points_per_iter={self.points_per_iter}, patch_size={self.patch_size}"
+            )
+
+        if self.jitter_training:
+            print("Patch mode disables per-pixel training jitter to preserve patch adjacency.")
 
     @staticmethod
     def _hash_per_level_scale(n_levels: int, base_resolution: float, finest_resolution: float) -> float:
@@ -208,11 +276,12 @@ class NeUF:
         self.nerf = NeRF(checkpoint)
         self.optimizer = torch.optim.Adam(
             params=self.nerf.grad_vars(),
-            lr=5e-4,
+            lr=self.lr,
             betas=(0.9, 0.999),
         )
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.start = int(checkpoint["start"])
+        self.scheduler = self._build_lr_scheduler()
 
     def _initialize_from_scratch(self) -> None:
         np.random.seed(self.seed)
@@ -223,8 +292,17 @@ class NeUF:
         self.nerf.init_model(8, 256)
         self.optimizer = torch.optim.Adam(
             params=self.nerf.grad_vars(),
-            lr=5e-4,
+            lr=self.lr,
             betas=(0.9, 0.999),
+        )
+        self.scheduler = self._build_lr_scheduler()
+
+    def _build_lr_scheduler(self) -> torch.optim.lr_scheduler.ExponentialLR:
+        gamma = self.lr_decay_factor ** (1.0 / max(1, self.N_iters))
+        return torch.optim.lr_scheduler.ExponentialLR(
+            self.optimizer,
+            gamma=gamma,
+            last_epoch=self.start - 1,
         )
 
     def _load_dataset(self) -> Dataset:
@@ -303,7 +381,7 @@ class NeUF:
     def _initialize_loss_csv(self) -> None:
         with self.loss_csv_path.open("w", newline="") as csv_file:
             writer = csv.writer(csv_file)
-            writer.writerow(["iteration", "loss_train", "loss_valid", "loss_gt"])
+            writer.writerow(["iteration", "loss_train", "loss_valid", "loss_gt", "loss_valid_tv"])
 
     def _create_checkpoint_payload(self, iteration: int) -> dict:
         params = self.nerf.get_save_dict()
@@ -357,14 +435,25 @@ class NeUF:
         self,
         rendered: dict[str, torch.Tensor],
         references: dict[str, torch.Tensor],
-    ) -> Optional[float]:
+    ) -> tuple[Optional[float], Optional[float]]:
         if not rendered or not references:
-            return None
+            return None, None
 
-        losses = [self.mse(rendered[name], references[name]).item() for name in rendered if name in references]
-        if not losses:
-            return None
-        return float(np.mean(losses))
+        losses: list[float] = []
+        tv_values: list[float] = []
+        for name, prediction in rendered.items():
+            if name in references:
+                losses.append(self.criterion(prediction, references[name]).item())
+
+            tv = (
+                torch.mean(torch.abs(prediction[1:, :] - prediction[:-1, :]))
+                + torch.mean(torch.abs(prediction[:, 1:] - prediction[:, :-1]))
+            )
+            tv_values.append(tv.item())
+
+        loss_valid = float(np.mean(losses)) if losses else None
+        tv_valid = float(np.mean(tv_values)) if tv_values else None
+        return loss_valid, tv_valid
 
     def _compute_temporal_validation_loss(self, rendered: dict[str, torch.Tensor]) -> Optional[float]:
         if not self.previous_validation_slices:
@@ -375,7 +464,7 @@ class NeUF:
             previous_slice = self.previous_validation_slices.get(name)
             if previous_slice is None:
                 continue
-            deltas.append(torch.sum(torch.square(previous_slice - current_slice)).item())
+            deltas.append(torch.mean(torch.square(previous_slice - current_slice)).item())
 
         if not deltas:
             return None
@@ -454,6 +543,7 @@ class NeUF:
         loss_train: Optional[float],
         loss_valid: Optional[float],
         loss_gt: Optional[float],
+        loss_valid_tv: Optional[float] = None,
     ) -> None:
         if loss_train is not None:
             self.tb_writer.add_scalar("loss/train", loss_train, iteration)
@@ -461,10 +551,12 @@ class NeUF:
             self.tb_writer.add_scalar("loss/valid", loss_valid, iteration)
         if loss_gt is not None:
             self.tb_writer.add_scalar("loss/gt", loss_gt, iteration)
+        if loss_valid_tv is not None:
+            self.tb_writer.add_scalar("loss/valid_tv", loss_valid_tv, iteration)
 
         with self.loss_csv_path.open("a", newline="") as csv_file:
             writer = csv.writer(csv_file)
-            writer.writerow([iteration, loss_train, loss_valid, loss_gt])
+            writer.writerow([iteration, loss_train, loss_valid, loss_gt, loss_valid_tv])
 
         self.tb_writer.flush()
 
@@ -485,13 +577,13 @@ class NeUF:
             return None, now
 
         loss_train = float(np.mean(train_losses)) if train_losses else None
-        loss_valid = self._compute_validation_loss(rendered, references)
+        loss_valid, loss_valid_tv = self._compute_validation_loss(rendered, references)
         loss_gt = self._compute_temporal_validation_loss(rendered)
 
         self._save_ground_truth_images(references)
         self._save_preview_images(iteration, rendered)
         self._write_tensorboard_images(iteration, rendered, references)
-        self._write_metrics(iteration, loss_train, loss_valid, loss_gt)
+        self._write_metrics(iteration, loss_train, loss_valid, loss_gt, loss_valid_tv)
         self.previous_validation_slices = {
             name: tensor.detach().clone() for name, tensor in rendered.items()
         }
@@ -534,6 +626,16 @@ class NeUF:
         self.random_start_index = stop_index % len(self.random_permutation)
         return indices
 
+    def _build_training_slice_starts(self) -> torch.Tensor:
+        return torch.as_tensor(
+            [slice_info.start for slice_info in self.dataset.slices],
+            dtype=torch.long,
+            device=self.dataset.pixels.device,
+        )
+
+    def _patches_per_iter(self, patch_size: int) -> int:
+        return self.points_per_iter // (patch_size ** 2)
+
     def _sample_training_batch(self):
         if self.training_mode == "Slice":
             slice_index = np.random.randint(len(self.dataset.slices))
@@ -543,18 +645,76 @@ class NeUF:
             )
             return target, density
 
+        if self.training_mode == "Patch":
+            return self._sample_patch_batch()
+
         if self.training_mode == "Random":
             indices = self._next_random_indices()
             target = self.dataset.get_indices_pixels(indices)
-
-            # 暂存当前batch的points和viewdirs，供smoothness loss使用
             self._current_points = self.dataset.get_indices_points(indices)
             self._current_viewdirs = self.dataset.get_indices_viewdirs(indices)
-
             density = self.slice_renderer.query_random_positions(self.nerf, indices, reshaped=False)
             return target, density
 
         raise ValueError(f"Training mode '{self.training_mode}' is not implemented")
+
+    def _sample_patch_batch(self, patch_size: Optional[int] = None, n_patches: Optional[int] = None):
+        patch_size = self.patch_size if patch_size is None else int(patch_size)
+        n_patches = self._patches_per_iter(patch_size) if n_patches is None else int(n_patches)
+        if n_patches <= 0:
+            raise ValueError(
+                "Patch mode requires at least one patch per iteration; "
+                f"got points_per_iter={self.points_per_iter}, patch_size={patch_size}"
+            )
+        if self.training_slice_starts is None:
+            self.training_slice_starts = self._build_training_slice_starts()
+
+        device = self.dataset.pixels.device
+        px_width = int(self.dataset.px_width)
+        max_row = int(self.dataset.px_height) - patch_size + 1
+        max_col = px_width - patch_size + 1
+        if max_row <= 0 or max_col <= 0:
+            raise ValueError(
+                "patch_size must fit inside one training slice, "
+                f"got patch_size={patch_size}, "
+                f"slice={self.dataset.px_width}x{self.dataset.px_height}"
+            )
+
+        slice_indices = torch.randint(
+            len(self.dataset.slices),
+            (n_patches,),
+            dtype=torch.long,
+            device=device,
+        )
+        patch_rows = torch.randint(max_row, (n_patches,), dtype=torch.long, device=device)
+        patch_cols = torch.randint(max_col, (n_patches,), dtype=torch.long, device=device)
+
+        row_offsets = torch.arange(patch_size, dtype=torch.long, device=device).unsqueeze(1) * px_width
+        col_offsets = torch.arange(patch_size, dtype=torch.long, device=device).unsqueeze(0)
+        patch_offsets = (row_offsets + col_offsets).reshape(1, -1)
+        patch_starts = (
+            self.training_slice_starts[slice_indices]
+            + patch_rows * px_width
+            + patch_cols
+        ).unsqueeze(1)
+        indices = (patch_starts + patch_offsets).reshape(-1)
+
+        target = self.dataset.get_indices_pixels(indices)
+        density = self.slice_renderer.query_random_positions(
+            self.nerf,
+            indices,
+            reshaped=False,
+            jitter=False,
+        )
+        return target, density
+
+    def _sample_slice_batch(self):
+        slice_index = np.random.randint(len(self.dataset.slices))
+        target = self.dataset.get_slice_pixels(slice_index).to(DEVICE)
+        density = self.slice_renderer.render_slice_from_dataset(
+            self.nerf, slice_index, jitter=self.jitter_training,
+        )
+        return target, density
 
     def _compute_gradient_loss(self, target: torch.Tensor, density: torch.Tensor) -> torch.Tensor:
         target_slice = torch.reshape(
@@ -566,37 +726,100 @@ class NeUF:
             (self.dataset.px_height, self.dataset.px_width),
         ).unsqueeze(0).unsqueeze(0)
 
-        target_grad_x = torch.nn.functional.conv2d(target_slice, self.scharr_x, padding=1)
-        target_grad_y = torch.nn.functional.conv2d(target_slice, self.scharr_y, padding=1)
+        target_blurred = self._gaussian_blur(
+            target_slice,
+            kernel_size=self.grad_blur_kernel_size,
+            sigma=self.grad_blur_sigma,
+        )
+        target_grad_x = torch.nn.functional.conv2d(target_blurred, self.scharr_x, padding=1)
+        target_grad_y = torch.nn.functional.conv2d(target_blurred, self.scharr_y, padding=1)
         density_grad_x = torch.nn.functional.conv2d(density_slice, self.scharr_x, padding=1)
         density_grad_y = torch.nn.functional.conv2d(density_slice, self.scharr_y, padding=1)
 
-        return self.mse(density_grad_x, target_grad_x) + self.mse(density_grad_y, target_grad_y)
+        return self.criterion(density_grad_x, target_grad_x) + self.criterion(density_grad_y, target_grad_y)
 
-    def _compute_training_loss(self, target, density):
-        loss = self.mse(density, target)
-        
-        if self.training_mode == "Slice":
-            loss = loss + self.grad_weight * self._compute_gradient_loss(target, density)
-            loss = loss + self.tv_weight * self._compute_tv_loss(density)
-        
-        elif self.training_mode == "Random":
-            # 随机采样附近的点，约束密度连续性
-            loss = loss + self.tv_weight * self._compute_spatial_smoothness(self._current_points)
-        
-        return loss
+    def _gaussian_blur(self, x: torch.Tensor, kernel_size: int = 6, sigma: float = 1.5) -> torch.Tensor:
+        coords = torch.arange(kernel_size, dtype=x.dtype, device=x.device)
+        coords = coords - (kernel_size - 1) / 2
+        g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+        kernel = (g[:, None] * g[None, :]).unsqueeze(0).unsqueeze(0)
+        kernel = kernel / kernel.sum()
 
-    def _compute_spatial_smoothness(self, points):
-        """在3D空间中对邻域点施加平滑约束"""
-        with torch.no_grad():
-            delta = 0.3  # mm级别的偏移，需根据你的pixel_size调整
-            noise = delta * torch.randn_like(points)
-            perturbed = points + noise
-        
-        d_orig = self.nerf.query(points, torch.zeros_like(points))
-        d_perturbed = self.nerf.query(perturbed, torch.zeros_like(perturbed))
+        pad_total = kernel_size - 1
+        pad_before = pad_total // 2
+        pad_after = pad_total - pad_before
+        x_padded = torch.nn.functional.pad(
+            x,
+            (pad_before, pad_after, pad_before, pad_after),
+            mode="replicate",
+        )
+        return torch.nn.functional.conv2d(x_padded, kernel)
+
+    def _compute_tv_loss(self, density):
+        d = torch.reshape(density, (self.dataset.px_height, self.dataset.px_width))
+        diff_h = d[1:, :] - d[:-1, :]
+        diff_w = d[:, 1:] - d[:, :-1]
+
+        # Huber: 小于threshold用L2（强平滑），大于threshold用L1（保边）
+        threshold = 5.0  # 根据你图像灰度范围调s
+        tv_h = torch.nn.functional.huber_loss(diff_h, torch.zeros_like(diff_h),
+                                            delta=threshold, reduction='mean')
+        tv_w = torch.nn.functional.huber_loss(diff_w, torch.zeros_like(diff_w),
+                                            delta=threshold, reduction='mean')
+        return tv_h + tv_w
+
+    def _compute_patch_tv_loss(self, density: torch.Tensor) -> torch.Tensor:
+        patch_area = self.patch_size ** 2
+        if density.numel() % patch_area != 0:
+            raise ValueError(
+                "Patch density count must be divisible by patch_size**2, "
+                f"got density.numel()={density.numel()}, patch_size={self.patch_size}"
+            )
+
+        density_patches = torch.reshape(
+            density,
+            (-1, 1, self.patch_size, self.patch_size),
+        )
+        diff_h = density_patches[:, :, 1:, :] - density_patches[:, :, :-1, :]
+        diff_w = density_patches[:, :, :, 1:] - density_patches[:, :, :, :-1]
+        tv_h = torch.square(diff_h).sum()
+        tv_w = torch.square(diff_w).sum()
+        return (tv_h + tv_w) / (density_patches.shape[0] * patch_area)
+
+    def _compute_spatial_smoothness(self, points, viewdirs):
+        delta = self.smoothness_delta
+        noise = delta * torch.randn_like(points)
+        perturbed = points + noise
+        d_orig = self.nerf.query(points, viewdirs)
+        d_perturbed = self.nerf.query(perturbed, viewdirs)
         return torch.mean(torch.abs(d_orig - d_perturbed))
-    
+
+    def _compute_training_loss(self, target, density, iteration=0):
+        l1_loss = self.criterion(density, target)
+        loss = l1_loss
+        components: dict[str, torch.Tensor] = {"l1": l1_loss}
+
+        if self.training_mode == "Patch":
+            tv = self._compute_patch_tv_loss(density)
+            components["patch_tv"] = tv
+            loss = loss + self.tv_weight * tv
+
+        elif self.training_mode == "Slice":
+            grad = self._compute_gradient_loss(target, density)
+            tv = self._compute_tv_loss(density)
+            components["gradient"] = grad
+            components["tv"] = tv
+            loss = loss + self.grad_weight * grad + self.tv_weight * tv
+
+        elif self.training_mode == "Random":
+            smooth = self._compute_spatial_smoothness(
+                self._current_points, self._current_viewdirs
+            )
+            components["smoothness"] = smooth
+            loss = loss + self.tv_weight * smooth
+
+        return loss, components
+
     def _update_progress_bar(self, progress_bar, params: Optional[dict]) -> None:
         if params is None:
             return
@@ -623,6 +846,23 @@ class NeUF:
 
         try:
             for iteration in progress_bar:
+                if (
+                    self.progressive_training
+                    and self.nerf.encoding_type == "HASH"
+                    and self.nerf.use_encoding
+                ):
+                    active_levels = min(
+                        self.nerf.encode.n_levels,
+                        self.progressive_start_levels
+                        + iteration // self.progressive_step_interval,
+                    )
+                    self.nerf._active_levels = active_levels
+                    if iteration % 1000 == 0:
+                        gates = torch.sigmoid(
+                            self.nerf.encode.level_weights
+                        ).detach().cpu().numpy()
+                        print(f"Active levels: {active_levels}, Gates: {np.round(gates, 3)}")
+
                 if iteration != 0 and iteration % self.i_save == 0:
                     self._save_checkpoint(iteration)
 
@@ -634,16 +874,62 @@ class NeUF:
                         last_plot_time,
                     )
                     self._update_progress_bar(progress_bar, params)
+                    if self.nerf.encoding_type == "HASH" and self.nerf.use_encoding:
+                        gates = torch.sigmoid(
+                            self.nerf.encode.level_weights
+                        ).detach().cpu().numpy()
+                        for i, gate in enumerate(gates):
+                            self.tb_writer.add_scalar(f"gates/level_{i}", gate, iteration)
+
+                        if self.progressive_training:
+                            self.tb_writer.add_scalar(
+                                "gates/active_levels",
+                                getattr(self.nerf, '_active_levels', len(gates)),
+                                iteration,
+                            )
 
                 target, density = self._sample_training_batch()
                 self.optimizer.zero_grad()
-                loss = self._compute_training_loss(target, density)
+                loss, loss_components = self._compute_training_loss(target, density, iteration)
                 loss.backward()
+                if self.grad_clip_norm > 0:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.nerf.parameters(),
+                        max_norm=self.grad_clip_norm,
+                    )
+                    self.tb_writer.add_scalar(
+                        "train/grad_norm",
+                        self._to_float(grad_norm),
+                        iteration,
+                    )
                 self.optimizer.step()
-                train_losses.append(float(loss.detach().cpu()))
+                self.scheduler.step()
+
+                loss_value = float(loss.detach().cpu())
+                train_losses.append(loss_value)
+                self.tb_writer.add_scalar("loss/train_iter", loss_value, iteration)
+                self.tb_writer.add_scalar(
+                    "train/lr",
+                    self.optimizer.param_groups[0]["lr"],
+                    iteration,
+                )
+                for name, value in loss_components.items():
+                    self.tb_writer.add_scalar(
+                        f"loss/components/{name}",
+                        float(value.detach().cpu()),
+                        iteration,
+                    )
         finally:
             self.tb_writer.close()
             progress_bar.close()
+            tensorboard_dir = self.run_paths.log_dir / "tensorboard"
+            event_files = sorted(tensorboard_dir.glob("events.out.tfevents.*"))
+            print(f"TensorBoard log dir: {tensorboard_dir.resolve()}")
+            if event_files:
+                for event_file in event_files:
+                    print(f"TensorBoard event file: {event_file.resolve()}")
+            else:
+                print("TensorBoard event file not found.")
 
     def getReferences(self):
         references = [
@@ -674,16 +960,40 @@ def parse_args():
     parser.add_argument("--dataset", default=DEFAULT_DATASET_PATH, help="Dataset folder or baked dataset path")
     parser.add_argument("--checkpoint", default="", help="Checkpoint to resume from")
     parser.add_argument("--encoding", default="Hash", choices=["Hash", "Freq", "None"])
-    parser.add_argument("--training-mode", default="Random", choices=["Random", "Slice"])
+    parser.add_argument("--training-mode", default="Random", choices=["Random", "Slice", "Patch"])
     parser.add_argument("--points-per-iter", type=int, default=50000)
-    parser.add_argument("--nb-iters-max", type=int, default=8500)
+    parser.add_argument("--patch-size", type=int, default=32, help="Patch side length in pixels for Patch mode")
+    parser.add_argument("--nb-iters-max", type=int, default=10000)
     parser.add_argument("--plot-freq", type=int, default=100)
     parser.add_argument("--save-freq", type=int, default=100)
     parser.add_argument("--seed", type=int, default=19981708)
     parser.add_argument("--grad-weight", type=float, default=0.1)
+    parser.add_argument(
+        "--grad-clip-norm",
+        type=float,
+        default=1.0,
+        help="Max gradient norm for clipping. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--grad-blur-kernel-size",
+        type=int,
+        default=6,
+        help="Gaussian blur kernel size for GT gradient loss.",
+    )
+    parser.add_argument(
+        "--grad-blur-sigma",
+        type=float,
+        default=1.5,
+        help="Gaussian blur sigma for GT gradient loss.",
+    )
     parser.add_argument("--root", default=".", help="Root folder for logs and latest checkpoint")
     parser.add_argument("--raw-dataset", action="store_true", help="Treat --dataset as an unbaked folder")
     parser.add_argument("--jitter-training", action="store_true", help="Enable point jitter during training")
+    parser.add_argument("--tv-weight", type=float, default=1e-4)
+    parser.add_argument("--slice-mix-interval", type=int, default=10,
+                        help="In Random mode, mix a full slice every N iters for 2D TV loss. 0 to disable.")
+    parser.add_argument("--smoothness-delta", type=float, default=0.1,
+                        help="Perturbation distance in mm for spatial smoothness loss")
 
     hash_group = parser.add_argument_group(
         "HashGrid experiment parameters",
@@ -728,6 +1038,23 @@ def parse_args():
         default=DEFAULT_HASH_LOG2_HASHMAP_SIZE,
         help="HashGrid log2 hashmap size.",
     )
+    hash_group.add_argument(
+        "--progressive-training",
+        action="store_true",
+        help="Enable progressive level activation for hash encoder",
+    )
+    hash_group.add_argument(
+        "--progressive-start-levels",
+        type=int,
+        default=4,
+        help="Number of hash levels active from the start",
+    )
+    hash_group.add_argument(
+        "--progressive-step-interval",
+        type=int,
+        default=1000,
+        help="Unlock one more hash level every N iterations",
+    )
     return parser.parse_args()
 
 
@@ -739,19 +1066,29 @@ def main():
         encoding=args.encoding,
         training_mode=args.training_mode,
         points_per_iter=args.points_per_iter,
+        patch_size=args.patch_size,
         nb_iters_max=args.nb_iters_max,
         plot_freq=args.plot_freq,
         save_freq=args.save_freq,
         seed=args.seed,
         grad_weight=args.grad_weight,
+        grad_clip_norm=args.grad_clip_norm,
+        grad_blur_kernel_size=args.grad_blur_kernel_size,
+        grad_blur_sigma=args.grad_blur_sigma,
         root=args.root,
         baked_dataset=not args.raw_dataset,
         jitter_training=args.jitter_training,
+        tv_weight=args.tv_weight,
+        slice_mix_interval=args.slice_mix_interval,
+        smoothness_delta=args.smoothness_delta,
         hash_n_levels=args.hash_n_levels,
         hash_n_features_per_level=args.hash_n_features_per_level,
         hash_log2_hashmap_size=args.hash_log2_hashmap_size,
         hash_base_resolution=args.hash_base_resolution,
         hash_finest_resolution=args.hash_finest_resolution,
+        progressive_training=args.progressive_training,
+        progressive_start_levels=args.progressive_start_levels,
+        progressive_step_interval=args.progressive_step_interval,
     )
     neuf.run()
 

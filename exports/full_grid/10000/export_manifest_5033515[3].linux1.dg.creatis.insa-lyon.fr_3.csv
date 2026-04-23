@@ -1,0 +1,2 @@
+ckpt,output_root,latest_output,start_time,end_time
+/home/zchen/Code/NeUF/logs/21-04-2026/HASH_Patient0_6/checkpoints/10000.pkl,/misc/raid/zchen/Code/NeUF/exports/full_grid/10000,/misc/raid/zchen/Code/NeUF/exports/full_grid/10000/22-04-2026/10000_0,2026-04-22T10:04:00+02:00,2026-04-22T10:06:46+02:00

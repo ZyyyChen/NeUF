@@ -30,6 +30,11 @@ def parse_args():
     parser.add_argument("--ckpt", type=Path, required=True, help="Path to checkpoint .pkl")
     parser.add_argument("--output", type=Path, required=True, help="Output directory")
     parser.add_argument(
+        "--output-exact",
+        action="store_true",
+        help="Write directly into --output instead of creating a dated checkpoint subdirectory.",
+    )
+    parser.add_argument(
         "--spacing",
         type=float,
         nargs="+",
@@ -1015,7 +1020,11 @@ def voxelize_gt_observations(baked_dataset, point_min, point_max, spacing_xyz):
 
 def main():
     args = parse_args()
-    output_dir = make_dated_output_dir(args.output, args.ckpt)
+    if args.output_exact:
+        output_dir = args.output
+        output_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        output_dir = make_dated_output_dir(args.output, args.ckpt)
 
     ckpt, model = load_checkpoint(args.ckpt)
     baked_dataset, dataset_path = load_dataset_from_ckpt(ckpt)

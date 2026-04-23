@@ -17,3 +17,4 @@ root=/misc/raid/zchen/Code/NeUF/experiments/hash_grid_nmax/exp2_F_L12_Nmax512
 latest_checkpoint=/misc/raid/zchen/Code/NeUF/experiments/hash_grid_nmax/exp2_F_L12_Nmax512/latest/ckpt.pkl
 named_checkpoint=/misc/raid/zchen/Code/NeUF/experiments/hash_grid_nmax/exp2_F_L12_Nmax512/exp2_F_L12_Nmax512_latest.pkl
 start_time=2026-04-20T16:26:17+02:00
+end_time=2026-04-20T16:53:12+02:00

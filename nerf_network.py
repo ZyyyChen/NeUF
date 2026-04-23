@@ -172,7 +172,10 @@ class NeRF(nn.Module) :
 
     def query(self, inputs, dirs, netchunk=1024*64):
         inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
-        embedded = self.encode(inputs_flat)
+        if hasattr(self.encode, 'forward') and self.encoding_type == "HASH" and self.use_encoding:
+            embedded = self.encode(inputs_flat, active_levels=getattr(self, '_active_levels', None))
+        else:
+            embedded = self.encode(inputs_flat)
 
         if self.use_direction :
             input_dirs_flat = torch.reshape(dirs, [-1, dirs.shape[-1]])

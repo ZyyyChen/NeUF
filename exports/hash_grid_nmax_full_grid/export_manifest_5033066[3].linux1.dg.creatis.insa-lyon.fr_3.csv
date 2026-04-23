@@ -1,1 +1,2 @@
 experiment,ckpt,output_root,latest_output,start_time,end_time
+exp1_D_L16_Nmax64,/misc/raid/zchen/Code/NeUF/experiments/hash_grid_nmax/exp1_D_L16_Nmax64/exp1_D_L16_Nmax64_latest.pkl,/misc/raid/zchen/Code/NeUF/exports/hash_grid_nmax_full_grid/exp1_D_L16_Nmax64,/misc/raid/zchen/Code/NeUF/exports/hash_grid_nmax_full_grid/exp1_D_L16_Nmax64/20-04-2026/exp1_D_L16_Nmax64_latest_1,2026-04-20T16:47:28+02:00,2026-04-20T16:49:52+02:00
