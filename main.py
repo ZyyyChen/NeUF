@@ -52,6 +52,7 @@ class NeUF:
         self.i_save = int(kwargs.get("save_freq", 100))
         self.baked_dataset = bool(kwargs.get("baked_dataset", True))
         self.training_mode = kwargs.get("training_mode", "Random")
+        self.phase_switch_ratio = float(kwargs.get("phase_switch_ratio", 0.5))
         self.points_per_iter = int(kwargs.get("points_per_iter", 50000))
         self.jitter_training = bool(kwargs.get("jitter_training", False))
         self.patch_size = int(kwargs.get("patch_size", 32))
@@ -113,6 +114,10 @@ class NeUF:
         self.previous_validation_slices: dict[str, torch.Tensor] = {}
         self.gt_saved = False
         self.tb_reference_images_logged = False
+        self._active_mode: str = (
+            "Random" if self.training_mode == "CurriculumRS" else self.training_mode
+        )
+        self._phase_switched: bool = False
 
         self.random_permutation: Optional[torch.Tensor] = None
         self.random_start_index = 0
@@ -145,7 +150,7 @@ class NeUF:
             raise ValueError(f"plot_freq must be >= 1, got {self.i_plot}")
         if self.i_save <= 0:
             raise ValueError(f"save_freq must be >= 1, got {self.i_save}")
-        if self.training_mode not in {"Random", "Slice", "Patch"}:
+        if self.training_mode not in {"Random", "Slice", "Patch", "CurriculumRS"}:
             raise ValueError(f"Unknown training mode: {self.training_mode}")
         if self.points_per_iter <= 0:
             raise ValueError(f"points_per_iter must be >= 1, got {self.points_per_iter}")
@@ -240,6 +245,15 @@ class NeUF:
                 "dual loss weights must be >= 0, "
                 f"got {self.dual_sparsity_weight}, {self.dual_gate_weight}"
             )
+        if not (0.0 < self.phase_switch_ratio < 1.0):
+            raise ValueError(
+                f"phase_switch_ratio must be in (0, 1), got {self.phase_switch_ratio}"
+            )
+
+    def _current_phase(self, progress: float) -> str:
+        if self.training_mode != "CurriculumRS":
+            return self.training_mode
+        return "Random" if progress < self.phase_switch_ratio else "Slice"
 
     def _validate_dataset_configuration(self) -> None:
         if self.training_mode != "Patch":
@@ -670,6 +684,7 @@ class NeUF:
         if self.nerf.dual_encoder is not None:
             self._save_dual_freq_preview(iteration)
         self._write_tensorboard_images(iteration, rendered, references)
+        self._write_dual_freq_tensorboard(iteration)
         self._write_metrics(iteration, loss_train, loss_valid, loss_gt, loss_valid_tv)
         self.previous_validation_slices = {
             name: tensor.detach().clone() for name, tensor in rendered.items()
@@ -725,6 +740,7 @@ class NeUF:
         axes[0].imshow(low_img, cmap="gray")
         axes[0].set_title("Low-frequency mean")
         axes[1].imshow(high_img, cmap="hot")
+        axes[1].set_title("High-frequency mean")
         axes[2].imshow(gate_img, cmap="hot")
         axes[2].set_title(f"Gate (progress={progress:.2f})")
         for ax in axes:
@@ -732,6 +748,70 @@ class NeUF:
         plt.tight_layout()
         plt.savefig(self.run_paths.image_dir / f"dual_freq_{iteration:06d}.png", dpi=100)
         plt.close(fig)
+
+    def _write_dual_freq_tensorboard(self, iteration: int) -> None:
+        if self.nerf.dual_encoder is None or not self.dataset.slices_valid:
+            return
+
+        encoder = self.nerf.dual_encoder
+        progress = float(getattr(self.nerf, "training_progress", 1.0))
+        hf_weight = float(
+            encoder.global_hf_weight(progress, device=DEVICE, dtype=torch.float32)
+            .detach()
+            .cpu()
+        )
+        self.tb_writer.add_scalar("dual/hf_weight", hf_weight, iteration)
+
+        with torch.no_grad():
+            points = self._model_input_points(self.dataset.get_slice_valid_points(0))
+            decomp = encoder.forward_decomposed(points, progress)
+
+        height, width = self.dataset.px_height, self.dataset.px_width
+        if points.shape[0] != height * width:
+            return
+
+        def to_hw_image(tensor: torch.Tensor, clamp_unit: bool = False) -> torch.Tensor:
+            image = tensor.detach().cpu().float().reshape(height, width)
+            if clamp_unit:
+                return torch.clamp(image, 0.0, 1.0)
+            image_min = image.min()
+            image_max = image.max()
+            if float(image_max - image_min) > 1e-8:
+                image = (image - image_min) / (image_max - image_min)
+            else:
+                image = torch.zeros_like(image)
+            return image
+
+        name = VALIDATION_SLICE_NAMES[0]
+        gate_img = to_hw_image(decomp["gate"].squeeze(-1), clamp_unit=True)
+        feat_low_img = to_hw_image(decomp["feat_low"].mean(dim=-1))
+        feat_high_img = to_hw_image(decomp["feat_high"].mean(dim=-1))
+        weighted_high_img = to_hw_image(decomp["weighted_high"].mean(dim=-1))
+
+        self.tb_writer.add_image(f"dual/gate_map/{name}", gate_img, iteration, dataformats="HW")
+        self.tb_writer.add_image(
+            f"dual/feat_low_mean/{name}",
+            feat_low_img,
+            iteration,
+            dataformats="HW",
+        )
+        self.tb_writer.add_image(
+            f"dual/feat_high_mean/{name}",
+            feat_high_img,
+            iteration,
+            dataformats="HW",
+        )
+        self.tb_writer.add_image(
+            f"dual/weighted_high_mean/{name}",
+            weighted_high_img,
+            iteration,
+            dataformats="HW",
+        )
+
+        gate_flat = gate_img.reshape(-1)
+        self.tb_writer.add_scalar("dual/gate_mean", float(gate_flat.mean()), iteration)
+        self.tb_writer.add_scalar("dual/gate_std", float(gate_flat.std()), iteration)
+        self.tb_writer.add_histogram("dual/gate_histogram", gate_flat, iteration)
 
     def _next_random_indices(self) -> torch.Tensor:
         if self.random_permutation is None:
@@ -767,30 +847,26 @@ class NeUF:
         self._current_points = None
         self._current_viewdirs = None
         self._current_target_slice = None
+        active_mode = self._active_mode
 
-        if self.training_mode == "Slice":
-            slice_index = np.random.randint(len(self.dataset.slices))
-            target = self.dataset.get_slice_pixels(slice_index).to(DEVICE)
-            self._current_points = self.dataset.get_slice_points(slice_index)
-            self._current_viewdirs = self.dataset.get_slice_viewdirs(slice_index)
-            self._current_target_slice = target
-            density = self.slice_renderer.render_slice_from_dataset(
-                self.nerf, slice_index, jitter=self.jitter_training,
-            )
-            return target, density
+        if active_mode == "Slice":
+            return self._sample_slice_batch()
 
-        if self.training_mode == "Patch":
+        if active_mode == "Patch":
             return self._sample_patch_batch()
 
-        if self.training_mode == "Random":
-            indices = self._next_random_indices()
-            target = self.dataset.get_indices_pixels(indices)
-            self._current_points = self.dataset.get_indices_points(indices)
-            self._current_viewdirs = self.dataset.get_indices_viewdirs(indices)
-            density = self.slice_renderer.query_random_positions(self.nerf, indices, reshaped=False)
-            return target, density
+        if active_mode == "Random":
+            return self._sample_random_batch()
 
-        raise ValueError(f"Training mode '{self.training_mode}' is not implemented")
+        raise ValueError(f"Training mode '{active_mode}' is not implemented")
+
+    def _sample_random_batch(self):
+        indices = self._next_random_indices()
+        target = self.dataset.get_indices_pixels(indices)
+        self._current_points = self.dataset.get_indices_points(indices)
+        self._current_viewdirs = self.dataset.get_indices_viewdirs(indices)
+        density = self.slice_renderer.query_random_positions(self.nerf, indices, reshaped=False)
+        return target, density
 
     def _sample_patch_batch(self, patch_size: Optional[int] = None, n_patches: Optional[int] = None):
         patch_size = self.patch_size if patch_size is None else int(patch_size)
@@ -847,6 +923,9 @@ class NeUF:
     def _sample_slice_batch(self):
         slice_index = np.random.randint(len(self.dataset.slices))
         target = self.dataset.get_slice_pixels(slice_index).to(DEVICE)
+        self._current_points = self.dataset.get_slice_points(slice_index)
+        self._current_viewdirs = self.dataset.get_slice_viewdirs(slice_index)
+        self._current_target_slice = target
         density = self.slice_renderer.render_slice_from_dataset(
             self.nerf, slice_index, jitter=self.jitter_training,
         )
@@ -953,25 +1032,27 @@ class NeUF:
         mse_loss = self.reconstruction_criterion(density, target)
         loss = mse_loss
         components: dict[str, torch.Tensor] = {"mse": mse_loss}
+        active_mode = self._active_mode
 
-        # if self.training_mode == "Patch":
-        #     tv = self._compute_patch_tv_loss(density)
-        #     components["patch_tv"] = tv
-        #     loss = loss + self.tv_weight * tv
+        if active_mode == "Patch":
+            tv = self._compute_patch_tv_loss(density)
+            components["patch_tv"] = tv
+            loss = loss + self.tv_weight * tv
 
-        # elif self.training_mode == "Slice":
-        #     grad = self._compute_gradient_loss(target, density)
-        #     tv = self._compute_tv_loss(density)
-        #     components["gradient"] = grad
-        #     components["tv"] = tv
-        #     loss = loss + self.grad_weight * grad + self.tv_weight * tv
+        elif active_mode == "Slice":
+            grad = self._compute_gradient_loss(target, density)
+            tv = self._compute_tv_loss(density)
+            components["gradient"] = grad
+            components["tv"] = tv
+            loss = loss + self.grad_weight * grad + self.tv_weight * tv
 
-        # elif self.training_mode == "Random":
-        #     smooth = self._compute_spatial_smoothness(
-        #         self._current_points, self._current_viewdirs
-        #     )
-        #     components["smoothness"] = smooth
-        #     loss = loss + self.tv_weight * smooth
+        elif active_mode == "Random" and self.training_mode == "Random":
+            if self._current_points is not None and self._current_viewdirs is not None:
+                smooth = self._compute_spatial_smoothness(
+                    self._current_points, self._current_viewdirs
+                )
+                components["smoothness"] = smooth
+                loss = loss + self.tv_weight * smooth
 
         if self.nerf.dual_encoder is not None and self._current_points is not None:
             progress = self.nerf.training_progress
@@ -987,7 +1068,7 @@ class NeUF:
             loss = loss + self.dual_sparsity_weight * sparsity
 
             if (
-                self.training_mode == "Slice"
+                active_mode == "Slice"
                 and self._current_target_slice is not None
                 and self._current_target_slice.numel() == gate.shape[0]
             ):
@@ -1027,8 +1108,18 @@ class NeUF:
 
         try:
             for iteration in progress_bar:
-                if self.nerf.dual_encoder is not None:
-                    self.nerf.training_progress = iteration / max(1, self.N_iters)
+                self.nerf.training_progress = iteration / max(1, self.N_iters)
+                self._active_mode = self._current_phase(self.nerf.training_progress)
+                if (
+                    self.training_mode == "CurriculumRS"
+                    and self._active_mode == "Slice"
+                    and self._phase_switched is False
+                ):
+                    self._phase_switched = True
+                    tqdm.tqdm.write(
+                        f"[CurriculumRS] Switched to Slice phase at iteration={iteration}, "
+                        f"progress={self.nerf.training_progress:.3f}"
+                    )
 
                 if (
                     self.progressive_training
@@ -1097,6 +1188,11 @@ class NeUF:
                     self.optimizer.param_groups[0]["lr"],
                     iteration,
                 )
+                phase_value = {"Random": 0.0, "Slice": 1.0, "Patch": 2.0}.get(
+                    self._active_mode,
+                    -1.0,
+                )
+                self.tb_writer.add_scalar("train/phase", phase_value, iteration)
                 for name, value in loss_components.items():
                     self.tb_writer.add_scalar(
                         f"loss/components/{name}",
@@ -1148,7 +1244,11 @@ def parse_args():
         default="Hash",
         choices=["Hash", "Freq", "None", "DUAL_HASH", "DUAL_FREQ"],
     )
-    parser.add_argument("--training-mode", default="Random", choices=["Random", "Slice", "Patch"])
+    parser.add_argument(
+        "--training-mode",
+        default="Random",
+        choices=["Random", "Slice", "Patch", "CurriculumRS"],
+    )
     parser.add_argument("--points-per-iter", type=int, default=50000)
     parser.add_argument("--patch-size", type=int, default=32, help="Patch side length in pixels for Patch mode")
     parser.add_argument("--nb-iters-max", type=int, default=10000)
@@ -1182,6 +1282,13 @@ def parse_args():
                         help="In Random mode, mix a full slice every N iters for 2D TV loss. 0 to disable.")
     parser.add_argument("--smoothness-delta", type=float, default=0.1,
                         help="Perturbation distance in mm for spatial smoothness loss")
+    parser.add_argument(
+        "--phase-switch-ratio",
+        dest="phase_switch_ratio",
+        type=float,
+        default=0.4,
+        help="Training progress threshold for CurriculumRS to switch from Random to Slice.",
+    )
 
     hash_group = parser.add_argument_group(
         "HashGrid experiment parameters",
@@ -1338,6 +1445,7 @@ def main():
         tv_weight=args.tv_weight,
         slice_mix_interval=args.slice_mix_interval,
         smoothness_delta=args.smoothness_delta,
+        phase_switch_ratio=args.phase_switch_ratio,
         hash_n_levels=args.hash_n_levels,
         hash_n_features_per_level=args.hash_n_features_per_level,
         hash_log2_hashmap_size=args.hash_log2_hashmap_size,
