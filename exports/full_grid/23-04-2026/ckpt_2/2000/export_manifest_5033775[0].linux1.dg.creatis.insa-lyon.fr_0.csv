@@ -1,0 +1,2 @@
+ckpt,output_root,latest_output,start_time,end_time
+/home/zchen/Code/NeUF/logs/23-04-2026/DUAL_FREQ_Patient0_0/checkpoints/2000.pkl,/misc/raid/zchen/Code/NeUF/exports/full_grid/23-04-2026/ckpt_2/2000,/misc/raid/zchen/Code/NeUF/exports/full_grid/23-04-2026/ckpt_2/2000,2026-04-23T13:14:39+02:00,2026-04-23T13:16:23+02:00

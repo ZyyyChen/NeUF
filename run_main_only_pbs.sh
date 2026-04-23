@@ -19,7 +19,7 @@ RUN_ROOT="${RUN_ROOT:-${REPO_DIR}}"
 LOG_DIR="${LOG_DIR:-/home/zchen/history/neuf_main}"
 
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-}"
-ENCODING="${ENCODING:-Hash}"
+ENCODING="${ENCODING:-DUAL_HASH}"
 TRAINING_MODE="${TRAINING_MODE:-Random}"
 POINTS_PER_ITER="${POINTS_PER_ITER:-50000}"
 PATCH_SIZE="${PATCH_SIZE:-32}"
@@ -30,7 +30,7 @@ SEED="${SEED:-19981708}"
 GRAD_WEIGHT="${GRAD_WEIGHT:-0.1}"
 GRAD_BLUR_KERNEL_SIZE="${GRAD_BLUR_KERNEL_SIZE:-6}"
 GRAD_BLUR_SIGMA="${GRAD_BLUR_SIGMA:-1.5}"
-TV_WEIGHT="${TV_WEIGHT:-50}"
+TV_WEIGHT="${TV_WEIGHT:-20}"
 SLICE_MIX_INTERVAL="${SLICE_MIX_INTERVAL:-10}"
 SMOOTHNESS_DELTA="${SMOOTHNESS_DELTA:-0.1}"
 
@@ -39,6 +39,29 @@ HASH_N_MIN="${HASH_N_MIN:-16}"
 HASH_N_MAX="${HASH_N_MAX:-256}"
 HASH_FEATURES_PER_LEVEL="${HASH_FEATURES_PER_LEVEL:-2}"
 HASH_LOG2_HASHMAP_SIZE="${HASH_LOG2_HASHMAP_SIZE:-19}"
+
+DUAL_PE_TYPE="${DUAL_PE_TYPE:-}"
+if [[ -z "${DUAL_PE_TYPE}" ]]; then
+  if [[ "${ENCODING}" == "DUAL_FREQ" || "${ENCODING}" == "dual_freq" ]]; then
+    DUAL_PE_TYPE="fourier"
+  else
+    DUAL_PE_TYPE="hash"
+  fi
+fi
+DUAL_N_LEVELS_LOW="${DUAL_N_LEVELS_LOW:-8}"
+DUAL_N_LEVELS_HIGH="${DUAL_N_LEVELS_HIGH:-8}"
+DUAL_N_MIN_LOW="${DUAL_N_MIN_LOW:-16}"
+DUAL_N_MAX_LOW="${DUAL_N_MAX_LOW:-64}"
+DUAL_N_MIN_HIGH="${DUAL_N_MIN_HIGH:-64}"
+DUAL_N_MAX_HIGH="${DUAL_N_MAX_HIGH:-512}"
+DUAL_SIGMA_LOW="${DUAL_SIGMA_LOW:-1.0}"
+DUAL_SIGMA_HIGH="${DUAL_SIGMA_HIGH:-20.0}"
+DUAL_N_FREQ="${DUAL_N_FREQ:-64}"
+DUAL_USE_GATE="${DUAL_USE_GATE:-1}"
+DUAL_HF_ACTIVATE_RATIO="${DUAL_HF_ACTIVATE_RATIO:-0.6}"
+DUAL_HF_MAX_WEIGHT="${DUAL_HF_MAX_WEIGHT:-1.0}"
+DUAL_SPARSITY_WEIGHT="${DUAL_SPARSITY_WEIGHT:-10}"
+DUAL_GATE_WEIGHT="${DUAL_GATE_WEIGHT:-0.5}"
 
 RAW_DATASET="${RAW_DATASET:-0}"
 JITTER_TRAINING="${JITTER_TRAINING:-0}"
@@ -83,6 +106,20 @@ cmd=(
   --hash-n-max "${HASH_N_MAX}"
   --hash-n-features-per-level "${HASH_FEATURES_PER_LEVEL}"
   --hash-log2-hashmap-size "${HASH_LOG2_HASHMAP_SIZE}"
+  --dual-pe-type "${DUAL_PE_TYPE}"
+  --dual-n-levels-low "${DUAL_N_LEVELS_LOW}"
+  --dual-n-levels-high "${DUAL_N_LEVELS_HIGH}"
+  --dual-base-resolution-low "${DUAL_N_MIN_LOW}"
+  --dual-finest-resolution-low "${DUAL_N_MAX_LOW}"
+  --dual-base-resolution-high "${DUAL_N_MIN_HIGH}"
+  --dual-finest-resolution-high "${DUAL_N_MAX_HIGH}"
+  --dual-sigma-low "${DUAL_SIGMA_LOW}"
+  --dual-sigma-high "${DUAL_SIGMA_HIGH}"
+  --dual-n-freq "${DUAL_N_FREQ}"
+  --dual-hf-activate-ratio "${DUAL_HF_ACTIVATE_RATIO}"
+  --dual-hf-max-weight "${DUAL_HF_MAX_WEIGHT}"
+  --dual-sparsity-weight "${DUAL_SPARSITY_WEIGHT}"
+  --dual-gate-weight "${DUAL_GATE_WEIGHT}"
 )
 
 if [[ -n "${CHECKPOINT_PATH}" ]]; then
@@ -93,6 +130,9 @@ if [[ "${RAW_DATASET}" == "1" ]]; then
 fi
 if [[ "${JITTER_TRAINING}" == "1" ]]; then
   cmd+=(--jitter-training)
+fi
+if [[ "${DUAL_USE_GATE}" == "0" ]]; then
+  cmd+=(--dual-no-gate)
 fi
 
 start_time="$(date --iso-8601=seconds)"
@@ -121,6 +161,21 @@ config_path="${RUN_ROOT}/main_config_${PBS_JOBID:-manual}.txt"
   echo "hash_n_max=${HASH_N_MAX}"
   echo "hash_features_per_level=${HASH_FEATURES_PER_LEVEL}"
   echo "hash_log2_hashmap_size=${HASH_LOG2_HASHMAP_SIZE}"
+  echo "dual_pe_type=${DUAL_PE_TYPE}"
+  echo "dual_n_levels_low=${DUAL_N_LEVELS_LOW}"
+  echo "dual_n_levels_high=${DUAL_N_LEVELS_HIGH}"
+  echo "dual_n_min_low=${DUAL_N_MIN_LOW}"
+  echo "dual_n_max_low=${DUAL_N_MAX_LOW}"
+  echo "dual_n_min_high=${DUAL_N_MIN_HIGH}"
+  echo "dual_n_max_high=${DUAL_N_MAX_HIGH}"
+  echo "dual_sigma_low=${DUAL_SIGMA_LOW}"
+  echo "dual_sigma_high=${DUAL_SIGMA_HIGH}"
+  echo "dual_n_freq=${DUAL_N_FREQ}"
+  echo "dual_use_gate=${DUAL_USE_GATE}"
+  echo "dual_hf_activate_ratio=${DUAL_HF_ACTIVATE_RATIO}"
+  echo "dual_hf_max_weight=${DUAL_HF_MAX_WEIGHT}"
+  echo "dual_sparsity_weight=${DUAL_SPARSITY_WEIGHT}"
+  echo "dual_gate_weight=${DUAL_GATE_WEIGHT}"
   echo "raw_dataset=${RAW_DATASET}"
   echo "jitter_training=${JITTER_TRAINING}"
   echo "start_time=${start_time}"

@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import base_encoder
 import hash_encoder
+import dual_freq_encoder
 from datetime import date
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -30,6 +31,8 @@ class NeRF(nn.Module) :
         self.num_freq_dir=0
 
         self.encoding_initialized = False
+        self.dual_encoder: dual_freq_encoder.DualFreqEncoder | None = None
+        self.training_progress: float = 0.0
 
         if ckpt != None :
             self._init_from_ckpt(ckpt)
@@ -58,6 +61,29 @@ class NeRF(nn.Module) :
             )
             if self.use_encoding :
                 self.encode.load_state_dict(ckpt["hash_encoder_state"])
+        elif ckpt["encoding"].startswith("DUAL_"):
+            encoding_name = ckpt["encoding"].upper()
+            pe_type = "fourier" if encoding_name in {"DUAL_FREQ", "DUAL_FOURIER"} else "hash"
+            self.init_dual_encoding(
+                pe_type=pe_type,
+                bounding_box=ckpt.get("bounding_box"),
+                n_levels_low=ckpt.get("n_levels_low", 8) or 8,
+                n_levels_high=ckpt.get("n_levels_high", 8) or 8,
+                n_features_per_level=ckpt.get("n_features_per_level", 2) or 2,
+                log2_hashmap_size=ckpt.get("log2_hashmap_size", 19) or 19,
+                base_resolution_low=ckpt.get("base_resolution_low", 16) or 16,
+                finest_resolution_low=ckpt.get("finest_resolution_low", 64) or 64,
+                base_resolution_high=ckpt.get("base_resolution_high", 64) or 64,
+                finest_resolution_high=ckpt.get("finest_resolution_high", 512) or 512,
+                sigma_low=ckpt.get("sigma_low", 1.0) or 1.0,
+                sigma_high=ckpt.get("sigma_high", 20.0) or 20.0,
+                n_freq=ckpt.get("n_freq", 64) or 64,
+                use_gate=ckpt.get("use_gate", True),
+                hf_activate_ratio=ckpt.get("hf_activate_ratio", 0.6) or 0.6,
+                hf_max_weight=ckpt.get("hf_max_weight", 1.0) or 1.0,
+            )
+            if self.dual_encoder is not None and "dual_encoder_state" in ckpt:
+                self.dual_encoder.load_state_dict(ckpt["dual_encoder_state"])
         else:
             print("unknown model type:",ckpt["encoding"])
             exit(-1)
@@ -106,6 +132,60 @@ class NeRF(nn.Module) :
         self.use_encoding = use_encoding
         self.use_direction = use_directions
         self.encoding_type = "FREQ"
+        self.encoding_initialized = True
+
+    def init_dual_encoding(
+        self,
+        pe_type: str = "hash",
+        bounding_box=None,
+        n_levels_low: int = 8,
+        n_levels_high: int = 8,
+        n_features_per_level: int = 2,
+        log2_hashmap_size: int = 19,
+        base_resolution_low: int = 16,
+        finest_resolution_low: int = 64,
+        base_resolution_high: int = 64,
+        finest_resolution_high: int = 512,
+        sigma_low: float = 1.0,
+        sigma_high: float = 20.0,
+        n_freq: int = 64,
+        use_gate: bool = True,
+        hf_activate_ratio: float = 0.6,
+        hf_max_weight: float = 1.0,
+    ):
+        if self.encoding_initialized :
+            print("encoding initialized twice")
+            exit(-1)
+
+        pe_type = pe_type.lower()
+        self.dual_encoder = dual_freq_encoder.DualFreqEncoder(
+            pe_type=pe_type,
+            bounding_box=bounding_box,
+            n_levels_low=n_levels_low,
+            n_levels_high=n_levels_high,
+            n_features_per_level=n_features_per_level,
+            log2_hashmap_size=log2_hashmap_size,
+            base_resolution_low=base_resolution_low,
+            finest_resolution_low=finest_resolution_low,
+            base_resolution_high=base_resolution_high,
+            finest_resolution_high=finest_resolution_high,
+            sigma_low=sigma_low,
+            sigma_high=sigma_high,
+            n_freq=n_freq,
+            use_gate=use_gate,
+            hf_activate_ratio=hf_activate_ratio,
+            hf_max_weight=hf_max_weight,
+        )
+
+        self.encode = lambda x: self.dual_encoder(x, self.training_progress)
+        self.in_ch = self.dual_encoder.out_dim
+        self.out_ch = 1
+        self.skips = [4]
+        self.dir_ch = 0
+        self.use_encoding = True
+        self.use_direction = False
+        self.encoding_type = "DUAL_FREQ" if pe_type == "fourier" else "DUAL_HASH"
+        self.encoder_params = list(self.dual_encoder.parameters())
         self.encoding_initialized = True
 
 
@@ -237,6 +317,62 @@ class NeRF(nn.Module) :
                     "base_resolution": float(self.encode.base_resolution.cpu()),
                     "finest_resolution": float(self.encode.finest_resolution.cpu()),
                     "hash_encoder_state": self.encode.state_dict(),
+                })
+            elif self.encoding_type.startswith("DUAL_") and self.dual_encoder is not None:
+                enc = self.dual_encoder
+                dic.update({
+                    "bounding_box": (
+                        enc.enc_low.bounding_box
+                        if hasattr(enc.enc_low, "bounding_box")
+                        else None
+                    ),
+                    "n_levels_low": (
+                        enc.enc_low.n_levels
+                        if hasattr(enc.enc_low, "n_levels")
+                        else None
+                    ),
+                    "n_levels_high": (
+                        enc.enc_high.n_levels
+                        if hasattr(enc.enc_high, "n_levels")
+                        else None
+                    ),
+                    "n_features_per_level": (
+                        enc.enc_low.n_features_per_level
+                        if hasattr(enc.enc_low, "n_features_per_level")
+                        else None
+                    ),
+                    "log2_hashmap_size": (
+                        enc.enc_low.log2_hashmap_size
+                        if hasattr(enc.enc_low, "log2_hashmap_size")
+                        else None
+                    ),
+                    "base_resolution_low": (
+                        float(enc.enc_low.base_resolution.cpu())
+                        if hasattr(enc.enc_low, "base_resolution")
+                        else None
+                    ),
+                    "finest_resolution_low": (
+                        float(enc.enc_low.finest_resolution.cpu())
+                        if hasattr(enc.enc_low, "finest_resolution")
+                        else None
+                    ),
+                    "base_resolution_high": (
+                        float(enc.enc_high.base_resolution.cpu())
+                        if hasattr(enc.enc_high, "base_resolution")
+                        else None
+                    ),
+                    "finest_resolution_high": (
+                        float(enc.enc_high.finest_resolution.cpu())
+                        if hasattr(enc.enc_high, "finest_resolution")
+                        else None
+                    ),
+                    "sigma_low": getattr(enc.enc_low, "sigma", None),
+                    "sigma_high": getattr(enc.enc_high, "sigma", None),
+                    "n_freq": getattr(enc.enc_low, "n_freq", None),
+                    "use_gate": enc.use_gate,
+                    "hf_activate_ratio": enc.hf_activate_ratio,
+                    "hf_max_weight": enc.hf_max_weight,
+                    "dual_encoder_state": enc.state_dict(),
                 })
 
         return dic

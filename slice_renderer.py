@@ -99,7 +99,7 @@ class SliceRenderer:
         return mask
 
     def _normalize_points_if_needed(self, model, points: torch.Tensor, bb_min_dev: torch.Tensor) -> torch.Tensor:
-        if model.encoding_type == "HASH" and model.use_encoding:
+        if model.encoding_type in {"HASH", "DUAL_HASH"} and model.use_encoding:
             return points
 
         return torch.add(

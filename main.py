@@ -12,6 +12,7 @@ from typing import Optional
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
@@ -79,6 +80,21 @@ class NeUF:
         self.hash_finest_resolution = int(
             kwargs.get("hash_finest_resolution", DEFAULT_HASH_FINEST_RESOLUTION)
         )
+        self.dual_pe_type = kwargs.get("dual_pe_type", "hash")
+        self.dual_n_levels_low = int(kwargs.get("dual_n_levels_low", 8))
+        self.dual_n_levels_high = int(kwargs.get("dual_n_levels_high", 8))
+        self.dual_finest_resolution_low = int(kwargs.get("dual_finest_resolution_low", 64))
+        self.dual_finest_resolution_high = int(kwargs.get("dual_finest_resolution_high", 512))
+        self.dual_base_resolution_low = int(kwargs.get("dual_base_resolution_low", 16))
+        self.dual_base_resolution_high = int(kwargs.get("dual_base_resolution_high", 64))
+        self.dual_sigma_low = float(kwargs.get("dual_sigma_low", 1.0))
+        self.dual_sigma_high = float(kwargs.get("dual_sigma_high", 20.0))
+        self.dual_n_freq = int(kwargs.get("dual_n_freq", 64))
+        self.dual_use_gate = bool(kwargs.get("dual_use_gate", True))
+        self.dual_hf_activate_ratio = float(kwargs.get("dual_hf_activate_ratio", 0.6))
+        self.dual_hf_max_weight = float(kwargs.get("dual_hf_max_weight", 1.0))
+        self.dual_sparsity_weight = float(kwargs.get("dual_sparsity_weight", 0.01))
+        self.dual_gate_weight = float(kwargs.get("dual_gate_weight", 0.5))
         self.progressive_training = bool(kwargs.get("progressive_training", False))
         self.progressive_start_levels = int(kwargs.get("progressive_start_levels", 4))
         self.progressive_step_interval = int(kwargs.get("progressive_step_interval", 1000))
@@ -91,8 +107,8 @@ class NeUF:
         self.slice_renderer: SliceRenderer
         self.start = 0
 
-        # self.criterion = torch.nn.MSELoss()
         self.criterion = torch.nn.L1Loss()
+        self.reconstruction_criterion = torch.nn.MSELoss()
         self.scharr_x, self.scharr_y = self._build_scharr_kernels()
         self.previous_validation_slices: dict[str, torch.Tensor] = {}
         self.gt_saved = False
@@ -103,6 +119,7 @@ class NeUF:
         self.training_slice_starts: Optional[torch.Tensor] = None
         self._current_points = None
         self._current_viewdirs = None
+        self._current_target_slice = None
 
         checkpoint = self._load_checkpoint(self.ckptFile)
         if checkpoint is not None:
@@ -180,6 +197,49 @@ class NeUF:
                 "progressive_step_interval must be >= 1, "
                 f"got {self.progressive_step_interval}"
             )
+        if self.dual_pe_type not in {"hash", "fourier"}:
+            raise ValueError(f"dual_pe_type must be 'hash' or 'fourier', got {self.dual_pe_type}")
+        if self.dual_n_levels_low <= 0 or self.dual_n_levels_high <= 0:
+            raise ValueError(
+                "dual_n_levels_low and dual_n_levels_high must be >= 1, "
+                f"got {self.dual_n_levels_low}, {self.dual_n_levels_high}"
+            )
+        if self.dual_base_resolution_low <= 0 or self.dual_base_resolution_high <= 0:
+            raise ValueError(
+                "dual base resolutions must be >= 1, "
+                f"got {self.dual_base_resolution_low}, {self.dual_base_resolution_high}"
+            )
+        if self.dual_finest_resolution_low < self.dual_base_resolution_low:
+            raise ValueError(
+                "dual_finest_resolution_low must be >= dual_base_resolution_low, "
+                f"got {self.dual_finest_resolution_low} < {self.dual_base_resolution_low}"
+            )
+        if self.dual_finest_resolution_high < self.dual_base_resolution_high:
+            raise ValueError(
+                "dual_finest_resolution_high must be >= dual_base_resolution_high, "
+                f"got {self.dual_finest_resolution_high} < {self.dual_base_resolution_high}"
+            )
+        if self.dual_sigma_low <= 0 or self.dual_sigma_high <= 0:
+            raise ValueError(
+                "dual sigma values must be > 0, "
+                f"got {self.dual_sigma_low}, {self.dual_sigma_high}"
+            )
+        if self.dual_n_freq <= 0:
+            raise ValueError(f"dual_n_freq must be >= 1, got {self.dual_n_freq}")
+        if not 0 <= self.dual_hf_activate_ratio <= 1:
+            raise ValueError(
+                "dual_hf_activate_ratio must be in [0, 1], "
+                f"got {self.dual_hf_activate_ratio}"
+            )
+        if self.dual_hf_max_weight < 0:
+            raise ValueError(
+                f"dual_hf_max_weight must be >= 0, got {self.dual_hf_max_weight}"
+            )
+        if self.dual_sparsity_weight < 0 or self.dual_gate_weight < 0:
+            raise ValueError(
+                "dual loss weights must be >= 0, "
+                f"got {self.dual_sparsity_weight}, {self.dual_gate_weight}"
+            )
 
     def _validate_dataset_configuration(self) -> None:
         if self.training_mode != "Patch":
@@ -213,10 +273,13 @@ class NeUF:
         return float(value)
 
     def _print_hash_configuration(self) -> None:
-        if self.nerf.get_encode_name() != "HASH":
+        if self.nerf.get_encode_name() == "DUAL_HASH":
+            encoder = self.nerf.dual_encoder.enc_high
+        elif self.nerf.get_encode_name() == "HASH":
+            encoder = self.nerf.encode
+        else:
             return
 
-        encoder = self.nerf.encode
         n_levels = int(encoder.n_levels)
         base_resolution = self._to_float(encoder.base_resolution)
         finest_resolution = self._to_float(encoder.finest_resolution)
@@ -344,6 +407,28 @@ class NeUF:
                 finest_resolution=self.hash_finest_resolution,
                 use_encoding=False,
                 use_directions=False,
+            )
+            return
+
+        if encoding_name in ("dual_hash", "dual_freq"):
+            pe_type = "hash" if encoding_name == "dual_hash" else "fourier"
+            self.nerf.init_dual_encoding(
+                pe_type=pe_type,
+                bounding_box=self.dataset.get_bounding_box(),
+                n_levels_low=self.dual_n_levels_low,
+                n_levels_high=self.dual_n_levels_high,
+                n_features_per_level=self.hash_n_features_per_level,
+                log2_hashmap_size=self.hash_log2_hashmap_size,
+                base_resolution_low=self.dual_base_resolution_low,
+                finest_resolution_low=self.dual_finest_resolution_low,
+                base_resolution_high=self.dual_base_resolution_high,
+                finest_resolution_high=self.dual_finest_resolution_high,
+                sigma_low=self.dual_sigma_low,
+                sigma_high=self.dual_sigma_high,
+                n_freq=self.dual_n_freq,
+                use_gate=self.dual_use_gate,
+                hf_activate_ratio=self.dual_hf_activate_ratio,
+                hf_max_weight=self.dual_hf_max_weight,
             )
             return
 
@@ -582,6 +667,8 @@ class NeUF:
 
         self._save_ground_truth_images(references)
         self._save_preview_images(iteration, rendered)
+        if self.nerf.dual_encoder is not None:
+            self._save_dual_freq_preview(iteration)
         self._write_tensorboard_images(iteration, rendered, references)
         self._write_metrics(iteration, loss_train, loss_valid, loss_gt, loss_valid_tv)
         self.previous_validation_slices = {
@@ -605,6 +692,46 @@ class NeUF:
             }
         )
         return params, now
+
+    def _model_input_points(self, points: torch.Tensor) -> torch.Tensor:
+        return self.slice_renderer._normalize_points_if_needed(
+            self.nerf,
+            torch.reshape(points, (-1, points.shape[-1])),
+            self.dataset.point_min_dev,
+        )
+
+    def _save_dual_freq_preview(self, iteration: int) -> None:
+        if not self.dataset.slices_valid or self.nerf.dual_encoder is None:
+            return
+
+        with torch.no_grad():
+            progress = self.nerf.training_progress
+            pts = self._model_input_points(self.dataset.get_slice_valid_points(0))
+            decomp = self.nerf.dual_encoder.forward_decomposed(pts, progress)
+
+        height, width = self.dataset.px_height, self.dataset.px_width
+
+        def to_img(tensor: torch.Tensor) -> np.ndarray:
+            arr = tensor.reshape(height, width).detach().cpu().float().numpy()
+            arr_min = arr.min()
+            arr_max = arr.max()
+            return (arr - arr_min) / (arr_max - arr_min + 1e-8)
+
+        low_img = to_img(decomp["feat_low"].mean(dim=-1))
+        high_img = to_img(decomp["feat_high"].mean(dim=-1))
+        gate_img = to_img(decomp["gate"].squeeze(-1))
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        axes[0].imshow(low_img, cmap="gray")
+        axes[0].set_title("Low-frequency mean")
+        axes[1].imshow(high_img, cmap="hot")
+        axes[2].imshow(gate_img, cmap="hot")
+        axes[2].set_title(f"Gate (progress={progress:.2f})")
+        for ax in axes:
+            ax.axis("off")
+        plt.tight_layout()
+        plt.savefig(self.run_paths.image_dir / f"dual_freq_{iteration:06d}.png", dpi=100)
+        plt.close(fig)
 
     def _next_random_indices(self) -> torch.Tensor:
         if self.random_permutation is None:
@@ -637,9 +764,16 @@ class NeUF:
         return self.points_per_iter // (patch_size ** 2)
 
     def _sample_training_batch(self):
+        self._current_points = None
+        self._current_viewdirs = None
+        self._current_target_slice = None
+
         if self.training_mode == "Slice":
             slice_index = np.random.randint(len(self.dataset.slices))
             target = self.dataset.get_slice_pixels(slice_index).to(DEVICE)
+            self._current_points = self.dataset.get_slice_points(slice_index)
+            self._current_viewdirs = self.dataset.get_slice_viewdirs(slice_index)
+            self._current_target_slice = target
             density = self.slice_renderer.render_slice_from_dataset(
                 self.nerf, slice_index, jitter=self.jitter_training,
             )
@@ -700,6 +834,8 @@ class NeUF:
         indices = (patch_starts + patch_offsets).reshape(-1)
 
         target = self.dataset.get_indices_pixels(indices)
+        self._current_points = self.dataset.get_indices_points(indices)
+        self._current_viewdirs = self.dataset.get_indices_viewdirs(indices)
         density = self.slice_renderer.query_random_positions(
             self.nerf,
             indices,
@@ -790,33 +926,78 @@ class NeUF:
         delta = self.smoothness_delta
         noise = delta * torch.randn_like(points)
         perturbed = points + noise
-        d_orig = self.nerf.query(points, viewdirs)
-        d_perturbed = self.nerf.query(perturbed, viewdirs)
+        d_orig = self.nerf.query(self._model_input_points(points), viewdirs)
+        d_perturbed = self.nerf.query(self._model_input_points(perturbed), viewdirs)
         return torch.mean(torch.abs(d_orig - d_perturbed))
 
+    def _compute_gate_boundary_loss(
+        self,
+        gate: torch.Tensor,
+        target_slice: torch.Tensor,
+    ) -> torch.Tensor:
+        height, width = self.dataset.px_height, self.dataset.px_width
+        target = target_slice.reshape(1, 1, height, width).float()
+
+        grad_x = F.conv2d(target, self.scharr_x, padding=1)
+        grad_y = F.conv2d(target, self.scharr_y, padding=1)
+        grad_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2)
+
+        grad_max = grad_mag.max()
+        if grad_max > 1e-8:
+            grad_mag = grad_mag / grad_max
+
+        target_gate = grad_mag.reshape(-1, 1)[:gate.shape[0]]
+        return F.mse_loss(gate, target_gate.detach())
+
     def _compute_training_loss(self, target, density, iteration=0):
-        l1_loss = self.criterion(density, target)
-        loss = l1_loss
-        components: dict[str, torch.Tensor] = {"l1": l1_loss}
+        mse_loss = self.reconstruction_criterion(density, target)
+        loss = mse_loss
+        components: dict[str, torch.Tensor] = {"mse": mse_loss}
 
-        if self.training_mode == "Patch":
-            tv = self._compute_patch_tv_loss(density)
-            components["patch_tv"] = tv
-            loss = loss + self.tv_weight * tv
+        # if self.training_mode == "Patch":
+        #     tv = self._compute_patch_tv_loss(density)
+        #     components["patch_tv"] = tv
+        #     loss = loss + self.tv_weight * tv
 
-        elif self.training_mode == "Slice":
-            grad = self._compute_gradient_loss(target, density)
-            tv = self._compute_tv_loss(density)
-            components["gradient"] = grad
-            components["tv"] = tv
-            loss = loss + self.grad_weight * grad + self.tv_weight * tv
+        # elif self.training_mode == "Slice":
+        #     grad = self._compute_gradient_loss(target, density)
+        #     tv = self._compute_tv_loss(density)
+        #     components["gradient"] = grad
+        #     components["tv"] = tv
+        #     loss = loss + self.grad_weight * grad + self.tv_weight * tv
 
-        elif self.training_mode == "Random":
-            smooth = self._compute_spatial_smoothness(
-                self._current_points, self._current_viewdirs
+        # elif self.training_mode == "Random":
+        #     smooth = self._compute_spatial_smoothness(
+        #         self._current_points, self._current_viewdirs
+        #     )
+        #     components["smoothness"] = smooth
+        #     loss = loss + self.tv_weight * smooth
+
+        if self.nerf.dual_encoder is not None and self._current_points is not None:
+            progress = self.nerf.training_progress
+            decomp = self.nerf.dual_encoder.forward_decomposed(
+                self._model_input_points(self._current_points),
+                progress,
             )
-            components["smoothness"] = smooth
-            loss = loss + self.tv_weight * smooth
+            feat_high = decomp["feat_high"]
+            gate = decomp["gate"]
+
+            sparsity = torch.mean(torch.abs(feat_high))
+            components["dual_sparsity"] = sparsity
+            loss = loss + self.dual_sparsity_weight * sparsity
+
+            if (
+                self.training_mode == "Slice"
+                and self._current_target_slice is not None
+                and self._current_target_slice.numel() == gate.shape[0]
+            ):
+                gate_loss = self._compute_gate_boundary_loss(
+                    gate,
+                    self._current_target_slice,
+                )
+                gate_weight = self.dual_gate_weight * progress
+                components["dual_gate"] = gate_loss
+                loss = loss + gate_weight * gate_loss
 
         return loss, components
 
@@ -846,6 +1027,9 @@ class NeUF:
 
         try:
             for iteration in progress_bar:
+                if self.nerf.dual_encoder is not None:
+                    self.nerf.training_progress = iteration / max(1, self.N_iters)
+
                 if (
                     self.progressive_training
                     and self.nerf.encoding_type == "HASH"
@@ -959,7 +1143,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train a NeUF model")
     parser.add_argument("--dataset", default=DEFAULT_DATASET_PATH, help="Dataset folder or baked dataset path")
     parser.add_argument("--checkpoint", default="", help="Checkpoint to resume from")
-    parser.add_argument("--encoding", default="Hash", choices=["Hash", "Freq", "None"])
+    parser.add_argument(
+        "--encoding",
+        default="Hash",
+        choices=["Hash", "Freq", "None", "DUAL_HASH", "DUAL_FREQ"],
+    )
     parser.add_argument("--training-mode", default="Random", choices=["Random", "Slice", "Patch"])
     parser.add_argument("--points-per-iter", type=int, default=50000)
     parser.add_argument("--patch-size", type=int, default=32, help="Patch side length in pixels for Patch mode")
@@ -1055,6 +1243,75 @@ def parse_args():
         default=1000,
         help="Unlock one more hash level every N iterations",
     )
+    dual_group = parser.add_argument_group("Dual-frequency PE parameters")
+    dual_group.add_argument(
+        "--dual-pe-type",
+        dest="dual_pe_type",
+        default="hash",
+        choices=["hash", "fourier"],
+        help="Dual PE implementation: hash or fourier",
+    )
+    dual_group.add_argument("--dual-n-levels-low", dest="dual_n_levels_low", type=int, default=8)
+    dual_group.add_argument("--dual-n-levels-high", dest="dual_n_levels_high", type=int, default=8)
+    dual_group.add_argument(
+        "--dual-finest-resolution-low",
+        dest="dual_finest_resolution_low",
+        type=int,
+        default=64,
+    )
+    dual_group.add_argument(
+        "--dual-finest-resolution-high",
+        dest="dual_finest_resolution_high",
+        type=int,
+        default=512,
+    )
+    dual_group.add_argument(
+        "--dual-base-resolution-low",
+        dest="dual_base_resolution_low",
+        type=int,
+        default=16,
+    )
+    dual_group.add_argument(
+        "--dual-base-resolution-high",
+        dest="dual_base_resolution_high",
+        type=int,
+        default=64,
+    )
+    dual_group.add_argument("--dual-sigma-low", dest="dual_sigma_low", type=float, default=1.0)
+    dual_group.add_argument("--dual-sigma-high", dest="dual_sigma_high", type=float, default=20.0)
+    dual_group.add_argument("--dual-n-freq", dest="dual_n_freq", type=int, default=64)
+    dual_group.add_argument(
+        "--dual-no-gate",
+        dest="dual_use_gate",
+        action="store_false",
+        default=True,
+        help="Disable spatial gate network",
+    )
+    dual_group.add_argument(
+        "--dual-hf-activate-ratio",
+        dest="dual_hf_activate_ratio",
+        type=float,
+        default=0.6,
+        help="Training progress ratio where high frequencies start activating",
+    )
+    dual_group.add_argument(
+        "--dual-hf-max-weight",
+        dest="dual_hf_max_weight",
+        type=float,
+        default=1.0,
+    )
+    dual_group.add_argument(
+        "--dual-sparsity-weight",
+        dest="dual_sparsity_weight",
+        type=float,
+        default=0.01,
+    )
+    dual_group.add_argument(
+        "--dual-gate-weight",
+        dest="dual_gate_weight",
+        type=float,
+        default=0.5,
+    )
     return parser.parse_args()
 
 
@@ -1089,6 +1346,21 @@ def main():
         progressive_training=args.progressive_training,
         progressive_start_levels=args.progressive_start_levels,
         progressive_step_interval=args.progressive_step_interval,
+        dual_pe_type=args.dual_pe_type,
+        dual_n_levels_low=args.dual_n_levels_low,
+        dual_n_levels_high=args.dual_n_levels_high,
+        dual_finest_resolution_low=args.dual_finest_resolution_low,
+        dual_finest_resolution_high=args.dual_finest_resolution_high,
+        dual_base_resolution_low=args.dual_base_resolution_low,
+        dual_base_resolution_high=args.dual_base_resolution_high,
+        dual_sigma_low=args.dual_sigma_low,
+        dual_sigma_high=args.dual_sigma_high,
+        dual_n_freq=args.dual_n_freq,
+        dual_use_gate=args.dual_use_gate,
+        dual_hf_activate_ratio=args.dual_hf_activate_ratio,
+        dual_hf_max_weight=args.dual_hf_max_weight,
+        dual_sparsity_weight=args.dual_sparsity_weight,
+        dual_gate_weight=args.dual_gate_weight,
     )
     neuf.run()
 

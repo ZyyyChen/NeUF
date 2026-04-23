@@ -25,3 +25,4 @@ raw_dataset=0
 jitter_training=0
 start_time=2026-04-23T11:29:30+02:00
 command= /home/zchen/.conda/envs/neuf/bin/python /misc/raid/zchen/Code/NeUF/main.py --dataset /misc/raid/zchen/Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Recalage/Patient0/us_recal_original/baked_dataset.pkl --encoding Hash --training-mode Random --points-per-iter 50000 --patch-size 32 --nb-iters-max 10000 --plot-freq 100 --save-freq 100 --seed 19981708 --grad-weight 0.1 --grad-blur-kernel-size 6 --grad-blur-sigma 1.5 --root /misc/raid/zchen/Code/NeUF --tv-weight 50 --slice-mix-interval 10 --smoothness-delta 0.1 --hash-n-levels 16 --hash-n-min 16 --hash-n-max 256 --hash-n-features-per-level 2 --hash-log2-hashmap-size 19
+end_time=2026-04-23T12:01:16+02:00
