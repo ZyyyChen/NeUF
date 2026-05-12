@@ -1,11 +1,11 @@
 #!/bin/bash -l
-#PBS -N neuf_export_grid
+#PBS -N neuf_render_3d
 #PBS -q gpu
 #PBS -l walltime=23:59:00
 #PBS -l nodes=1:ppn=16:gpus=1:gpu48
 #PBS -l mem=128gb
 #PBS -j oe
-#PBS -o /home/zchen/history/neuf_export_full_grid.pbs.log
+#PBS -o /home/zchen/history/neuf_render_3d_volume.pbs.log
 #PBS -M ziyi.chen@creatis.insa-lyon.fr
 #PBS -m ae
 #PBS -t 0-3
@@ -14,29 +14,26 @@ set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-/misc/raid/zchen/Code/NeUF}"
 PYTHON_BIN="${PYTHON_BIN:-/home/zchen/.conda/envs/neuf/bin/python}"
-SCRIPT_PATH="${REPO_DIR}/export_full_grid_from_ckpt.py"
+SCRIPT_PATH="${SCRIPT_PATH:-${REPO_DIR}/render_3d_volume_from_ckpt.py}"
 CKPT_DIR="${CKPT_DIR:-/home/zchen/Code/NeUF/logs/23-04-2026/DUAL_HASH_Patient0_9/checkpoints}"
 CKPT_STEPS="${CKPT_STEPS:-2000 5000 8000 10000}"
 CKPT_PATH="${CKPT_PATH:-}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_DIR}/exports/full_grid}"
-EXPORT_DATE="${EXPORT_DATE:-$(date +%d-%m-%Y)}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_DIR}/exports/render_3d_volume}"
+RENDER_DATE="${RENDER_DATE:-$(date +%d-%m-%Y)}"
 CKPT_GROUP="${CKPT_GROUP:-}"
 CKPT_GROUP_PREFIX="${CKPT_GROUP_PREFIX:-ckpt}"
-LOG_DIR="${LOG_DIR:-/home/zchen/history/neuf_export_full_grid}"
+LOG_DIR="${LOG_DIR:-/home/zchen/history/neuf_render_3d_volume}"
 
-EXPORT_CHUNK_SIZE="${EXPORT_CHUNK_SIZE:-131072}"
-EXPORT_RESOLUTION_SCALE="${EXPORT_RESOLUTION_SCALE:-1.0}"
-EXPORT_SPACING="${EXPORT_SPACING:-}"
-EXPORT_POINT_MIN="${EXPORT_POINT_MIN:-}"
-EXPORT_POINT_MAX="${EXPORT_POINT_MAX:-}"
-EXPORT_X_AXIS_NPY="${EXPORT_X_AXIS_NPY:-}"
-EXPORT_Y_AXIS_NPY="${EXPORT_Y_AXIS_NPY:-}"
-EXPORT_Z_AXIS_NPY="${EXPORT_Z_AXIS_NPY:-}"
-EXPORT_RECONS_COMMON_GRID_H5="${EXPORT_RECONS_COMMON_GRID_H5:-}"
-EXPORT_USE_BBOX_MASK="${EXPORT_USE_BBOX_MASK:-0}"
-EXPORT_DISABLE_SEQUENCE_PLANE_MASK="${EXPORT_DISABLE_SEQUENCE_PLANE_MASK:-0}"
-EXPORT_SAVE_LARGE_NPY="${EXPORT_SAVE_LARGE_NPY:-0}"
-EXPORT_SAVE_GT_EXPORTS="${EXPORT_SAVE_GT_EXPORTS:-0}"
+RENDER_CHUNK_SIZE="${RENDER_CHUNK_SIZE:-131072}"
+RENDER_RESOLUTION_SCALE="${RENDER_RESOLUTION_SCALE:-1.0}"
+RENDER_SPACING="${RENDER_SPACING:-}"
+RENDER_POINT_MIN="${RENDER_POINT_MIN:-}"
+RENDER_POINT_MAX="${RENDER_POINT_MAX:-}"
+RENDER_USE_BBOX_MASK="${RENDER_USE_BBOX_MASK:-0}"
+RENDER_TRAINING_PROGRESS="${RENDER_TRAINING_PROGRESS:-}"
+RENDER_NB_ITERS_MAX="${RENDER_NB_ITERS_MAX:-10000}"
+RENDER_OUTPUT_TYPE="${RENDER_OUTPUT_TYPE:-uint8}"
+RENDER_SAVE_VOLUME_NPY="${RENDER_SAVE_VOLUME_NPY:-0}"
 
 ARRAY_ID="${PBS_ARRAYID:-${PBS_ARRAY_INDEX:-${CKPT_INDEX:-0}}}"
 
@@ -69,7 +66,7 @@ if [[ ! -f "${CKPT_PATH}" ]]; then
   exit 1
 fi
 
-DATE_OUTPUT_ROOT="${OUTPUT_ROOT}/${EXPORT_DATE}"
+DATE_OUTPUT_ROOT="${OUTPUT_ROOT}/${RENDER_DATE}"
 mkdir -p "${DATE_OUTPUT_ROOT}"
 
 PBS_JOB_KEY="${PBS_JOBID:-manual}"
@@ -123,62 +120,49 @@ cmd=(
   --ckpt "${CKPT_PATH}"
   --output "${CHECKPOINT_OUTPUT_ROOT}"
   --output-exact
-  --chunk-size "${EXPORT_CHUNK_SIZE}"
-  --resolution-scale "${EXPORT_RESOLUTION_SCALE}"
+  --chunk-size "${RENDER_CHUNK_SIZE}"
+  --resolution-scale "${RENDER_RESOLUTION_SCALE}"
+  --nb-iters-max "${RENDER_NB_ITERS_MAX}"
+  --output-type "${RENDER_OUTPUT_TYPE}"
 )
 
-if [[ -n "${EXPORT_SPACING}" ]]; then
-  read -r -a spacing_vals <<< "${EXPORT_SPACING}"
+if [[ -n "${RENDER_SPACING}" ]]; then
+  read -r -a spacing_vals <<< "${RENDER_SPACING}"
   if [[ "${#spacing_vals[@]}" -ne 1 && "${#spacing_vals[@]}" -ne 3 ]]; then
-    echo "EXPORT_SPACING expects 1 value or 3 values, got: ${EXPORT_SPACING}"
+    echo "RENDER_SPACING expects 1 value or 3 values, got: ${RENDER_SPACING}"
     exit 1
   fi
   cmd+=(--spacing "${spacing_vals[@]}")
 fi
-if [[ -n "${EXPORT_POINT_MIN}" ]]; then
-  read -r -a point_min_vals <<< "${EXPORT_POINT_MIN}"
+if [[ -n "${RENDER_POINT_MIN}" ]]; then
+  read -r -a point_min_vals <<< "${RENDER_POINT_MIN}"
   if [[ "${#point_min_vals[@]}" -ne 3 ]]; then
-    echo "EXPORT_POINT_MIN expects 3 values, got: ${EXPORT_POINT_MIN}"
+    echo "RENDER_POINT_MIN expects 3 values, got: ${RENDER_POINT_MIN}"
     exit 1
   fi
   cmd+=(--point-min "${point_min_vals[@]}")
 fi
-if [[ -n "${EXPORT_POINT_MAX}" ]]; then
-  read -r -a point_max_vals <<< "${EXPORT_POINT_MAX}"
+if [[ -n "${RENDER_POINT_MAX}" ]]; then
+  read -r -a point_max_vals <<< "${RENDER_POINT_MAX}"
   if [[ "${#point_max_vals[@]}" -ne 3 ]]; then
-    echo "EXPORT_POINT_MAX expects 3 values, got: ${EXPORT_POINT_MAX}"
+    echo "RENDER_POINT_MAX expects 3 values, got: ${RENDER_POINT_MAX}"
     exit 1
   fi
   cmd+=(--point-max "${point_max_vals[@]}")
 fi
-if [[ -n "${EXPORT_X_AXIS_NPY}" ]]; then
-  cmd+=(--x-axis-npy "${EXPORT_X_AXIS_NPY}")
-fi
-if [[ -n "${EXPORT_Y_AXIS_NPY}" ]]; then
-  cmd+=(--y-axis-npy "${EXPORT_Y_AXIS_NPY}")
-fi
-if [[ -n "${EXPORT_Z_AXIS_NPY}" ]]; then
-  cmd+=(--z-axis-npy "${EXPORT_Z_AXIS_NPY}")
-fi
-if [[ -n "${EXPORT_RECONS_COMMON_GRID_H5}" ]]; then
-  cmd+=(--recons-common-grid-h5 "${EXPORT_RECONS_COMMON_GRID_H5}")
-fi
-if [[ "${EXPORT_USE_BBOX_MASK}" == "1" ]]; then
+if [[ "${RENDER_USE_BBOX_MASK}" == "1" ]]; then
   cmd+=(--use-bbox-mask)
 fi
-if [[ "${EXPORT_DISABLE_SEQUENCE_PLANE_MASK}" == "1" ]]; then
-  cmd+=(--disable-sequence-plane-mask)
+if [[ -n "${RENDER_TRAINING_PROGRESS}" ]]; then
+  cmd+=(--training-progress "${RENDER_TRAINING_PROGRESS}")
 fi
-if [[ "${EXPORT_SAVE_LARGE_NPY}" == "1" ]]; then
-  cmd+=(--save-large-npy)
-fi
-if [[ "${EXPORT_SAVE_GT_EXPORTS}" == "1" ]]; then
-  cmd+=(--save-gt-exports)
+if [[ "${RENDER_SAVE_VOLUME_NPY}" == "1" ]]; then
+  cmd+=(--save-volume-npy)
 fi
 
 start_time="$(date --iso-8601=seconds)"
-manifest_path="${CHECKPOINT_OUTPUT_ROOT}/export_manifest_${PBS_JOBID:-manual}_${ARRAY_ID}.csv"
-config_path="${CHECKPOINT_OUTPUT_ROOT}/export_config_${PBS_JOBID:-manual}_${ARRAY_ID}.txt"
+manifest_path="${CHECKPOINT_OUTPUT_ROOT}/render_manifest_${PBS_JOBID:-manual}_${ARRAY_ID}.csv"
+config_path="${CHECKPOINT_OUTPUT_ROOT}/render_config_${PBS_JOBID:-manual}_${ARRAY_ID}.txt"
 printf "ckpt,output_root,latest_output,start_time,end_time\n" > "${manifest_path}"
 {
   echo "script=${SCRIPT_PATH}"
@@ -187,22 +171,19 @@ printf "ckpt,output_root,latest_output,start_time,end_time\n" > "${manifest_path
   echo "ckpt_steps=${CKPT_STEPS}"
   echo "ckpt_step=${CKPT_STEP}"
   echo "ckpt=${CKPT_PATH}"
-  echo "export_date=${EXPORT_DATE}"
+  echo "render_date=${RENDER_DATE}"
   echo "ckpt_group=${CKPT_GROUP}"
   echo "output_root=${CHECKPOINT_OUTPUT_ROOT}"
-  echo "chunk_size=${EXPORT_CHUNK_SIZE}"
-  echo "resolution_scale=${EXPORT_RESOLUTION_SCALE}"
-  echo "spacing=${EXPORT_SPACING:-default}"
-  echo "point_min=${EXPORT_POINT_MIN:-default}"
-  echo "point_max=${EXPORT_POINT_MAX:-default}"
-  echo "x_axis_npy=${EXPORT_X_AXIS_NPY:-none}"
-  echo "y_axis_npy=${EXPORT_Y_AXIS_NPY:-none}"
-  echo "z_axis_npy=${EXPORT_Z_AXIS_NPY:-none}"
-  echo "recons_common_grid_h5=${EXPORT_RECONS_COMMON_GRID_H5:-none}"
-  echo "use_bbox_mask=${EXPORT_USE_BBOX_MASK}"
-  echo "disable_sequence_plane_mask=${EXPORT_DISABLE_SEQUENCE_PLANE_MASK}"
-  echo "save_large_npy=${EXPORT_SAVE_LARGE_NPY}"
-  echo "save_gt_exports=${EXPORT_SAVE_GT_EXPORTS}"
+  echo "chunk_size=${RENDER_CHUNK_SIZE}"
+  echo "resolution_scale=${RENDER_RESOLUTION_SCALE}"
+  echo "spacing=${RENDER_SPACING:-default}"
+  echo "point_min=${RENDER_POINT_MIN:-default}"
+  echo "point_max=${RENDER_POINT_MAX:-default}"
+  echo "use_bbox_mask=${RENDER_USE_BBOX_MASK}"
+  echo "training_progress=${RENDER_TRAINING_PROGRESS:-infer_from_checkpoint}"
+  echo "nb_iters_max=${RENDER_NB_ITERS_MAX}"
+  echo "output_type=${RENDER_OUTPUT_TYPE}"
+  echo "save_volume_npy=${RENDER_SAVE_VOLUME_NPY}"
   echo "start_time=${start_time}"
   printf "command="
   printf " %q" "${cmd[@]}"
@@ -221,7 +202,7 @@ echo "Checkpoint dir: ${CKPT_DIR}"
 echo "Checkpoint step: ${CKPT_STEP}"
 echo "Checkpoint: ${CKPT_PATH}"
 echo "Base output root: ${OUTPUT_ROOT}"
-echo "Export date: ${EXPORT_DATE}"
+echo "Render date: ${RENDER_DATE}"
 echo "Checkpoint group: ${CKPT_GROUP}"
 echo "Output root: ${CHECKPOINT_OUTPUT_ROOT}"
 echo "Threads: ${THREADS}"
@@ -252,5 +233,5 @@ printf "%s,%s,%s,%s,%s\n" \
   "${start_time}" \
   "${end_time}" >> "${manifest_path}"
 
-echo "Finished export_full_grid_from_ckpt.py at: ${end_time}"
+echo "Finished render_3d_volume_from_ckpt.py at: ${end_time}"
 echo "Latest output: ${latest_output}"

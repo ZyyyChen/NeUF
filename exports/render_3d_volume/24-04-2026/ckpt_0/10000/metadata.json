@@ -1,0 +1,56 @@
+{
+  "ckpt": "/home/zchen/Code/NeUF/logs/23-04-2026/DUAL_HASH_Patient0_9/checkpoints/10000.pkl",
+  "dataset_pkl": "/misc/raid/zchen/Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Recalage/Patient0/us_recal_original/baked_dataset.pkl",
+  "encoding": "DUAL_HASH",
+  "training_progress": 1.0,
+  "checkpoint_start": 10000,
+  "nb_iters_max_for_progress": 10000,
+  "normalization_rule": "preserve_zero_background_foreground_min_max_to_1_255",
+  "normalization_min": -0.08750028163194656,
+  "normalization_max": 265.20428466796875,
+  "foreground_voxels": 547830192,
+  "shape_zyx": [
+    728,
+    798,
+    943
+  ],
+  "spacing_mm_xyz": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "base_spacing_mm_xyz": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "point_min_mm_xyz": [
+    -471.5,
+    172.82444763183594,
+    -699.1565551757812
+  ],
+  "point_max_mm_xyz": [
+    471.5,
+    970.5919799804688,
+    28.666547775268555
+  ],
+  "mhd_origin_mm_xyz": [
+    -471.0,
+    173.32444763183594,
+    -698.6565551757812
+  ],
+  "bounding_box_min_mm_xyz": [
+    -471.5,
+    172.82444763183594,
+    -699.1565551757812
+  ],
+  "bounding_box_max_mm_xyz": [
+    471.5,
+    970.5919799804688,
+    28.666547775268555
+  ],
+  "use_bbox_mask": false,
+  "output_type": "uint8",
+  "mhd_array_order": "raw array is z, y, x; MHD DimSize is x y z",
+  "dual_hash_coordinate_rule": "physical mm coordinates, not normalized"
+}

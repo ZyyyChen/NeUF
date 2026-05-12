@@ -941,11 +941,13 @@ class NeUF:
             (self.dataset.px_height, self.dataset.px_width),
         ).unsqueeze(0).unsqueeze(0)
 
-        target_blurred = self._gaussian_blur(
-            target_slice,
-            kernel_size=self.grad_blur_kernel_size,
-            sigma=self.grad_blur_sigma,
-        )
+        # target_blurred = self._gaussian_blur(
+        #     target_slice,
+        #     kernel_size=self.grad_blur_kernel_size,
+        #     sigma=self.grad_blur_sigma,
+        # )
+        
+        target_blurred = target_slice
         target_grad_x = torch.nn.functional.conv2d(target_blurred, self.scharr_x, padding=1)
         target_grad_y = torch.nn.functional.conv2d(target_blurred, self.scharr_y, padding=1)
         density_grad_x = torch.nn.functional.conv2d(density_slice, self.scharr_x, padding=1)
@@ -1034,25 +1036,25 @@ class NeUF:
         components: dict[str, torch.Tensor] = {"mse": mse_loss}
         active_mode = self._active_mode
 
-        if active_mode == "Patch":
-            tv = self._compute_patch_tv_loss(density)
-            components["patch_tv"] = tv
-            loss = loss + self.tv_weight * tv
+        # if active_mode == "Patch":
+        #     tv = self._compute_patch_tv_loss(density)
+        #     components["patch_tv"] = tv
+        #     loss = loss + self.tv_weight * tv
 
-        elif active_mode == "Slice":
-            grad = self._compute_gradient_loss(target, density)
-            tv = self._compute_tv_loss(density)
-            components["gradient"] = grad
-            components["tv"] = tv
-            loss = loss + self.grad_weight * grad + self.tv_weight * tv
+        # elif active_mode == "Slice":
+        #     grad = self._compute_gradient_loss(target, density)
+        #     tv = self._compute_tv_loss(density)
+        #     components["gradient"] = grad
+        #     components["tv"] = tv
+        #     loss = loss + self.grad_weight * grad + self.tv_weight * tv
 
-        elif active_mode == "Random" and self.training_mode == "Random":
-            if self._current_points is not None and self._current_viewdirs is not None:
-                smooth = self._compute_spatial_smoothness(
-                    self._current_points, self._current_viewdirs
-                )
-                components["smoothness"] = smooth
-                loss = loss + self.tv_weight * smooth
+        # elif active_mode == "Random" and self.training_mode == "Random":
+        #     if self._current_points is not None and self._current_viewdirs is not None:
+        #         smooth = self._compute_spatial_smoothness(
+        #             self._current_points, self._current_viewdirs
+        #         )
+        #         components["smoothness"] = smooth
+        #         loss = loss + self.tv_weight * smooth
 
         if self.nerf.dual_encoder is not None and self._current_points is not None:
             progress = self.nerf.training_progress
@@ -1065,7 +1067,7 @@ class NeUF:
 
             sparsity = torch.mean(torch.abs(feat_high))
             components["dual_sparsity"] = sparsity
-            loss = loss + self.dual_sparsity_weight * sparsity
+            # loss = loss + self.dual_sparsity_weight * sparsity
 
             if (
                 active_mode == "Slice"

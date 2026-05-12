@@ -115,6 +115,21 @@ def parse_args():
         default=None,
         help="Optional path to a recons_common_grid.h5 bundle produced by export_recons3d_style_baseline.py.",
     )
+    parser.add_argument(
+        "--training-progress",
+        type=float,
+        default=None,
+        help=(
+            "Override dual encoder progress in [0, 1]. "
+            "Defaults to checkpoint start / --nb-iters-max for DUAL_* checkpoints."
+        ),
+    )
+    parser.add_argument(
+        "--nb-iters-max",
+        type=int,
+        default=10000,
+        help="Training iteration count used to infer dual encoder progress.",
+    )
     return parser.parse_args()
 
 
@@ -138,6 +153,22 @@ def load_checkpoint(ckpt_path: Path):
     model = NeRF(ckpt).to(DEVICE)
     model.eval()
     return ckpt, model
+
+
+def model_uses_physical_coordinates(model):
+    return model.encoding_type in {"HASH", "DUAL_HASH"} and model.use_encoding
+
+
+def infer_training_progress(args, ckpt, model):
+    if args.training_progress is not None:
+        progress = float(args.training_progress)
+    elif "training_progress" in ckpt:
+        progress = float(ckpt["training_progress"])
+    elif str(getattr(model, "encoding_type", "")).startswith("DUAL_"):
+        progress = float(ckpt.get("start", args.nb_iters_max)) / float(max(1, args.nb_iters_max))
+    else:
+        progress = 1.0
+    return float(np.clip(progress, 0.0, 1.0))
 
 
 def load_dataset_from_ckpt(ckpt):
@@ -688,7 +719,7 @@ def query_recons_common_grid(model, ckpt, bundle_path: Path, chunk_size, use_bbo
                     batch_points = torch.from_numpy(query_points[start:stop]).to(DEVICE)
                     batch_dirs = torch.zeros_like(batch_points, device=DEVICE)
 
-                    if model.encoding_type != "HASH" or not model.use_encoding:
+                    if not model_uses_physical_coordinates(model):
                         batch_points = ((batch_points - bb_min_dev) / bb_size_dev) * 2.0 - 1.0
 
                     batch_values = model.query(batch_points, batch_dirs).reshape(-1)
@@ -929,7 +960,7 @@ def query_grid(model, ckpt, x_axis, y_axis, z_axis, chunk_size, use_bbox_mask, p
                 batch_points = torch.from_numpy(query_points[start:stop]).to(DEVICE)
                 batch_dirs = torch.zeros_like(batch_points, device=DEVICE)
 
-                if model.encoding_type != "HASH" or not model.use_encoding:
+                if not model_uses_physical_coordinates(model):
                     batch_points = ((batch_points - bb_min_dev) / bb_size_dev) * 2.0 - 1.0
 
                 batch_values = model.query(batch_points, batch_dirs).reshape(-1)
@@ -1027,9 +1058,13 @@ def main():
         output_dir = make_dated_output_dir(args.output, args.ckpt)
 
     ckpt, model = load_checkpoint(args.ckpt)
+    model.training_progress = infer_training_progress(args, ckpt, model)
     baked_dataset, dataset_path = load_dataset_from_ckpt(ckpt)
     bb_min, bb_max = to_numpy_bbox(ckpt)
     grid_spec = resolve_query_grid_spec(args, baked_dataset)
+
+    print(f"Encoding: {model.encoding_type}")
+    print(f"Training progress used for dual encoder: {model.training_progress:.6f}")
 
     use_sequence_plane_mask = not args.disable_sequence_plane_mask
     plane_mask_data = get_sequence_plane_mask_data(baked_dataset, dataset_path) if use_sequence_plane_mask else None
@@ -1100,6 +1135,10 @@ def main():
         metadata = {
             "ckpt": str(args.ckpt),
             "dataset_pkl": str(dataset_path),
+            "encoding": model.encoding_type,
+            "training_progress": float(model.training_progress),
+            "checkpoint_start": int(ckpt.get("start", -1)),
+            "nb_iters_max_for_progress": int(args.nb_iters_max),
             "grid_source_mode": grid_spec["source"],
             "grid_source_bundle_h5": str(grid_spec["bundle_path"]),
             "bounding_box_min_mm": bb_min.tolist(),
@@ -1231,6 +1270,10 @@ def main():
     metadata = {
         "ckpt": str(args.ckpt),
         "dataset_pkl": str(dataset_path),
+        "encoding": model.encoding_type,
+        "training_progress": float(model.training_progress),
+        "checkpoint_start": int(ckpt.get("start", -1)),
+        "nb_iters_max_for_progress": int(args.nb_iters_max),
         "grid_source_mode": grid_spec["source"],
         "base_spacing_mm_xyz": base_spacing_xyz.tolist(),
         "spacing_mm_xyz": spacing_xyz.tolist(),
