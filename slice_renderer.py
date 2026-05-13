@@ -99,7 +99,7 @@ class SliceRenderer:
         return mask
 
     def _normalize_points_if_needed(self, model, points: torch.Tensor, bb_min_dev: torch.Tensor) -> torch.Tensor:
-        if model.encoding_type in {"HASH", "DUAL_HASH"} and model.use_encoding:
+        if model.encoding_type in {"HASH", "DUAL_HASH", "KRONECKER"} and model.use_encoding:
             return points
 
         return torch.add(
@@ -107,11 +107,23 @@ class SliceRenderer:
             -1,
         )
 
-    def _query_points(self, model, points: torch.Tensor, viewdirs: torch.Tensor, bb_min_dev: torch.Tensor) -> torch.Tensor:
+    def _query_points(
+        self,
+        model,
+        points: torch.Tensor,
+        viewdirs: torch.Tensor,
+        bb_min_dev: torch.Tensor,
+        return_sigma: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         points = torch.reshape(points, (-1, points.shape[-1]))
         viewdirs = torch.reshape(viewdirs, (-1, viewdirs.shape[-1]))
         query_points = self._normalize_points_if_needed(model, points, bb_min_dev)
-        return model.query(query_points, viewdirs).to(DEVICE)
+        prediction = model.query(query_points, viewdirs, return_sigma=return_sigma)
+        if return_sigma:
+            density, log_sigma = prediction
+            return density.to(DEVICE), log_sigma.to(DEVICE)
+
+        return prediction.to(DEVICE)
 
     def _query_with_scan_mask(
         self,
@@ -172,18 +184,34 @@ class SliceRenderer:
         )
         return self._reshape_density(density, reshaped, (self.height_px, self.width_px))
 
-    def render_slice_from_dataset(self, model, slice_number, reshaped=False, jitter=False, scalefactor=None):
+    def render_slice_from_dataset(
+        self,
+        model,
+        slice_number,
+        reshaped=False,
+        jitter=False,
+        scalefactor=None,
+        return_sigma: bool = False,
+    ):
         dataset = self._require_dataset()
         points = dataset.get_slice_points(slice_number)
         if jitter:
             points = self._apply_jitter(points, self.width_px, self.height_px)
 
-        density = self._query_points(
+        prediction = self._query_points(
             model,
             points,
             dataset.get_slice_viewdirs(slice_number),
             dataset.point_min_dev,
+            return_sigma=return_sigma,
         )
+        if return_sigma:
+            density, log_sigma = prediction
+            density = self._reshape_density(density, reshaped, (self.height_px, self.width_px))
+            log_sigma = self._reshape_density(log_sigma, reshaped, (self.height_px, self.width_px))
+            return density, log_sigma
+
+        density = prediction
         reshaped_density = self._reshape_density(density, reshaped, (self.height_px, self.width_px))
         if not reshaped or scalefactor is None:
             return reshaped_density
@@ -217,11 +245,17 @@ class SliceRenderer:
         density = self._query_with_scan_mask(model, points, viewdirs, self.bb_min_dev)
         return self._reshape_density(density, reshaped, grid_shape)
 
-    def query_random_positions(self, model, indices, reshaped=False, jitter=False):
+    def query_random_positions(self, model, indices, reshaped=False, jitter=False, return_sigma: bool = False):
         del reshaped
         del jitter
 
         dataset = self._require_dataset()
         points = dataset.get_indices_points(indices)
         viewdirs = dataset.get_indices_viewdirs(indices)
-        return self._query_points(model, points, viewdirs, dataset.point_min_dev)
+        return self._query_points(
+            model,
+            points,
+            viewdirs,
+            dataset.point_min_dev,
+            return_sigma=return_sigma,
+        )

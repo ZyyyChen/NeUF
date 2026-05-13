@@ -51,14 +51,16 @@ class NeUF:
         self.i_plot = int(kwargs.get("plot_freq", 100))
         self.i_save = int(kwargs.get("save_freq", 100))
         self.baked_dataset = bool(kwargs.get("baked_dataset", True))
-        self.training_mode = kwargs.get("training_mode", "Random")
+        self.training_mode = kwargs.get("training_mode", "CurriculumRS")
         self.phase_switch_ratio = float(kwargs.get("phase_switch_ratio", 0.5))
         self.points_per_iter = int(kwargs.get("points_per_iter", 50000))
         self.jitter_training = bool(kwargs.get("jitter_training", False))
         self.patch_size = int(kwargs.get("patch_size", 32))
         self.grad_blur_kernel_size = int(kwargs.get("grad_blur_kernel_size", 6))
         self.grad_blur_sigma = float(kwargs.get("grad_blur_sigma", 1.5))
-        self.tv_weight = float(kwargs.get("tv_weight", 15))
+        self.tv_weight = float(kwargs.get("tv_weight", 0))
+        self.ssim_weight = float(kwargs.get("ssim_weight", 0.1))
+        self.ssim_window_size = int(kwargs.get("ssim_window_size", 11))
         self.slice_mix_interval = int(kwargs.get("slice_mix_interval", 10))
         self.smoothness_delta = float(kwargs.get("smoothness_delta", 0.3))
         self.lr = float(kwargs.get("lr", 5e-4))
@@ -95,10 +97,17 @@ class NeUF:
         self.dual_hf_activate_ratio = float(kwargs.get("dual_hf_activate_ratio", 0.6))
         self.dual_hf_max_weight = float(kwargs.get("dual_hf_max_weight", 1.0))
         self.dual_sparsity_weight = float(kwargs.get("dual_sparsity_weight", 0.01))
-        self.dual_gate_weight = float(kwargs.get("dual_gate_weight", 0.5))
+        self.dual_gate_weight = float(kwargs.get("dual_gate_weight", 0.1))
         self.progressive_training = bool(kwargs.get("progressive_training", False))
         self.progressive_start_levels = int(kwargs.get("progressive_start_levels", 4))
         self.progressive_step_interval = int(kwargs.get("progressive_step_interval", 1000))
+        self.noise_sigma_min = float(kwargs.get("noise_sigma_min", 1e-3))
+        self.noise_sigma_max = float(kwargs.get("noise_sigma_max", 1e3))
+        use_loupas_arg = kwargs.get("use_loupas", True)
+        self._use_loupas_explicit = use_loupas_arg is not None
+        self.use_loupas = True if use_loupas_arg is None else bool(use_loupas_arg)
+        self.loupas_gamma = float(kwargs.get("loupas_gamma", 0.5))
+        self.loupas_weight = float(kwargs.get("loupas_weight", 0.1))
 
         self._validate_configuration()
 
@@ -164,6 +173,13 @@ class NeUF:
             raise ValueError(f"grad_blur_sigma must be > 0, got {self.grad_blur_sigma}")
         if self.tv_weight < 0:
             raise ValueError(f"tv_weight must be >= 0, got {self.tv_weight}")
+        if self.ssim_weight < 0:
+            raise ValueError(f"ssim_weight must be >= 0, got {self.ssim_weight}")
+        if self.ssim_window_size < 3 or self.ssim_window_size % 2 == 0:
+            raise ValueError(
+                "ssim_window_size must be an odd integer >= 3, "
+                f"got {self.ssim_window_size}"
+            )
         if self.grad_clip_norm < 0:
             raise ValueError(f"grad_clip_norm must be >= 0, got {self.grad_clip_norm}")
         if self.lr <= 0:
@@ -249,6 +265,15 @@ class NeUF:
             raise ValueError(
                 f"phase_switch_ratio must be in (0, 1), got {self.phase_switch_ratio}"
             )
+        if self.noise_sigma_min <= 0:
+            raise ValueError(f"noise_sigma_min must be > 0, got {self.noise_sigma_min}")
+        if self.noise_sigma_max <= self.noise_sigma_min:
+            raise ValueError(
+                "noise_sigma_max must be greater than noise_sigma_min, "
+                f"got {self.noise_sigma_max} <= {self.noise_sigma_min}"
+            )
+        if self.loupas_weight < 0:
+            raise ValueError(f"loupas_weight must be >= 0, got {self.loupas_weight}")
 
     def _current_phase(self, progress: float) -> str:
         if self.training_mode != "CurriculumRS":
@@ -336,6 +361,12 @@ class NeUF:
         np.random.seed(checkpoint_seed)
         torch.manual_seed(checkpoint_seed)
         self.seed = checkpoint_seed
+        if not self._use_loupas_explicit:
+            self.use_loupas = bool(checkpoint.get("use_loupas", self.use_loupas))
+        self.noise_sigma_min = float(checkpoint.get("noise_sigma_min", self.noise_sigma_min))
+        self.noise_sigma_max = float(checkpoint.get("noise_sigma_max", self.noise_sigma_max))
+        self.loupas_gamma = float(checkpoint.get("loupas_gamma", self.loupas_gamma))
+        self.loupas_weight = float(checkpoint.get("loupas_weight", self.loupas_weight))
 
         if checkpoint.get("baked", False):
             dataset_path = checkpoint.get(
@@ -491,6 +522,11 @@ class NeUF:
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "start": iteration,
                 "bounding_box": self.dataset.get_bounding_box(),
+                "use_loupas": self.use_loupas,
+                "noise_sigma_min": self.noise_sigma_min,
+                "noise_sigma_max": self.noise_sigma_max,
+                "loupas_gamma": self.loupas_gamma,
+                "loupas_weight": self.loupas_weight,
             }
         )
         dataset_key = "baked_dataset_file" if self.baked_dataset else "dataset_folder"
@@ -865,8 +901,14 @@ class NeUF:
         target = self.dataset.get_indices_pixels(indices)
         self._current_points = self.dataset.get_indices_points(indices)
         self._current_viewdirs = self.dataset.get_indices_viewdirs(indices)
-        density = self.slice_renderer.query_random_positions(self.nerf, indices, reshaped=False)
-        return target, density
+        prediction = self.slice_renderer.query_random_positions(
+            self.nerf,
+            indices,
+            reshaped=False,
+            return_sigma=self.use_loupas,
+        )
+        density, log_sigma = prediction if self.use_loupas else (prediction, None)
+        return target, density, log_sigma
 
     def _sample_patch_batch(self, patch_size: Optional[int] = None, n_patches: Optional[int] = None):
         patch_size = self.patch_size if patch_size is None else int(patch_size)
@@ -912,13 +954,15 @@ class NeUF:
         target = self.dataset.get_indices_pixels(indices)
         self._current_points = self.dataset.get_indices_points(indices)
         self._current_viewdirs = self.dataset.get_indices_viewdirs(indices)
-        density = self.slice_renderer.query_random_positions(
+        prediction = self.slice_renderer.query_random_positions(
             self.nerf,
             indices,
             reshaped=False,
             jitter=False,
+            return_sigma=self.use_loupas,
         )
-        return target, density
+        density, log_sigma = prediction if self.use_loupas else (prediction, None)
+        return target, density, log_sigma
 
     def _sample_slice_batch(self):
         slice_index = np.random.randint(len(self.dataset.slices))
@@ -926,10 +970,12 @@ class NeUF:
         self._current_points = self.dataset.get_slice_points(slice_index)
         self._current_viewdirs = self.dataset.get_slice_viewdirs(slice_index)
         self._current_target_slice = target
-        density = self.slice_renderer.render_slice_from_dataset(
+        prediction = self.slice_renderer.render_slice_from_dataset(
             self.nerf, slice_index, jitter=self.jitter_training,
+            return_sigma=self.use_loupas,
         )
-        return target, density
+        density, log_sigma = prediction if self.use_loupas else (prediction, None)
+        return target, density, log_sigma
 
     def _compute_gradient_loss(self, target: torch.Tensor, density: torch.Tensor) -> torch.Tensor:
         target_slice = torch.reshape(
@@ -971,6 +1017,81 @@ class NeUF:
             mode="replicate",
         )
         return torch.nn.functional.conv2d(x_padded, kernel)
+
+    def _reshape_for_ssim(
+        self,
+        target: torch.Tensor,
+        density: torch.Tensor,
+        active_mode: str,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        if active_mode == "Slice":
+            height, width = self.dataset.px_height, self.dataset.px_width
+            if target.numel() != height * width or density.numel() != height * width:
+                return None
+            target_images = target.reshape(1, 1, height, width)
+            density_images = density.reshape(1, 1, height, width)
+            return target_images, density_images
+
+        if active_mode == "Patch":
+            patch_area = self.patch_size ** 2
+            if target.numel() % patch_area != 0 or density.numel() % patch_area != 0:
+                return None
+            target_images = target.reshape(-1, 1, self.patch_size, self.patch_size)
+            density_images = density.reshape(-1, 1, self.patch_size, self.patch_size)
+            return target_images, density_images
+
+        return None
+
+    def _ssim_window_size_for(self, height: int, width: int) -> int:
+        window_size = min(self.ssim_window_size, int(height), int(width))
+        if window_size % 2 == 0:
+            window_size -= 1
+        return window_size
+
+    def _compute_ssim_loss(
+        self,
+        target: torch.Tensor,
+        density: torch.Tensor,
+        active_mode: str,
+    ) -> Optional[torch.Tensor]:
+        structured = self._reshape_for_ssim(target, density, active_mode)
+        if structured is None:
+            return None
+
+        target_images, density_images = structured
+        _, _, height, width = target_images.shape
+        window_size = self._ssim_window_size_for(height, width)
+        if window_size < 3:
+            return None
+
+        data_range = torch.clamp(
+            target_images.detach().amax() - target_images.detach().amin(),
+            min=1.0,
+        )
+        c1 = (0.01 * data_range) ** 2
+        c2 = (0.03 * data_range) ** 2
+        padding = window_size // 2
+
+        def local_mean(image: torch.Tensor) -> torch.Tensor:
+            padded = F.pad(image, (padding, padding, padding, padding), mode="replicate")
+            return F.avg_pool2d(padded, kernel_size=window_size, stride=1)
+
+        mu_pred = local_mean(density_images)
+        mu_target = local_mean(target_images)
+        mu_pred_sq = mu_pred ** 2
+        mu_target_sq = mu_target ** 2
+        mu_pred_target = mu_pred * mu_target
+
+        sigma_pred_sq = local_mean(density_images ** 2) - mu_pred_sq
+        sigma_target_sq = local_mean(target_images ** 2) - mu_target_sq
+        sigma_pred_target = local_mean(density_images * target_images) - mu_pred_target
+
+        numerator = (2 * mu_pred_target + c1) * (2 * sigma_pred_target + c2)
+        denominator = (mu_pred_sq + mu_target_sq + c1) * (
+            sigma_pred_sq + sigma_target_sq + c2
+        )
+        ssim = numerator / torch.clamp(denominator, min=1e-12)
+        return 1.0 - ssim.mean()
 
     def _compute_tv_loss(self, density):
         d = torch.reshape(density, (self.dataset.px_height, self.dataset.px_width))
@@ -1030,31 +1151,68 @@ class NeUF:
         target_gate = grad_mag.reshape(-1, 1)[:gate.shape[0]]
         return F.mse_loss(gate, target_gate.detach())
 
-    def _compute_training_loss(self, target, density, iteration=0):
+    def _compute_training_loss(self, target, density, log_sigma=None, iteration=0):
+        target = torch.reshape(target, density.shape)
         mse_loss = self.reconstruction_criterion(density, target)
-        loss = mse_loss
-        components: dict[str, torch.Tensor] = {"mse": mse_loss}
+
+        if not self.use_loupas:
+            loss = mse_loss
+            components: dict[str, torch.Tensor] = {
+                "mse": mse_loss,
+            }
+        else:
+            if log_sigma is None:
+                raise ValueError("Loupas NLL is enabled but log_sigma was not returned by the model.")
+            log_sigma = torch.reshape(log_sigma, density.shape)
+            log_sigma_min = torch.log(
+                torch.as_tensor(self.noise_sigma_min, dtype=log_sigma.dtype, device=log_sigma.device)
+            )
+            log_sigma_max = torch.log(
+                torch.as_tensor(self.noise_sigma_max, dtype=log_sigma.dtype, device=log_sigma.device)
+            )
+            stable_log_sigma = torch.clamp(log_sigma, min=log_sigma_min, max=log_sigma_max)
+            sigma = torch.exp(stable_log_sigma)
+
+            nll = ((density - target) ** 2) / (2.0 * sigma ** 2) + stable_log_sigma
+            nll_loss = nll.mean()
+            loupas_target = self.loupas_gamma * torch.log(
+                density.detach().clamp(min=self.noise_sigma_min)
+            )
+            loupas_reg = F.mse_loss(log_sigma, loupas_target)
+
+            loss = nll_loss + self.loupas_weight * loupas_reg
+            components = {
+                "nll": nll_loss,
+                "mse": mse_loss,
+                "loupas_reg": loupas_reg,
+                "sigma_mean": sigma.mean(),
+            }
         active_mode = self._active_mode
 
-        # if active_mode == "Patch":
-        #     tv = self._compute_patch_tv_loss(density)
-        #     components["patch_tv"] = tv
-        #     loss = loss + self.tv_weight * tv
+        if self.ssim_weight > 0:
+            ssim_loss = self._compute_ssim_loss(target, density, active_mode)
+            if ssim_loss is not None:
+                components["ssim"] = ssim_loss
+                loss = loss + self.ssim_weight * ssim_loss
 
-        # elif active_mode == "Slice":
-        #     grad = self._compute_gradient_loss(target, density)
-        #     tv = self._compute_tv_loss(density)
-        #     components["gradient"] = grad
-        #     components["tv"] = tv
-        #     loss = loss + self.grad_weight * grad + self.tv_weight * tv
+        if self.tv_weight > 0:
+            if active_mode == "Patch":
+                tv = self._compute_patch_tv_loss(density)
+                components["patch_tv"] = tv
+                loss = loss + self.tv_weight * tv
 
-        # elif active_mode == "Random" and self.training_mode == "Random":
-        #     if self._current_points is not None and self._current_viewdirs is not None:
-        #         smooth = self._compute_spatial_smoothness(
-        #             self._current_points, self._current_viewdirs
-        #         )
-        #         components["smoothness"] = smooth
-        #         loss = loss + self.tv_weight * smooth
+            elif active_mode == "Slice":
+                tv = self._compute_tv_loss(density)
+                components["tv"] = tv
+                loss = loss + self.tv_weight * tv
+
+            elif active_mode == "Random" and self.training_mode == "Random":
+                if self._current_points is not None and self._current_viewdirs is not None:
+                    smooth = self._compute_spatial_smoothness(
+                        self._current_points, self._current_viewdirs
+                    )
+                    components["smoothness"] = smooth
+                    loss = loss + self.tv_weight * smooth
 
         if self.nerf.dual_encoder is not None and self._current_points is not None:
             progress = self.nerf.training_progress
@@ -1165,9 +1323,14 @@ class NeUF:
                                 iteration,
                             )
 
-                target, density = self._sample_training_batch()
+                target, density, log_sigma = self._sample_training_batch()
                 self.optimizer.zero_grad()
-                loss, loss_components = self._compute_training_loss(target, density, iteration)
+                loss, loss_components = self._compute_training_loss(
+                    target,
+                    density,
+                    log_sigma,
+                    iteration,
+                )
                 loss.backward()
                 if self.grad_clip_norm > 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1280,6 +1443,18 @@ def parse_args():
     parser.add_argument("--raw-dataset", action="store_true", help="Treat --dataset as an unbaked folder")
     parser.add_argument("--jitter-training", action="store_true", help="Enable point jitter during training")
     parser.add_argument("--tv-weight", type=float, default=1e-4)
+    parser.add_argument(
+        "--ssim-weight",
+        type=float,
+        default=0.1,
+        help="Weight for SSIM loss on Slice and Patch batches. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--ssim-window-size",
+        type=int,
+        default=11,
+        help="Odd local window size for SSIM loss.",
+    )
     parser.add_argument("--slice-mix-interval", type=int, default=10,
                         help="In Random mode, mix a full slice every N iters for 2D TV loss. 0 to disable.")
     parser.add_argument("--smoothness-delta", type=float, default=0.1,
@@ -1421,6 +1596,48 @@ def parse_args():
         type=float,
         default=0.5,
     )
+    noise_group = parser.add_argument_group("Heteroscedastic noise model parameters")
+    noise_group.add_argument(
+        "--use-loupas",
+        dest="use_loupas",
+        action="store_true",
+        default=None,
+        help="Use the Loupas-inspired heteroscedastic model and NLL loss.",
+    )
+    noise_group.add_argument(
+        "--no-loupas",
+        dest="use_loupas",
+        action="store_false",
+        help="Disable the Loupas model and train with plain MSE loss.",
+    )
+    noise_group.add_argument(
+        "--noise-sigma-min",
+        dest="noise_sigma_min",
+        type=float,
+        default=1e-3,
+        help="Minimum predicted sigma used in the heteroscedastic NLL.",
+    )
+    noise_group.add_argument(
+        "--noise-sigma-max",
+        dest="noise_sigma_max",
+        type=float,
+        default=1e3,
+        help="Maximum predicted sigma used in the heteroscedastic NLL.",
+    )
+    noise_group.add_argument(
+        "--loupas-gamma",
+        dest="loupas_gamma",
+        type=float,
+        default=0.5,
+        help="Exponent gamma for log_sigma ~= gamma * log(I_clean).",
+    )
+    noise_group.add_argument(
+        "--loupas-weight",
+        dest="loupas_weight",
+        type=float,
+        default=0.1,
+        help="Weight for the Loupas-inspired sigma-density regularization.",
+    )
     return parser.parse_args()
 
 
@@ -1445,6 +1662,8 @@ def main():
         baked_dataset=not args.raw_dataset,
         jitter_training=args.jitter_training,
         tv_weight=args.tv_weight,
+        ssim_weight=args.ssim_weight,
+        ssim_window_size=args.ssim_window_size,
         slice_mix_interval=args.slice_mix_interval,
         smoothness_delta=args.smoothness_delta,
         phase_switch_ratio=args.phase_switch_ratio,
@@ -1471,6 +1690,11 @@ def main():
         dual_hf_max_weight=args.dual_hf_max_weight,
         dual_sparsity_weight=args.dual_sparsity_weight,
         dual_gate_weight=args.dual_gate_weight,
+        noise_sigma_min=args.noise_sigma_min,
+        noise_sigma_max=args.noise_sigma_max,
+        use_loupas=args.use_loupas,
+        loupas_gamma=args.loupas_gamma,
+        loupas_weight=args.loupas_weight,
     )
     neuf.run()
 

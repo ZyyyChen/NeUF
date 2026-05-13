@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import base_encoder
 import hash_encoder
 import dual_freq_encoder
+import kronecker_encoder
 from datetime import date
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -18,6 +19,7 @@ class NeRF(nn.Module) :
         self.out_ch = 0
         self.skips = []
         self.model = None
+        self.sigma_linear = None
 
         self.use_encoding = True
         self.use_direction = True
@@ -32,6 +34,7 @@ class NeRF(nn.Module) :
 
         self.encoding_initialized = False
         self.dual_encoder: dual_freq_encoder.DualFreqEncoder | None = None
+        self.kronecker_encoder: kronecker_encoder.KroneckerHashPE | None = None
         self.training_progress: float = 0.0
 
         if ckpt != None :
@@ -84,12 +87,34 @@ class NeRF(nn.Module) :
             )
             if self.dual_encoder is not None and "dual_encoder_state" in ckpt:
                 self.dual_encoder.load_state_dict(ckpt["dual_encoder_state"])
+        elif ckpt["encoding"] == "KRONECKER":
+            self.init_kronecker_encoding(
+                bounding_box=ckpt.get("bounding_box"),
+                n_levels_lateral=ckpt.get("n_levels_lateral", 8) or 8,
+                n_levels_axial=ckpt.get("n_levels_axial", 8) or 8,
+                finest_lateral=ckpt.get("finest_lateral", 128) or 128,
+                finest_axial=ckpt.get("finest_axial", 512) or 512,
+                n_features_per_level=ckpt.get("n_features_per_level", 2) or 2,
+                log2_hashmap_size=ckpt.get("log2_hashmap_size", 19) or 19,
+                base_resolution=ckpt.get("base_resolution", 16) or 16,
+                combine=ckpt.get("combine", "cat") or "cat",
+            )
+            if self.kronecker_encoder is not None and "kronecker_encoder_state" in ckpt:
+                self.kronecker_encoder.load_state_dict(ckpt["kronecker_encoder_state"])
         else:
             print("unknown model type:",ckpt["encoding"])
             exit(-1)
 
         self.init_model()
-        self.load_state_dict(ckpt["network_fn_state_dict"])
+        incompatible = self.load_state_dict(ckpt["network_fn_state_dict"], strict=False)
+        expected_missing = {"sigma_linear.weight", "sigma_linear.bias"}
+        unexpected_missing = set(incompatible.missing_keys) - expected_missing
+        if unexpected_missing or incompatible.unexpected_keys:
+            print(
+                "Checkpoint loaded with incompatible keys: "
+                f"missing={sorted(unexpected_missing)}, "
+                f"unexpected={sorted(incompatible.unexpected_keys)}"
+            )
 
 
     def init_hash_encoding(self, bounding_box, n_levels=16, n_features_per_level=2,
@@ -188,6 +213,44 @@ class NeRF(nn.Module) :
         self.encoder_params = list(self.dual_encoder.parameters())
         self.encoding_initialized = True
 
+    def init_kronecker_encoding(
+        self,
+        bounding_box,
+        n_levels_lateral: int = 8,
+        n_levels_axial: int = 8,
+        finest_lateral: int = 128,
+        finest_axial: int = 512,
+        n_features_per_level: int = 2,
+        log2_hashmap_size: int = 19,
+        base_resolution: int = 16,
+        combine: str = "cat",
+    ):
+        if self.encoding_initialized :
+            print("encoding initialized twice")
+            exit(-1)
+
+        self.kronecker_encoder = kronecker_encoder.KroneckerHashPE(
+            bounding_box=bounding_box,
+            n_levels_lateral=n_levels_lateral,
+            n_levels_axial=n_levels_axial,
+            finest_lateral=finest_lateral,
+            finest_axial=finest_axial,
+            n_features_per_level=n_features_per_level,
+            log2_hashmap_size=log2_hashmap_size,
+            base_resolution=base_resolution,
+            combine=combine,
+        )
+        self.encode = self.kronecker_encoder
+        self.in_ch = self.kronecker_encoder.out_dim
+        self.out_ch = 1
+        self.skips = [4]
+        self.dir_ch = 0
+        self.use_encoding = True
+        self.use_direction = False
+        self.encoding_type = "KRONECKER"
+        self.encoder_params = list(self.kronecker_encoder.parameters())
+        self.encoding_initialized = True
+
 
     def init_model(self, D=8, W=256):
         if(not self.encoding_initialized):
@@ -213,7 +276,8 @@ class NeRF(nn.Module) :
         if self.use_direction:
             self.feature_linear = nn.Linear(W, W)
 
-        self.output_linear = nn.Linear(W, self.out_ch)
+        self.output_linear = nn.Linear(W, 1)
+        self.sigma_linear = nn.Linear(W, 1)
 
         self.to(device)
 
@@ -236,21 +300,31 @@ class NeRF(nn.Module) :
                 h = F.relu(h)
 
 
-        outputs = self.output_linear(h)
+        i_clean = self.output_linear(h)
+        log_sigma = self.sigma_linear(h)
 
-        return outputs
+        return i_clean, log_sigma
 
 
-    def batchify(self, chunk):
+    def batchify(self, chunk, return_sigma=False):
         if chunk is None:
             return self.model
 
         def ret(inputs):
-            return torch.cat([self.forward(inputs[i:i + chunk]) for i in range(0, inputs.shape[0], chunk)], 0)
+            outputs = [
+                self.forward(inputs[i:i + chunk])
+                for i in range(0, inputs.shape[0], chunk)
+            ]
+            i_clean = torch.cat([output[0] for output in outputs], 0)
+            if not return_sigma:
+                return i_clean
+
+            log_sigma = torch.cat([output[1] for output in outputs], 0)
+            return i_clean, log_sigma
 
         return ret
 
-    def query(self, inputs, dirs, netchunk=1024*64):
+    def query(self, inputs, dirs, netchunk=1024*64, return_sigma=False):
         inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
         if hasattr(self.encode, 'forward') and self.encoding_type == "HASH" and self.use_encoding:
             embedded = self.encode(inputs_flat, active_levels=getattr(self, '_active_levels', None))
@@ -262,9 +336,12 @@ class NeRF(nn.Module) :
             embedded_dirs = self.encode_dirs(input_dirs_flat)
             embedded = torch.cat([embedded, embedded_dirs], -1)
 
-        outputs_flat = self.batchify(netchunk)(embedded)
+        outputs_flat = self.batchify(netchunk, return_sigma=return_sigma)(embedded)
         # outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
         return outputs_flat
+
+    def query_with_uncertainty(self, inputs, dirs, netchunk=1024*64):
+        return self.query(inputs, dirs, netchunk=netchunk, return_sigma=True)
 
     def grad_vars(self):
         params = list(self.parameters())
@@ -317,6 +394,20 @@ class NeRF(nn.Module) :
                     "base_resolution": float(self.encode.base_resolution.cpu()),
                     "finest_resolution": float(self.encode.finest_resolution.cpu()),
                     "hash_encoder_state": self.encode.state_dict(),
+                })
+            elif self.encoding_type == "KRONECKER" and self.kronecker_encoder is not None:
+                enc = self.kronecker_encoder
+                dic.update({
+                    "bounding_box": enc.bounding_box,
+                    "n_levels_lateral": enc.enc_xy.n_levels,
+                    "n_levels_axial": enc.enc_xz.n_levels,
+                    "finest_lateral": float(enc.enc_xy.finest_resolution.cpu()),
+                    "finest_axial": float(enc.enc_xz.finest_resolution.cpu()),
+                    "n_features_per_level": enc.enc_xy.n_features_per_level,
+                    "log2_hashmap_size": enc.enc_xy.log2_hashmap_size,
+                    "base_resolution": float(enc.enc_xy.base_resolution.cpu()),
+                    "combine": enc.combine,
+                    "kronecker_encoder_state": enc.state_dict(),
                 })
             elif self.encoding_type.startswith("DUAL_") and self.dual_encoder is not None:
                 enc = self.dual_encoder

@@ -156,7 +156,7 @@ def load_checkpoint(ckpt_path: Path):
 
 
 def model_uses_physical_coordinates(model):
-    return model.encoding_type in {"HASH", "DUAL_HASH"} and model.use_encoding
+    return model.encoding_type in {"HASH", "DUAL_HASH", "KRONECKER"} and model.use_encoding
 
 
 def infer_training_progress(args, ckpt, model):

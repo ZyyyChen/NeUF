@@ -21,7 +21,7 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Render a 3D Cartesian volume directly from a NeUF checkpoint. "
             "This path follows the current SliceRenderer point-normalization rules, "
-            "including DUAL_HASH physical-coordinate queries and dual training progress."
+            "including DUAL_HASH/KRONECKER physical-coordinate queries and dual training progress."
         )
     )
     parser.add_argument("--ckpt", type=Path, required=True, help="Path to checkpoint .pkl")
@@ -180,7 +180,7 @@ def normalize_points_for_model(
     bb_min: torch.Tensor,
     bb_max: torch.Tensor,
 ) -> torch.Tensor:
-    if model.encoding_type in {"HASH", "DUAL_HASH"} and model.use_encoding:
+    if model.encoding_type in {"HASH", "DUAL_HASH", "KRONECKER"} and model.use_encoding:
         return points
 
     bbox_extent = torch.clamp(bb_max - bb_min, min=MIN_BBOX_EXTENT)
