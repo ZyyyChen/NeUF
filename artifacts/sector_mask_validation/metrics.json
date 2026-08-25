@@ -1,0 +1,130 @@
+{
+  "status": "mask exclusion verified; reconstruction-quality effect not yet validated",
+  "dataset": "Patient0/us_recal_original",
+  "comparison_frame": "us0.jpg",
+  "image_shape_hw": [
+    708,
+    944
+  ],
+  "mask_detection": {
+    "source": "temporal-largest-component",
+    "sampled_frame_count": 32,
+    "sampled_frame_indices": [
+      0,
+      7,
+      15,
+      23,
+      31,
+      38,
+      46,
+      54,
+      62,
+      69,
+      77,
+      85,
+      93,
+      101,
+      108,
+      116,
+      124,
+      132,
+      139,
+      147,
+      155,
+      163,
+      171,
+      178,
+      186,
+      194,
+      202,
+      209,
+      217,
+      225,
+      233,
+      241
+    ],
+    "foreground_threshold_uint8": 4.0,
+    "safety_margin_px": 2
+  },
+  "valid_pixels": 441425,
+  "excluded_pixels": 226927,
+  "valid_fraction": 0.6604678373072872,
+  "valid_bbox_xyxy_inclusive": [
+    4,
+    4,
+    939,
+    669
+  ],
+  "raw_nonzero_pixels": 445182,
+  "masked_nonzero_pixels": 436166,
+  "excluded_nonzero_pixels": 9016,
+  "regions": {
+    "top_left_background": {
+      "mask_valid_pixels": 0,
+      "before_nonzero_pixels": 65,
+      "after_nonzero_pixels": 0,
+      "before_intensity_sum": 406,
+      "after_intensity_sum": 0
+    },
+    "date": {
+      "mask_valid_pixels": 0,
+      "before_nonzero_pixels": 310,
+      "after_nonzero_pixels": 0,
+      "before_intensity_sum": 16976,
+      "after_intensity_sum": 0
+    },
+    "right_device_parameters": {
+      "mask_valid_pixels": 0,
+      "before_nonzero_pixels": 1590,
+      "after_nonzero_pixels": 0,
+      "before_intensity_sum": 75191,
+      "after_intensity_sum": 0
+    },
+    "bottom_droit_gct_and_markings": {
+      "mask_valid_pixels": 0,
+      "before_nonzero_pixels": 2911,
+      "after_nonzero_pixels": 0,
+      "before_intensity_sum": 169734,
+      "after_intensity_sum": 0
+    }
+  },
+  "sagittal_supervision": {
+    "status": "independent sagittal mask exclusion verified",
+    "source": "data/cerebral_data/Pre_traitement_echo_v2/Repositionnement/Patient0/data_repos_Patient0_J35_2_sag.mat",
+    "variable": "data_sag",
+    "image_shape_hw": [
+      708,
+      944
+    ],
+    "mask_source": "temporal-largest-component",
+    "valid_pixels": 483618,
+    "excluded_pixels": 184734,
+    "valid_fraction": 0.7235977449008906,
+    "valid_bbox_xyxy_inclusive": [
+      4,
+      4,
+      930,
+      703
+    ],
+    "raw_nonzero_pixels": 489274,
+    "masked_nonzero_pixels": 483618,
+    "excluded_nonzero_pixels": 5656,
+    "regions": {
+      "date": {
+        "mask_valid_pixels": 0,
+        "before_nonzero_pixels": 120,
+        "after_nonzero_pixels": 0
+      },
+      "right_device_parameters": {
+        "mask_valid_pixels": 0,
+        "before_nonzero_pixels": 510,
+        "after_nonzero_pixels": 0
+      },
+      "top_left_background": {
+        "mask_valid_pixels": 0,
+        "before_nonzero_pixels": 0,
+        "after_nonzero_pixels": 0
+      }
+    }
+  }
+}

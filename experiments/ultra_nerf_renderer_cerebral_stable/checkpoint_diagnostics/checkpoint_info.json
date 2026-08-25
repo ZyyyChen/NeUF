@@ -1,0 +1,82 @@
+{
+  "backward_count": 1,
+  "checkpoint": "/misc/raid/zchen/Code/NeUF/experiments/ultra_nerf_renderer_cerebral_stable/latest/ckpt.pkl",
+  "checkpoint_iteration": 10000,
+  "checkpoint_sha256_after": "240c6adf07a3735676b7787a098c57f7b88d87ed0d01d263a81d532d934471db",
+  "checkpoint_sha256_before": "240c6adf07a3735676b7787a098c57f7b88d87ed0d01d263a81d532d934471db",
+  "checkpoint_size_bytes": 207244874,
+  "checkpoint_unchanged": true,
+  "cumprod": {
+    "dimension": 1,
+    "source_locations": {
+      "border_bernoulli": [
+        194
+      ],
+      "border_detach": [
+        197
+      ],
+      "cumprod_attenuation": [
+        191
+      ],
+      "cumprod_reflection": [
+        206
+      ],
+      "explanation": "Both torch.bernoulli(...).detach() samples are non-reparameterized and remove rho_b/rho_s from the rendered loss graph.",
+      "file": "/misc/raid/zchen/Code/NeUF/neuf/ultra_nerf_renderer.py",
+      "scatter_bernoulli": [
+        209
+      ],
+      "scatter_detach": [
+        212
+      ]
+    },
+    "tensor_layout": "[W,H]"
+  },
+  "dataset_argument": "data/cerebral_data/Pre_traitement_echo_v2/Recalage/Patient0/us_recal_original/baked_dataset_physical.pkl",
+  "dataset_load_mode": "baked_dataset",
+  "dataset_resolved": "/misc/raid/zchen/Code/NeUF/data/cerebral_data/Pre_traitement_echo_v2/Recalage/Patient0/us_recal_original/baked_dataset_physical.pkl",
+  "dataset_shape_hw": [
+    704,
+    944
+  ],
+  "device": "cpu",
+  "diagnostic_loss": "masked_mse",
+  "forward_pass_count": 1,
+  "frame_index": 121,
+  "frame_split": "train",
+  "frame_split_index": 120,
+  "model_mode": "eval",
+  "network_output_mode": "ultra_nerf",
+  "no_retraining": true,
+  "optimizer_created": false,
+  "optimizer_step_count": 0,
+  "process_id": 966742,
+  "raw_channel_order": [
+    "alpha_raw",
+    "beta_raw",
+    "rho_b_raw",
+    "rho_s_raw",
+    "phi_raw"
+  ],
+  "raw_channel_order_verified_by": "UltraNeRFRenderer.RAW_CHANNEL_NAMES and checkpoint Linear(...,5) head",
+  "renderer": "ultra_nerf",
+  "renderer_config": {
+    "distance_unit": "m",
+    "eval_mc_samples_for_diagnostic": 1,
+    "psf_axial_std": 1.0,
+    "psf_half_size": 3,
+    "psf_lateral_std": 2.0,
+    "query_chunk": 65536
+  },
+  "renderer_variables": {
+    "B": "b",
+    "E": "intensity_map",
+    "R": "r",
+    "T_att": "attenuation_transmission",
+    "T_ref": "reflection_transmission"
+  },
+  "reshape_order": "dataset flat row-major -> points_hw3/raw_hw5 [H,W] -> permute to raw_wh5 [W,H] -> renderer -> transpose back to [H,W]",
+  "seed": 0,
+  "torch_version": "2.6.0+cu126",
+  "training_loss_from_checkpoint": "MSE"
+}

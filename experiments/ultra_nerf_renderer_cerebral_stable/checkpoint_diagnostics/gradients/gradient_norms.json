@@ -1,0 +1,75 @@
+{
+  "active_grad_threshold": 1e-09,
+  "backward_count": 1,
+  "bernoulli_code_locations": {
+    "border_bernoulli": [
+      194
+    ],
+    "border_detach": [
+      197
+    ],
+    "cumprod_attenuation": [
+      191
+    ],
+    "cumprod_reflection": [
+      206
+    ],
+    "explanation": "Both torch.bernoulli(...).detach() samples are non-reparameterized and remove rho_b/rho_s from the rendered loss graph.",
+    "file": "/misc/raid/zchen/Code/NeUF/neuf/ultra_nerf_renderer.py",
+    "scatter_bernoulli": [
+      209
+    ],
+    "scatter_detach": [
+      212
+    ]
+  },
+  "diagnostic_loss": "masked_mse",
+  "diagnostic_loss_value": 0.010597788728773594,
+  "optimizer_created": false,
+  "optimizer_step_count": 0,
+  "output_head": {
+    "bias_grad_abs": {
+      "alpha_raw": 0.0003828751214314252,
+      "beta_raw": 1.3816447541614707e-08,
+      "phi_raw": 2.658889934537001e-05,
+      "rho_b_raw": 0.0,
+      "rho_s_raw": 0.0
+    },
+    "type": "Linear(..., 5)",
+    "weight_row_grad_norm": {
+      "alpha_raw": 0.0047824145294725895,
+      "beta_raw": 6.75110811698687e-08,
+      "phi_raw": 0.000153921457240358,
+      "rho_b_raw": 0.0,
+      "rho_s_raw": 0.0
+    }
+  },
+  "raw_output": {
+    "alpha_raw": {
+      "l2": 9.126645750257012e-07,
+      "max_abs": 3.6098992683974984e-09,
+      "mean_abs": 7.816365332757869e-10
+    },
+    "beta_raw": {
+      "l2": 6.005891339810887e-10,
+      "max_abs": 5.818278844826885e-11,
+      "mean_abs": 2.1450365694287467e-14
+    },
+    "phi_raw": {
+      "l2": 6.911533546372084e-06,
+      "max_abs": 1.5860035773584968e-07,
+      "mean_abs": 1.7876170543829062e-09
+    },
+    "rho_b_raw": {
+      "l2": 0.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    },
+    "rho_s_raw": {
+      "l2": 0.0,
+      "max_abs": 0.0,
+      "mean_abs": 0.0
+    }
+  },
+  "zero_grad_threshold": 1e-12
+}

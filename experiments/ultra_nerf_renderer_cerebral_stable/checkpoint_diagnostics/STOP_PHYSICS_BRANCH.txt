@@ -1,0 +1,4 @@
+STOP_PHYSICS_BRANCH=true
+reason=current cumprod paths do not match convex-sector propagation geometry
+Do not continue training, fine-tuning, parameter sweeps, or formal A/B tests.
+Required acquisition/scan-conversion information: virtual centre, probe curvature radius, sector angle, depth sampling, and pixel-to-beam mapping.

@@ -1,0 +1,135 @@
+{
+  "PARALLEL_VERTICAL_GEOMETRY": true,
+  "STOP_PHYSICS_BRANCH": true,
+  "cumprod_dimension": 1,
+  "cumprod_index_mapping": "raw_wh5[path=original_col, depth=original_row]",
+  "direct_pixel_mapping": true,
+  "direction_angle_spread_deg": 0.0,
+  "inside_mask_fraction_below_0.95_path_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "near_vertical_threshold_px": 1.8880000000000001,
+  "non_monotonic_path_ids": [],
+  "parallel_vertical_path_count": 10,
+  "paths": [
+    {
+      "column": 4,
+      "depth_order_monotonic": true,
+      "direction_angle_deg_from_image_down_axis": 0.0,
+      "horizontal_drift_px": 0.0,
+      "inside_mask_fraction": 0.08522727272727272,
+      "near_vertical_path": true,
+      "path_id": 0,
+      "vertical_extent_px": 703.0
+    },
+    {
+      "column": 108,
+      "depth_order_monotonic": true,
+      "direction_angle_deg_from_image_down_axis": 0.0,
+      "horizontal_drift_px": 0.0,
+      "inside_mask_fraction": 0.39488636363636365,
+      "near_vertical_path": true,
+      "path_id": 1,
+      "vertical_extent_px": 703.0
+    },
+    {
+      "column": 212,
+      "depth_order_monotonic": true,
+      "direction_angle_deg_from_image_down_axis": 0.0,
+      "horizontal_drift_px": 0.0,
+      "inside_mask_fraction": 0.6789772727272727,
+      "near_vertical_path": true,
+      "path_id": 2,
+      "vertical_extent_px": 703.0
+    },
+    {
+      "column": 316,
+      "depth_order_monotonic": true,
+      "direction_angle_deg_from_image_down_axis": 0.0,
+      "horizontal_drift_px": 0.0,
+      "inside_mask_fraction": 0.9360795454545454,
+      "near_vertical_path": true,
+      "path_id": 3,
+      "vertical_extent_px": 703.0
+    },
+    {
+      "column": 420,
+      "depth_order_monotonic": true,
+      "direction_angle_deg_from_image_down_axis": 0.0,
+      "horizontal_drift_px": 0.0,
+      "inside_mask_fraction": 0.9488636363636364,
+      "near_vertical_path": true,
+      "path_id": 4,
+      "vertical_extent_px": 703.0
+    },
+    {
+      "column": 523,
+      "depth_order_monotonic": true,
+      "direction_angle_deg_from_image_down_axis": 0.0,
+      "horizontal_drift_px": 0.0,
+      "inside_mask_fraction": 0.9474431818181818,
+      "near_vertical_path": true,
+      "path_id": 5,
+      "vertical_extent_px": 703.0
+    },
+    {
+      "column": 627,
+      "depth_order_monotonic": true,
+      "direction_angle_deg_from_image_down_axis": 0.0,
+      "horizontal_drift_px": 0.0,
+      "inside_mask_fraction": 0.9446022727272727,
+      "near_vertical_path": true,
+      "path_id": 6,
+      "vertical_extent_px": 703.0
+    },
+    {
+      "column": 731,
+      "depth_order_monotonic": true,
+      "direction_angle_deg_from_image_down_axis": 0.0,
+      "horizontal_drift_px": 0.0,
+      "inside_mask_fraction": 0.71875,
+      "near_vertical_path": true,
+      "path_id": 7,
+      "vertical_extent_px": 703.0
+    },
+    {
+      "column": 835,
+      "depth_order_monotonic": true,
+      "direction_angle_deg_from_image_down_axis": 0.0,
+      "horizontal_drift_px": 0.0,
+      "inside_mask_fraction": 0.42613636363636365,
+      "near_vertical_path": true,
+      "path_id": 8,
+      "vertical_extent_px": 703.0
+    },
+    {
+      "column": 939,
+      "depth_order_monotonic": true,
+      "direction_angle_deg_from_image_down_axis": 0.0,
+      "horizontal_drift_px": 0.0,
+      "inside_mask_fraction": 0.11931818181818182,
+      "near_vertical_path": true,
+      "path_id": 9,
+      "vertical_extent_px": 703.0
+    }
+  ],
+  "reason": "current cumprod paths do not match convex-sector propagation geometry",
+  "reprojection_error_px": {
+    "maximum": 0.0,
+    "median": 0.0
+  },
+  "selected_path_count": 10,
+  "stop_conditions": [
+    "PARALLEL_VERTICAL_GEOMETRY",
+    "PATH_INSIDE_MASK_FRACTION_BELOW_0.95"
+  ]
+}

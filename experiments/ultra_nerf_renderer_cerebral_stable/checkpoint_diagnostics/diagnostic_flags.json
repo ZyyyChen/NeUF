@@ -1,0 +1,11 @@
+{
+  "BERNOULLI_GRAD_BLOCKED": true,
+  "OTHER_CHANNELS_ACTIVE": true,
+  "PARALLEL_VERTICAL_GEOMETRY": true,
+  "RHO_B_GRAD_ZERO": true,
+  "RHO_B_NEAR_HALF": false,
+  "RHO_S_GRAD_ZERO": true,
+  "RHO_S_NEAR_HALF": false,
+  "SCATTER_DOMINANT": true,
+  "STOP_PHYSICS_BRANCH": true
+}

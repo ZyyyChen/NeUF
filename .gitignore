@@ -1,4 +1,5 @@
 _*
+!/neuf/__main__.py
 tmp/
 logs/
 datasets/**
@@ -6,6 +7,7 @@ datasets/**
 !datasets/baked/grandeSphereValid.pkl
 .idea
 tests/
+!tests/
 volume/*
 /.NUF_venv/
 /latest
@@ -35,6 +37,25 @@ __pycache__/
 # ppt files
 *.ppt
 
+# local archives and crash dumps
+/archives/
+core
+core.*
 
+# generated training caches and logs
+/logdir/
+.matplotlib/
 
+# large medical volumes, segmentation outputs, and checkpoints
+*.pickle
+*.nii
+*.nii.gz
+*.ckpt.data-*
+*.ckpt.index
+/code_seg_3D/SegAuto_VNet/
+/code_seg_3D/newold_dataset_640_resize_320/
+/code_seg_3D/savenet_/
+/seg_test/
 
+# temporary office files
+~$*

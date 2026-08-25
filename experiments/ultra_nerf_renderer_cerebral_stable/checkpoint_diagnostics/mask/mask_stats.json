@@ -1,0 +1,55 @@
+{
+  "central_pixel_valid": true,
+  "connected_components_kept": 1,
+  "estimation": {
+    "algorithm": "sequence_maximum_central_row_run",
+    "central_support_row_range": [
+      0,
+      673
+    ],
+    "erosion_pixels": 2,
+    "excluded_support_component_sizes": [
+      460454,
+      1984,
+      1863,
+      983,
+      255,
+      253,
+      202,
+      192,
+      192,
+      28,
+      20,
+      12,
+      9,
+      9,
+      9
+    ],
+    "support_component_count": 15,
+    "threshold": 0.00784313725490196
+  },
+  "frames_used_for_estimation": 246,
+  "height": 704,
+  "mask_valid": true,
+  "maximum_column_interval_count": 1,
+  "maximum_row_interval_count": 1,
+  "source": "estimated",
+  "source_detail": "all train+validation frames",
+  "touches_image_border": false,
+  "ui_regions_excluded": true,
+  "valid_column_range": [
+    4,
+    939
+  ],
+  "valid_fraction": 0.6742343990755008,
+  "valid_pixel_count": 448080,
+  "valid_row_range": [
+    4,
+    671
+  ],
+  "visual_review_artifacts": [
+    "mask_overlay_frame_121.png",
+    "mask_overlay_three_frames.png"
+  ],
+  "width": 944
+}

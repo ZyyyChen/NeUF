@@ -1,0 +1,1 @@
+/home/zchen/.conda/envs/neuf/bin/python -m neuf.diagnose_ultra_nerf_checkpoint --checkpoint experiments/ultra_nerf_renderer_cerebral_stable/latest/ckpt.pkl --dataset data/cerebral_data/Pre_traitement_echo_v2/Recalage/Patient0/us_recal_original/baked_dataset_physical.pkl --frame-index 121 --seed 0 --output-dir experiments/ultra_nerf_renderer_cerebral_stable/checkpoint_diagnostics
