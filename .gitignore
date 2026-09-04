@@ -44,7 +44,23 @@ core.*
 
 # generated training caches and logs
 /logdir/
+/runs/
+/experiments/
+/exports/
+/phase1_image_quality*/
+/artifacts/
+/trajectory_output/
 .matplotlib/
+
+# retained locally but not part of the current source tree
+/code_seg_3D/
+/notebooks/
+
+# local development environments and caches
+/.venv/
+/.cache/
+/.pytest_cache/
+/.ruff_cache/
 
 # large medical volumes, segmentation outputs, and checkpoints
 *.pickle

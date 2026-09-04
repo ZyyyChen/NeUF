@@ -1,213 +1,369 @@
+"""超声神经场的网络结构、编码器初始化、查询接口与检查点序列化。
+
+本模块只保留当前实验仍在使用的三种固定几何模型：基础单头 HashGrid、
+无门控双 HashGrid 单头模型，以及显式分离解剖结构与散斑的双头模型。已经移除的
+视角方向编码、不确定性预测、位姿分支和射线物理分支不会在这里静默恢复。
+
+除非单个函数另有说明，输入坐标张量最后一维均为三维空间坐标，前面的维度可以是
+任意采样布局；查询时会临时展平为 ``[点数, 3]``，输出强度的最后一维为 1。
+"""
+
+from __future__ import annotations
+
 import math
+from collections.abc import Callable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from neuf import base_encoder
-from neuf import hash_encoder
-from neuf import dual_freq_encoder
-from neuf import kronecker_encoder
-from datetime import date
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+from neuf.dual_freq_encoder import DualFreqEncoder
+from neuf.hash_encoder import HashEncoder
 
-class NeRF(nn.Module) :
-    DEFAULT_ULTRA_HEAD_INITIALIZATION = {
-        "attenuation": 1.0,
-        "reflection": 0.02,
-        "border_probability": 0.005,
-        "scatter_density": 0.2,
-        "scatter_amplitude": 0.5,
-        "weight_std": 1e-4,
+
+# 模型统一放置到当前可用的 CUDA 设备；没有 CUDA 时自动回退到 CPU。
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+class SkipMLP(nn.Module):
+    """带一次可选输入跳跃连接的 ReLU 多层感知机。
+
+    跳跃连接发生在指定隐藏层的线性变换之前：把原始输入特征与上一层隐藏特征
+    沿最后一维拼接，再送入该层。这样既保留高频编码中的原始信息，也避免深层
+    MLP 完全依赖连续非线性变换后的表示。
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        hidden_layers: int,
+        *,
+        skip_before: int | None = None,
+        output_dim: int = 1,
+    ) -> None:
+        """构建解码器。
+
+        参数:
+            input_dim: 每个采样点的输入特征维数。
+            hidden_dim: 每个隐藏层的输出维数。
+            hidden_layers: 隐藏层数量。
+            skip_before: 在第几个隐藏层之前拼接原始输入；``None`` 表示不使用
+                跳跃连接，索引从 0 开始。
+            output_dim: 最终线性输出层的通道数。
+        """
+        super().__init__()
+        # 显式保存结构参数，便于检查点记录、调试和参数量核对。
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.hidden_layers = int(hidden_layers)
+        self.skip_before = skip_before
+
+        # 逐层计算实际输入维数；跳跃层需要额外容纳一份原始输入特征。
+        layers = []
+        for index in range(self.hidden_layers):
+            layer_input = self.input_dim if index == 0 else self.hidden_dim
+            if index == self.skip_before:
+                layer_input += self.input_dim
+            layers.append(nn.Linear(layer_input, self.hidden_dim))
+        self.layers = nn.ModuleList(layers)
+        # 输出层不使用激活函数，具体的强度约束由上层查询逻辑决定。
+        self.output = nn.Linear(self.hidden_dim, int(output_dim))
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """把编码特征解码为每点预测值。
+
+        ``features`` 的形状为 ``[..., input_dim]``，返回形状为
+        ``[..., output_dim]``；除最后一维外的所有批次维度都会原样保留。
+        """
+        hidden = features
+        for index, layer in enumerate(self.layers):
+            if index == self.skip_before:
+                # 仅在指定位置拼接一次，拼接方向始终为特征维（最后一维）。
+                hidden = torch.cat((hidden, features), dim=-1)
+            hidden = F.relu(layer(hidden))
+        return self.output(hidden)
+
+
+class NeRF(nn.Module):
+    """只包含当前保留的 HashGrid 方案的神经超声场。
+
+    三种 ``field_head`` 的用途如下：
+
+    * ``legacy_fixed_geometry``：基础单头 HashGrid，对每个坐标直接预测一个强度；
+    * ``dual_single_head_matched``：直接拼接低频与高频特征后，用与基础模型相同
+      的单头解码器，作为只替换编码器的公平对照；
+    * ``anatomy_speckle_v1``：低频分支预测解剖基底，解剖输出与高频特征共同
+      预测散斑残差，
+      最终通过 ``anatomy + alpha * speckle`` 合成强度。
+
+    本类不会创建已经淘汰的方向、不确定性、位姿、矢状面、Fourier、Kronecker
+    或射线物理分支。遇到旧检查点时会明确拒绝不受支持的结构，避免加载成功但
+    实际模型语义不一致。
+    """
+
+    # 这些字符串会写入检查点，是模型结构协议的一部分，不能随意改名。
+    LEGACY_FIELD_HEAD = "legacy_fixed_geometry"
+    MATCHED_FIELD_HEAD = "dual_single_head_matched"
+    ANATOMY_SPECKLE_FIELD_HEAD = "anatomy_speckle_v1"
+
+    # 每种场头只允许一种编码器，避免把 E0 的“基础单 Hash”对照静默运行成
+    # 双频编码。该映射同时用于新模型初始化和检查点恢复。
+    FIELD_HEAD_ENCODINGS = {
+        LEGACY_FIELD_HEAD: "HASH",
+        MATCHED_FIELD_HEAD: "DUAL_HASH",
+        ANATOMY_SPECKLE_FIELD_HEAD: "DUAL_HASH",
     }
 
-    def __init__(self, ckpt=None, intensity_activation=None, output_mode=None):
-        super(NeRF, self).__init__()
-        self.encode = None
-        self.encode_dirs = None
-        self.dir_ch = 0
-        self.in_ch = 0
-        self.out_ch = 0
-        self.skips = []
-        self.model = None
-        self.sigma_linear = None
+    # 非 legacy 模型通过版本号和结构字典共同验证检查点兼容性。
+    MODEL_SCHEMA_VERSION = 1
 
-        self.use_encoding = True
-        self.use_direction = True
+    # 该字典不仅用于说明结构，也会原样写入检查点并在恢复时严格比较。
+    # E1 固定为 E0 同款解码器；E2 固定双头结构，避免实验配置静默漂移。
+    FIELD_HEAD_CONFIGS = {
+        MATCHED_FIELD_HEAD: {
+            # E1 只替换 E0 的编码器，解码器结构保持完全相同。
+            "input": "combined_raw",
+            "hidden_layers": 8,
+            "hidden_width": 256,
+            "skip_before_hidden_index": 5,
+            "output_channels": 1,
+            "use_gate": False,
+            "progressive_high_frequency": False,
+        },
+        ANATOMY_SPECKLE_FIELD_HEAD: {
+            # A 只由低频特征生成；S 同时读取 A 和原始高频特征。
+            "anatomy_input": "feat_low",
+            "anatomy_hidden_layers": 4,
+            "anatomy_hidden_width": 128,
+            "anatomy_skip_before_hidden_index": 2,
+            "speckle_input": "concat(anatomy, feat_high)",
+            "speckle_hidden_layers": 3,
+            "speckle_hidden_width": 64,
+            "use_gate": False,
+            "progressive_high_frequency": False,
+            "training": "joint",
+            "loss": "masked_mse",
+        },
+    }
 
-        self.encoder_params = []
-        self.dir_encoder_params = []
+    def __init__(
+        self,
+        ckpt: dict | None = None,
+        intensity_activation: str | None = None,
+        field_head: str | None = None,
+        default_alpha: float | None = None,
+    ) -> None:
+        """创建空模型，或从检查点完整恢复模型。
 
-        self.encoding_type = ""
+        参数:
+            ckpt: ``get_save_dict`` 产生的检查点字典。传入时会先根据元数据重建
+                编码器和解码器，再加载参数。
+            intensity_activation: legacy 分支的输出激活，可为 ``identity`` 或
+                ``sigmoid``；省略时优先沿用检查点设置。
+            field_head: 要使用的场解码结构。恢复检查点时必须与其中记录的结构
+                一致，避免把一组权重加载进含义不同的网络。
+            default_alpha: 解剖/散斑合成时的默认散斑比例，必须位于 [0, 1]；
+                单次 ``query`` 可以用同名参数覆盖它。
+        """
+        super().__init__()
 
-        self.num_freq = 0
-        self.num_freq_dir=0
-
-        self.encoding_initialized = False
-        self.dual_encoder: dual_freq_encoder.DualFreqEncoder | None = None
-        self.kronecker_encoder: kronecker_encoder.KroneckerHashPE | None = None
-        self.training_progress: float = 0.0
-        checkpoint_output_mode = (
-            str(ckpt.get("output_mode", "intensity")).lower()
+        # 新模型默认使用基础单头；旧检查点没有 field_head 时也按 legacy 解释。
+        checkpoint_head = (
+            str(ckpt.get("field_head", self.LEGACY_FIELD_HEAD)).lower()
             if ckpt is not None
-            else "intensity"
+            else self.LEGACY_FIELD_HEAD
         )
-        self.output_mode = (
-            checkpoint_output_mode if output_mode is None else str(output_mode).lower()
-        )
-        if self.output_mode not in {"intensity", "ultra_nerf"}:
+        self.field_head = checkpoint_head if field_head is None else str(field_head).lower()
+        valid_heads = {
+            self.LEGACY_FIELD_HEAD,
+            self.MATCHED_FIELD_HEAD,
+            self.ANATOMY_SPECKLE_FIELD_HEAD,
+        }
+        # 尽早拒绝拼写错误或已经删除的网络头，防止后面出现难理解的空模块错误。
+        if self.field_head not in valid_heads:
             raise ValueError(
-                "output_mode must be 'intensity' or 'ultra_nerf', got "
-                f"{self.output_mode}"
+                f"Unknown field_head={self.field_head!r}; expected {sorted(valid_heads)}"
             )
-        if ckpt is not None and self.output_mode != checkpoint_output_mode:
+        # 显式传入的结构不能覆盖检查点自己的结构协议。
+        if ckpt is not None and self.field_head != checkpoint_head:
             raise ValueError(
-                "Network output mode does not match checkpoint: "
-                f"requested={self.output_mode}, checkpoint={checkpoint_output_mode}"
+                "Requested field head does not match checkpoint: "
+                f"requested={self.field_head}, checkpoint={checkpoint_head}"
             )
 
-        if intensity_activation is None:
-            intensity_activation = (
-                ckpt.get("intensity_activation", "identity")
-                if ckpt is not None
-                else "identity"
-            )
-        self.intensity_activation = str(intensity_activation).lower()
+        # alpha 和输出激活都采用“调用参数优先、检查点次之、默认值最后”的规则。
+        checkpoint_alpha = 1.0 if ckpt is None else float(ckpt.get("default_alpha", 1.0))
+        self.default_alpha = self._validate_alpha(
+            checkpoint_alpha if default_alpha is None else default_alpha
+        )
+        activation = (
+            ckpt.get("intensity_activation", "identity")
+            if ckpt is not None and intensity_activation is None
+            else ("identity" if intensity_activation is None else intensity_activation)
+        )
+        self.intensity_activation = str(activation).lower()
         if self.intensity_activation not in {"identity", "sigmoid"}:
-            raise ValueError(
-                "intensity_activation must be 'identity' or 'sigmoid', got "
-                f"{self.intensity_activation}"
-            )
+            raise ValueError("intensity_activation must be 'identity' or 'sigmoid'")
 
-        if ckpt != None :
+        # 以下字段记录尚未初始化或训练过程中会变化的模型状态。
+        self.encoding_type = ""
+        self.encoding_initialized = False
+        self.use_encoding = True
+        # 当前保留的三种模型均与观察方向无关；字段仅为旧调用接口兼容而保留。
+        self.use_direction = False
+        self.in_ch = 0
+        self.out_ch = 1
+        self.network_depth = 8
+        self.network_width = 256
+        self.training_progress = 0.0
+
+        # 编码器和解码头按所选结构延迟创建。Optional 类型让“尚未初始化”状态
+        # 显式可见；使用前必须检查非空，不能假定所有分支都会同时存在。
+        self.hash_encoder: HashEncoder | None = None
+        self.dual_encoder: DualFreqEncoder | None = None
+        self.legacy_head: SkipMLP | None = None
+        self.matched_head: SkipMLP | None = None
+        self.anatomy_head: SkipMLP | None = None
+        self.speckle_head: SkipMLP | None = None
+
+        if ckpt is not None:
+            # 恢复过程会依次建立编码器、解码器并加载 state_dict。
             self._init_from_ckpt(ckpt)
 
+    def _init_from_ckpt(self, ckpt: dict) -> None:
+        if str(ckpt.get("output_mode", "intensity")).lower() != "intensity":
+            raise ValueError("Only retained point-intensity checkpoints are supported")
+        if bool(ckpt.get("use_directions", False)):
+            raise ValueError("View-dependent checkpoints belong to a removed model variant")
 
-    def _init_from_ckpt(self, ckpt):
-
-        if(ckpt["encoding"] == "FREQ") :
-            self.init_base_encoding(
-                use_directions=ckpt["use_directions"],
-                use_encoding=ckpt["use_encoding"],
-                num_freq=ckpt.get("num_freq",0),
-                num_freq_dir=ckpt.get("num_freq_dir",0)
+        encoding = str(ckpt.get("encoding", "")).upper()
+        expected_encoding = self.FIELD_HEAD_ENCODINGS[self.field_head]
+        if encoding != expected_encoding:
+            raise ValueError(
+                f"{self.field_head} requires encoding={expected_encoding!r}, got {encoding!r}"
             )
+        if self.field_head != self.LEGACY_FIELD_HEAD:
+            if int(ckpt.get("model_schema_version", -1)) != self.MODEL_SCHEMA_VERSION:
+                raise ValueError("Missing or unsupported Phase 1 model schema")
+            if ckpt.get("field_head_config") != self.FIELD_HEAD_CONFIGS[self.field_head]:
+                raise ValueError(f"Incompatible field_head_config for {self.field_head}")
 
-        elif(ckpt["encoding"] == "HASH") :
+        if encoding == "HASH":
             self.init_hash_encoding(
-                use_directions=ckpt["use_directions"],
-                use_encoding=ckpt["use_encoding"],
-                bounding_box=ckpt.get("bounding_box",None),
-                n_levels=ckpt.get("n_levels",0),
-                n_features_per_level=ckpt.get("n_features_per_level",0),
-                log2_hashmap_size=ckpt.get("log2_hashmap_size",0),
-                base_resolution=ckpt.get("base_resolution",0),
-                finest_resolution=ckpt.get("finest_resolution",0)
+                bounding_box=ckpt["bounding_box"],
+                n_levels=int(ckpt.get("n_levels", 16)),
+                n_features_per_level=int(ckpt.get("n_features_per_level", 2)),
+                log2_hashmap_size=int(ckpt.get("log2_hashmap_size", 19)),
+                base_resolution=int(float(ckpt.get("base_resolution", 16))),
+                finest_resolution=int(float(ckpt.get("finest_resolution", 512))),
             )
-            if self.use_encoding :
-                self.encode.load_state_dict(ckpt["hash_encoder_state"])
-        elif ckpt["encoding"].startswith("DUAL_"):
-            encoding_name = ckpt["encoding"].upper()
-            pe_type = "fourier" if encoding_name in {"DUAL_FREQ", "DUAL_FOURIER"} else "hash"
+        elif encoding == "DUAL_HASH":
             self.init_dual_encoding(
-                pe_type=pe_type,
-                bounding_box=ckpt.get("bounding_box"),
-                n_levels_low=ckpt.get("n_levels_low", 8) or 8,
-                n_levels_high=ckpt.get("n_levels_high", 8) or 8,
-                n_features_per_level=ckpt.get("n_features_per_level", 2) or 2,
-                log2_hashmap_size=ckpt.get("log2_hashmap_size", 19) or 19,
-                base_resolution_low=ckpt.get("base_resolution_low", 16) or 16,
-                finest_resolution_low=ckpt.get("finest_resolution_low", 64) or 64,
-                base_resolution_high=ckpt.get("base_resolution_high", 64) or 64,
-                finest_resolution_high=ckpt.get("finest_resolution_high", 512) or 512,
-                sigma_low=ckpt.get("sigma_low", 1.0) or 1.0,
-                sigma_high=ckpt.get("sigma_high", 20.0) or 20.0,
-                n_freq=ckpt.get("n_freq", 64) or 64,
-                use_gate=ckpt.get("use_gate", True),
-                hf_activate_ratio=ckpt.get("hf_activate_ratio", 0.6) or 0.6,
-                hf_max_weight=ckpt.get("hf_max_weight", 1.0) or 1.0,
+                bounding_box=ckpt["bounding_box"],
+                n_levels_low=int(ckpt.get("n_levels_low", 8)),
+                n_levels_high=int(ckpt.get("n_levels_high", 8)),
+                n_features_per_level=int(ckpt.get("n_features_per_level", 2)),
+                log2_hashmap_size=int(ckpt.get("log2_hashmap_size", 19)),
+                base_resolution_low=int(float(ckpt.get("base_resolution_low", 16))),
+                finest_resolution_low=int(float(ckpt.get("finest_resolution_low", 128))),
+                base_resolution_high=int(float(ckpt.get("base_resolution_high", 64))),
+                finest_resolution_high=int(float(ckpt.get("finest_resolution_high", 512))),
+                use_gate=bool(ckpt.get("use_gate", True)),
+                hf_activate_ratio=float(ckpt.get("hf_activate_ratio", 0.2)),
+                hf_max_weight=float(ckpt.get("hf_max_weight", 1.0)),
             )
-            if self.dual_encoder is not None and "dual_encoder_state" in ckpt:
-                self.dual_encoder.load_state_dict(ckpt["dual_encoder_state"])
-        elif ckpt["encoding"] == "KRONECKER":
-            self.init_kronecker_encoding(
-                bounding_box=ckpt.get("bounding_box"),
-                n_levels_lateral=ckpt.get("n_levels_lateral", 8) or 8,
-                n_levels_axial=ckpt.get("n_levels_axial", 8) or 8,
-                finest_lateral=ckpt.get("finest_lateral", 128) or 128,
-                finest_axial=ckpt.get("finest_axial", 512) or 512,
-                n_features_per_level=ckpt.get("n_features_per_level", 2) or 2,
-                log2_hashmap_size=ckpt.get("log2_hashmap_size", 19) or 19,
-                base_resolution=ckpt.get("base_resolution", 16) or 16,
-                combine=ckpt.get("combine", "cat") or "cat",
-            )
-            if self.kronecker_encoder is not None and "kronecker_encoder_state" in ckpt:
-                self.kronecker_encoder.load_state_dict(ckpt["kronecker_encoder_state"])
         else:
-            print("unknown model type:",ckpt["encoding"])
-            exit(-1)
+            raise ValueError(
+                f"Checkpoint encoding {encoding!r} was removed; use HASH or DUAL_HASH"
+            )
 
         self.init_model(
             D=int(ckpt.get("network_depth", 8)),
             W=int(ckpt.get("network_width", 256)),
         )
-        incompatible = self.load_state_dict(ckpt["network_fn_state_dict"], strict=False)
-        expected_missing = {"sigma_linear.weight", "sigma_linear.bias"}
-        unexpected_missing = set(incompatible.missing_keys) - expected_missing
-        if unexpected_missing or incompatible.unexpected_keys:
-            print(
-                "Checkpoint loaded with incompatible keys: "
-                f"missing={sorted(unexpected_missing)}, "
-                f"unexpected={sorted(incompatible.unexpected_keys)}"
-            )
+        state = ckpt.get("network_fn_state_dict")
+        if state is None:
+            raise KeyError("Checkpoint is missing 'network_fn_state_dict'")
+        if self.field_head == self.LEGACY_FIELD_HEAD:
+            state = self._translate_legacy_state(state)
+        try:
+            self.load_state_dict(state, strict=self.field_head != self.LEGACY_FIELD_HEAD)
+        except RuntimeError as error:
+            raise ValueError(f"Incompatible {self.field_head} checkpoint state") from error
+        self.training_progress = float(ckpt.get("training_progress", 1.0))
 
+    @staticmethod
+    def _translate_legacy_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Map the retained old single-head checkpoint keys to the compact model.
 
-    def init_hash_encoding(self, bounding_box, n_levels=16, n_features_per_level=2,
-                       log2_hashmap_size=19, base_resolution=16, finest_resolution=256, use_directions=True, use_encoding=True):
-        if self.encoding_initialized :
-            print("encoding initialized twice")
-            exit(-1)
+        旧网络在 skip 层按 ``[原始特征, 隐藏特征]`` 拼接，当前 ``SkipMLP``
+        按 ``[隐藏特征, 原始特征]`` 拼接。两种写法的权重形状相同，因此仅改键名
+        会静默加载但改变输出；这里同时重排旧 skip 权重的输入列。
+        """
+        if any(key.startswith("legacy_head.") for key in state):
+            return state
+        translated = {}
+        for key, value in state.items():
+            if key.startswith("pts_linears."):
+                parts = key.split(".")
+                layer_index = int(parts[1])
+                if (
+                    parts[2] == "weight"
+                    and layer_index > 0
+                    and value.ndim == 2
+                    and value.shape[1] > value.shape[0]
+                ):
+                    input_dim = value.shape[1] - value.shape[0]
+                    value = torch.cat(
+                        (value[:, input_dim:], value[:, :input_dim]),
+                        dim=1,
+                    )
+                key = "legacy_head.layers." + key.removeprefix("pts_linears.")
+            elif key.startswith("output_linear."):
+                key = "legacy_head.output." + key.removeprefix("output_linear.")
+            elif key.startswith("encode."):
+                key = "hash_encoder." + key.removeprefix("encode.")
+            elif key.startswith(("sigma_linear.", "views_linears.", "feature_linear.")):
+                continue
+            translated[key] = value
+        return translated
 
-        self.encode, self.in_ch, self.encoder_params = hash_encoder.get_hash_encoder(use_encoding, bounding_box, n_levels, n_features_per_level, log2_hashmap_size, base_resolution, finest_resolution)
-        if use_directions:
-            self.encode_dirs, self.dir_ch, self.dir_encoder_params = base_encoder.get_base_encoder(4,
-                                                                                              use_encoding)
+    def _require_uninitialized(self) -> None:
+        if self.encoding_initialized:
+            raise RuntimeError("Encoding has already been initialized")
 
-        self.out_ch = 1
-        self.skips = [4]
-
-        self.use_encoding = use_encoding
-        self.use_direction = use_directions
-
+    def init_hash_encoding(
+        self,
+        bounding_box,
+        n_levels: int = 16,
+        n_features_per_level: int = 2,
+        log2_hashmap_size: int = 19,
+        base_resolution: int = 16,
+        finest_resolution: int = 256,
+        **legacy_kwargs,
+    ) -> None:
+        self._require_uninitialized()
+        if self.FIELD_HEAD_ENCODINGS[self.field_head] != "HASH":
+            raise ValueError(f"{self.field_head} requires DUAL_HASH")
+        if bool(legacy_kwargs.get("use_directions", False)):
+            raise ValueError("The retained basic HashGrid is direction independent")
+        self.hash_encoder = HashEncoder(
+            bounding_box,
+            n_levels,
+            n_features_per_level,
+            log2_hashmap_size,
+            base_resolution,
+            finest_resolution,
+        )
+        self.in_ch = self.hash_encoder.out_dim
         self.encoding_type = "HASH"
-        self.encoding_initialized = True
-
-
-
-    def init_base_encoding(self,use_directions=True, use_encoding=True, num_freq=10, num_freq_dir=4):
-        if self.encoding_initialized :
-            print("encoding initialized twice")
-            exit(-1)
-
-        self.encode, self.in_ch, self.encoder_params = base_encoder.get_base_encoder(num_freq, use_encoding)
-        if use_directions :
-            self.encode_dirs, self.dir_ch, self.dir_encoder_params = base_encoder.get_base_encoder(num_freq_dir, use_encoding)
-
-
-        self.out_ch = 1
-        self.skips = [4]
-
-        self.num_freq = num_freq
-        self.num_freq_dir = num_freq_dir
-        self.use_encoding = use_encoding
-        self.use_direction = use_directions
-        self.encoding_type = "FREQ"
         self.encoding_initialized = True
 
     def init_dual_encoding(
         self,
-        pe_type: str = "hash",
-        bounding_box=None,
+        *,
+        bounding_box,
         n_levels_low: int = 8,
         n_levels_high: int = 8,
         n_features_per_level: int = 2,
@@ -216,20 +372,18 @@ class NeRF(nn.Module) :
         finest_resolution_low: int = 64,
         base_resolution_high: int = 64,
         finest_resolution_high: int = 512,
-        sigma_low: float = 1.0,
-        sigma_high: float = 20.0,
-        n_freq: int = 64,
-        use_gate: bool = True,
-        hf_activate_ratio: float = 0.6,
+        use_gate: bool = False,
+        hf_activate_ratio: float = 0.2,
         hf_max_weight: float = 1.0,
-    ):
-        if self.encoding_initialized :
-            print("encoding initialized twice")
-            exit(-1)
-
-        pe_type = pe_type.lower()
-        self.dual_encoder = dual_freq_encoder.DualFreqEncoder(
-            pe_type=pe_type,
+        pe_type: str = "hash",
+        **removed_kwargs,
+    ) -> None:
+        self._require_uninitialized()
+        if self.FIELD_HEAD_ENCODINGS[self.field_head] != "DUAL_HASH":
+            raise ValueError(f"{self.field_head} requires HASH")
+        if str(pe_type).lower() != "hash":
+            raise ValueError("Only the retained DUAL_HASH encoder is supported")
+        self.dual_encoder = DualFreqEncoder(
             bounding_box=bounding_box,
             n_levels_low=n_levels_low,
             n_levels_high=n_levels_high,
@@ -239,379 +393,259 @@ class NeRF(nn.Module) :
             finest_resolution_low=finest_resolution_low,
             base_resolution_high=base_resolution_high,
             finest_resolution_high=finest_resolution_high,
-            sigma_low=sigma_low,
-            sigma_high=sigma_high,
-            n_freq=n_freq,
-            use_gate=use_gate,
+            use_gate=False,
             hf_activate_ratio=hf_activate_ratio,
             hf_max_weight=hf_max_weight,
         )
-
-        self.encode = lambda x: self.dual_encoder(x, self.training_progress)
         self.in_ch = self.dual_encoder.out_dim
-        self.out_ch = 1
-        self.skips = [4]
-        self.dir_ch = 0
-        self.use_encoding = True
-        self.use_direction = False
-        self.encoding_type = "DUAL_FREQ" if pe_type == "fourier" else "DUAL_HASH"
-        self.encoder_params = list(self.dual_encoder.parameters())
+        self.encoding_type = "DUAL_HASH"
         self.encoding_initialized = True
 
-    def init_kronecker_encoding(
-        self,
-        bounding_box,
-        n_levels_lateral: int = 8,
-        n_levels_axial: int = 8,
-        finest_lateral: int = 128,
-        finest_axial: int = 512,
-        n_features_per_level: int = 2,
-        log2_hashmap_size: int = 19,
-        base_resolution: int = 16,
-        combine: str = "cat",
-    ):
-        if self.encoding_initialized :
-            print("encoding initialized twice")
-            exit(-1)
-
-        self.kronecker_encoder = kronecker_encoder.KroneckerHashPE(
-            bounding_box=bounding_box,
-            n_levels_lateral=n_levels_lateral,
-            n_levels_axial=n_levels_axial,
-            finest_lateral=finest_lateral,
-            finest_axial=finest_axial,
-            n_features_per_level=n_features_per_level,
-            log2_hashmap_size=log2_hashmap_size,
-            base_resolution=base_resolution,
-            combine=combine,
-        )
-        self.encode = self.kronecker_encoder
-        self.in_ch = self.kronecker_encoder.out_dim
-        self.out_ch = 1
-        self.skips = [4]
-        self.dir_ch = 0
-        self.use_encoding = True
-        self.use_direction = False
-        self.encoding_type = "KRONECKER"
-        self.encoder_params = list(self.kronecker_encoder.parameters())
-        self.encoding_initialized = True
-
-
-    def init_model(self, D=8, W=256):
-        if(not self.encoding_initialized):
-            print("NeRF: encoding not initialized, use init_*_encoding before init_model")
-            exit(-1)
-
+    def init_model(self, D: int = 8, W: int = 256) -> None:
+        if not self.encoding_initialized:
+            raise RuntimeError("Initialize HASH or DUAL_HASH before the decoder")
         self.network_depth = int(D)
         self.network_width = int(W)
-        input_ch = int(self.in_ch)
-        input_ch_views = int(self.dir_ch)
 
-        # print("---------------------\nINIT NERF MODEL:\ninputs:",input_ch,"\nview inputs:",input_ch_views,"\nout:", self.out_ch)
-
-        self.pts_linears = nn.ModuleList(
-            [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in
-                                        range(D - 1)])
-
-        # Implementation according to the official code release (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
-        self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W // 2)])
-
-        # Implementation according to the paper
-        # self.views_linears = nn.ModuleList(
-        #     [nn.Linear(input_ch_views + W, W//2)] + [nn.Linear(W//2, W//2) for i in range(D//2)])
-
-        if self.use_direction:
-            self.feature_linear = nn.Linear(W, W)
-
-        output_channels = 5 if self.output_mode == "ultra_nerf" else 1
-        self.out_ch = output_channels
-        self.output_linear = nn.Linear(W, output_channels)
-        self.sigma_linear = (
-            nn.Linear(W, 1) if self.output_mode == "intensity" else None
-        )
-
-        if self.output_mode == "ultra_nerf":
-            self.initialize_ultra_output_head()
-
-        self.to(device)
-
-    def initialize_ultra_output_head(
-        self,
-        *,
-        attenuation: float = 1.0,
-        reflection: float = 0.02,
-        border_probability: float = 0.005,
-        scatter_density: float = 0.2,
-        scatter_amplitude: float = 0.5,
-        weight_std: float = 1e-4,
-    ) -> None:
-        """Initialize the five raw Ultra-NeRF channels away from dead zones.
-
-        A generic zero-centred linear head initializes every sigmoid probability
-        near 0.5.  On a hundreds-of-samples A-line this makes the exclusive
-        reflection transmission vanish before training starts.  Small output
-        weights and physically conservative biases retain signal through the
-        complete A-line while preserving the official activations and renderer.
-        """
-        if self.output_mode != "ultra_nerf":
-            raise ValueError("Ultra-NeRF head initialization requires output_mode='ultra_nerf'")
-        if not hasattr(self, "output_linear") or self.output_linear.out_features != 5:
-            raise RuntimeError("Initialize the Ultra-NeRF model before its output head")
-        if attenuation <= 0 or not math.isfinite(attenuation):
-            raise ValueError(f"attenuation must be finite and > 0, got {attenuation}")
-        probabilities = {
-            "reflection": reflection,
-            "border_probability": border_probability,
-            "scatter_density": scatter_density,
-            "scatter_amplitude": scatter_amplitude,
-        }
-        invalid = {
-            name: value
-            for name, value in probabilities.items()
-            if not math.isfinite(value) or not 0 < value < 1
-        }
-        if invalid:
-            raise ValueError(f"Ultra-NeRF initial probabilities must be in (0, 1): {invalid}")
-        if weight_std < 0 or not math.isfinite(weight_std):
-            raise ValueError(f"weight_std must be finite and >= 0, got {weight_std}")
-
-        def logit(probability: float) -> float:
-            return math.log(probability / (1.0 - probability))
-
-        raw_biases = torch.tensor(
-            [
-                attenuation,
-                logit(reflection),
-                logit(border_probability),
-                logit(scatter_density),
-                logit(scatter_amplitude),
-            ],
-            dtype=self.output_linear.bias.dtype,
-            device=self.output_linear.bias.device,
-        )
-        with torch.no_grad():
-            nn.init.normal_(self.output_linear.weight, mean=0.0, std=weight_std)
-            self.output_linear.bias.copy_(raw_biases)
-
-        self.ultra_head_initialization = {
-            "attenuation": float(attenuation),
-            "reflection": float(reflection),
-            "border_probability": float(border_probability),
-            "scatter_density": float(scatter_density),
-            "scatter_amplitude": float(scatter_amplitude),
-            "weight_std": float(weight_std),
-        }
-
-
-    def forward(self,x):
-        input_pts, input_views = torch.split(x, [self.in_ch, self.dir_ch], dim=-1)
-        h = input_pts
-        for i, l in enumerate(self.pts_linears):
-            h = self.pts_linears[i](h)
-            h = F.relu(h)
-            if i in self.skips:
-                h = torch.cat([input_pts, h], -1)
-
-        if self.use_direction:
-            feature = self.feature_linear(h)
-            h = torch.cat([feature, input_views], -1)
-
-            for i, l in enumerate(self.views_linears):
-                h = self.views_linears[i](h)
-                h = F.relu(h)
-
-
-        raw_output = self.output_linear(h)
-        if self.output_mode == "ultra_nerf":
-            return raw_output
-
-        i_clean = raw_output
-        if self.intensity_activation == "sigmoid":
-            i_clean = torch.sigmoid(i_clean)
-        if self.sigma_linear is None:
-            raise RuntimeError("Intensity output mode requires a sigma head")
-        log_sigma = self.sigma_linear(h)
-
-        return i_clean, log_sigma
-
-
-    def batchify(self, chunk, return_sigma=False):
-        if chunk is None:
-            return self.model
-
-        def ret(inputs):
-            outputs = [
-                self.forward(inputs[i:i + chunk])
-                for i in range(0, inputs.shape[0], chunk)
-            ]
-            if self.output_mode == "ultra_nerf":
-                if return_sigma:
-                    raise ValueError(
-                        "Ultra-NeRF output mode has no heteroscedastic sigma head"
-                    )
-                return torch.cat(outputs, 0)
-
-            i_clean = torch.cat([output[0] for output in outputs], 0)
-            if not return_sigma:
-                return i_clean
-
-            log_sigma = torch.cat([output[1] for output in outputs], 0)
-            return i_clean, log_sigma
-
-        return ret
-
-    def query(self, inputs, dirs, netchunk=1024*64, return_sigma=False):
-        if self.output_mode == "ultra_nerf" and return_sigma:
-            raise ValueError("Ultra-NeRF output mode does not return log_sigma")
-        inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
-        if hasattr(self.encode, 'forward') and self.encoding_type == "HASH" and self.use_encoding:
-            embedded = self.encode(inputs_flat, active_levels=getattr(self, '_active_levels', None))
+        if self.field_head == self.LEGACY_FIELD_HEAD:
+            self.legacy_head = SkipMLP(
+                self.in_ch,
+                self.network_width,
+                self.network_depth,
+                skip_before=5 if self.network_depth > 5 else None,
+            )
         else:
-            embedded = self.encode(inputs_flat)
+            if self.encoding_type != "DUAL_HASH" or self.dual_encoder is None:
+                raise ValueError(f"{self.field_head} requires DUAL_HASH")
+            if self.field_head == self.MATCHED_FIELD_HEAD:
+                self.matched_head = SkipMLP(
+                    self.dual_encoder.out_dim,
+                    self.network_width,
+                    self.network_depth,
+                    skip_before=5 if self.network_depth > 5 else None,
+                )
+            else:
+                self.anatomy_head = SkipMLP(
+                    self.dual_encoder.out_dim_low,
+                    128,
+                    4,
+                    skip_before=2,
+                )
+                self.speckle_head = SkipMLP(
+                    self.dual_encoder.out_dim_high + 1,
+                    64,
+                    3,
+                )
+            self._validate_phase1_decoder_size()
+        self.to(DEVICE)
 
-        if self.use_direction :
-            input_dirs_flat = torch.reshape(dirs, [-1, dirs.shape[-1]])
-            embedded_dirs = self.encode_dirs(input_dirs_flat)
-            embedded = torch.cat([embedded, embedded_dirs], -1)
+    @staticmethod
+    def _validate_alpha(alpha: float) -> float:
+        value = float(alpha)
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"alpha must be finite and in [0, 1], got {value}")
+        return value
 
-        outputs_flat = self.batchify(netchunk, return_sigma=return_sigma)(embedded)
-        # outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
-        return outputs_flat
+    @staticmethod
+    def _chunk_apply(
+        inputs: torch.Tensor,
+        chunk: int | None,
+        function: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        if chunk is None:
+            return function(inputs)
+        return torch.cat(
+            [function(inputs[index:index + chunk]) for index in range(0, inputs.shape[0], chunk)],
+            dim=0,
+        )
 
-    def query_with_uncertainty(self, inputs, dirs, netchunk=1024*64):
-        return self.query(inputs, dirs, netchunk=netchunk, return_sigma=True)
+    def _encoded(self, inputs: torch.Tensor) -> torch.Tensor:
+        if self.encoding_type == "HASH" and self.hash_encoder is not None:
+            return self.hash_encoder(inputs)
+        if self.encoding_type == "DUAL_HASH" and self.dual_encoder is not None:
+            return self.dual_encoder(inputs, self.training_progress)
+        raise RuntimeError("Hash encoder is not initialized")
 
-    def grad_vars(self):
-        params = list(self.parameters())
-        if self.encoder_params:
-            params += list(self.encoder_params)
-        if self.dir_encoder_params:
-            params += list(self.dir_encoder_params)
+    def query_components(
+        self,
+        inputs: torch.Tensor,
+        dirs: torch.Tensor | None = None,
+        netchunk: int | None = 1024 * 64,
+        *,
+        alpha: float | None = None,
+    ) -> dict[str, torch.Tensor]:
+        del dirs
+        if self.field_head != self.ANATOMY_SPECKLE_FIELD_HEAD:
+            raise ValueError("Components are available only for anatomy_speckle_v1")
+        dual_encoder = self.dual_encoder
+        anatomy_head = self.anatomy_head
+        speckle_head = self.speckle_head
+        if dual_encoder is None or anatomy_head is None or speckle_head is None:
+            raise RuntimeError("Anatomy/speckle model is not initialized")
+        alpha_value = self._validate_alpha(self.default_alpha if alpha is None else alpha)
+        flat_inputs = inputs.reshape(-1, inputs.shape[-1])
 
-        unique_params = []
-        seen_param_ids = set()
-        for param in params:
-            param_id = id(param)
-            if param_id in seen_param_ids:
-                continue
-            seen_param_ids.add(param_id)
-            unique_params.append(param)
+        def query_chunk(coordinates: torch.Tensor) -> torch.Tensor:
+            features = dual_encoder.forward_decomposed(
+                coordinates,
+                self.training_progress,
+            )
+            anatomy = anatomy_head(features["feat_low"])
+            speckle_input = torch.cat((anatomy, features["feat_high"]), dim=-1)
+            speckle = speckle_head(speckle_input)
+            return torch.cat((anatomy, speckle), dim=-1)
 
-        return unique_params
+        values = self._chunk_apply(flat_inputs, netchunk, query_chunk)
+        anatomy, speckle = values[:, :1], values[:, 1:2]
+        return {
+            "anatomy": anatomy,
+            "speckle": speckle,
+            "intensity": anatomy + alpha_value * speckle,
+        }
 
-    def get_encode_name(self):
-        return self.encoding_type if self.use_encoding else "NONE"
+    def query(
+        self,
+        inputs: torch.Tensor,
+        dirs: torch.Tensor | None = None,
+        netchunk: int | None = 1024 * 64,
+        *,
+        alpha: float | None = None,
+        **removed_kwargs,
+    ) -> torch.Tensor:
+        del dirs
+        if removed_kwargs.get("return_sigma", False):
+            raise ValueError("The removed uncertainty head is no longer available")
+        if self.field_head == self.ANATOMY_SPECKLE_FIELD_HEAD:
+            return self.query_components(inputs, netchunk=netchunk, alpha=alpha)["intensity"]
 
-    def get_rep_name(self):
-        # d = date.today().strftime("%d-%m-%Y")
-        e = self.get_encode_name()
-        dir = "_dirs" if self.use_direction else ""
+        flat_inputs = inputs.reshape(-1, inputs.shape[-1])
+        if self.field_head == self.MATCHED_FIELD_HEAD:
+            dual_encoder = self.dual_encoder
+            matched_head = self.matched_head
+            if dual_encoder is None or matched_head is None:
+                raise RuntimeError("Matched single-head model is not initialized")
 
-        output = "_ultra_nerf" if self.output_mode == "ultra_nerf" else ""
-        return e+dir+output
+            def matched(coordinates: torch.Tensor) -> torch.Tensor:
+                features = dual_encoder.forward_decomposed(
+                    coordinates,
+                    self.training_progress,
+                )
+                return matched_head(features["combined_raw"])
 
-    def get_save_dict(self):
-        dic = {
-                "encoding": self.encoding_type,
-                "use_directions": self.use_direction,
-                "use_encoding": self.use_encoding,
-                "intensity_activation": self.intensity_activation,
-                "output_mode": self.output_mode,
-                "network_depth": self.network_depth,
-                "network_width": self.network_width,
-                "ultra_head_initialization": getattr(
-                    self,
-                    "ultra_head_initialization",
-                    None,
-                ),
-                "network_fn_state_dict": self.state_dict()
-            }
-        if self.use_encoding :
-            if self.encoding_type == "FREQ" :
-                dic.update({
-                    #"bounding_box": self.encode.bounding_box,
-                    "num_freq": self.num_freq,
-                    "num_freq_dir": self.num_freq_dir
-                })
-            elif self.encoding_type == "HASH" :
-                dic.update({
-                    "bounding_box": self.encode.bounding_box,
-                    "n_levels": self.encode.n_levels,
-                    "n_features_per_level": self.encode.n_features_per_level,
-                    "log2_hashmap_size": self.encode.log2_hashmap_size,
-                    "base_resolution": float(self.encode.base_resolution.cpu()),
-                    "finest_resolution": float(self.encode.finest_resolution.cpu()),
-                    "hash_encoder_state": self.encode.state_dict(),
-                })
-            elif self.encoding_type == "KRONECKER" and self.kronecker_encoder is not None:
-                enc = self.kronecker_encoder
-                dic.update({
-                    "bounding_box": enc.bounding_box,
-                    "n_levels_lateral": enc.enc_xy.n_levels,
-                    "n_levels_axial": enc.enc_xz.n_levels,
-                    "finest_lateral": float(enc.enc_xy.finest_resolution.cpu()),
-                    "finest_axial": float(enc.enc_xz.finest_resolution.cpu()),
-                    "n_features_per_level": enc.enc_xy.n_features_per_level,
-                    "log2_hashmap_size": enc.enc_xy.log2_hashmap_size,
-                    "base_resolution": float(enc.enc_xy.base_resolution.cpu()),
-                    "combine": enc.combine,
-                    "kronecker_encoder_state": enc.state_dict(),
-                })
-            elif self.encoding_type.startswith("DUAL_") and self.dual_encoder is not None:
-                enc = self.dual_encoder
-                dic.update({
-                    "bounding_box": (
-                        enc.enc_low.bounding_box
-                        if hasattr(enc.enc_low, "bounding_box")
-                        else None
-                    ),
-                    "n_levels_low": (
-                        enc.enc_low.n_levels
-                        if hasattr(enc.enc_low, "n_levels")
-                        else None
-                    ),
-                    "n_levels_high": (
-                        enc.enc_high.n_levels
-                        if hasattr(enc.enc_high, "n_levels")
-                        else None
-                    ),
-                    "n_features_per_level": (
-                        enc.enc_low.n_features_per_level
-                        if hasattr(enc.enc_low, "n_features_per_level")
-                        else None
-                    ),
-                    "log2_hashmap_size": (
-                        enc.enc_low.log2_hashmap_size
-                        if hasattr(enc.enc_low, "log2_hashmap_size")
-                        else None
-                    ),
-                    "base_resolution_low": (
-                        float(enc.enc_low.base_resolution.cpu())
-                        if hasattr(enc.enc_low, "base_resolution")
-                        else None
-                    ),
-                    "finest_resolution_low": (
-                        float(enc.enc_low.finest_resolution.cpu())
-                        if hasattr(enc.enc_low, "finest_resolution")
-                        else None
-                    ),
-                    "base_resolution_high": (
-                        float(enc.enc_high.base_resolution.cpu())
-                        if hasattr(enc.enc_high, "base_resolution")
-                        else None
-                    ),
-                    "finest_resolution_high": (
-                        float(enc.enc_high.finest_resolution.cpu())
-                        if hasattr(enc.enc_high, "finest_resolution")
-                        else None
-                    ),
-                    "sigma_low": getattr(enc.enc_low, "sigma", None),
-                    "sigma_high": getattr(enc.enc_high, "sigma", None),
-                    "n_freq": getattr(enc.enc_low, "n_freq", None),
-                    "use_gate": enc.use_gate,
-                    "hf_activate_ratio": enc.hf_activate_ratio,
-                    "hf_max_weight": enc.hf_max_weight,
-                    "dual_encoder_state": enc.state_dict(),
-                })
+            return self._chunk_apply(flat_inputs, netchunk, matched)
 
-        return dic
+        legacy_head = self.legacy_head
+        if legacy_head is None:
+            raise RuntimeError("Basic single-head model is not initialized")
+
+        def legacy(coordinates: torch.Tensor) -> torch.Tensor:
+            prediction = legacy_head(self._encoded(coordinates))
+            if self.intensity_activation == "sigmoid":
+                prediction = torch.sigmoid(prediction)
+            return prediction
+
+        return self._chunk_apply(flat_inputs, netchunk, legacy)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.query(inputs)
+
+    def grad_vars(self) -> list[nn.Parameter]:
+        return list(self.parameters())
+
+    def decoder_parameter_count(self) -> int:
+        heads = {
+            self.LEGACY_FIELD_HEAD: (self.legacy_head,),
+            self.MATCHED_FIELD_HEAD: (self.matched_head,),
+            self.ANATOMY_SPECKLE_FIELD_HEAD: (self.anatomy_head, self.speckle_head),
+        }[self.field_head]
+        return sum(
+            parameter.numel()
+            for head in heads
+            if head is not None
+            for parameter in head.parameters()
+        )
+
+    def parameter_counts(self) -> dict[str, int]:
+        encoder = self.hash_encoder if self.hash_encoder is not None else self.dual_encoder
+        encoder_count = 0 if encoder is None else sum(p.numel() for p in encoder.parameters())
+        return {
+            "encoder": int(encoder_count),
+            "decoder": int(self.decoder_parameter_count()),
+            "total": int(sum(parameter.numel() for parameter in self.parameters())),
+        }
+
+    def _validate_phase1_decoder_size(self) -> None:
+        expected = {
+            self.ANATOMY_SPECKLE_FIELD_HEAD: 63426,
+            self.MATCHED_FIELD_HEAD: 477441,
+        }
+        actual = self.decoder_parameter_count()
+        if actual != expected[self.field_head]:
+            raise RuntimeError(
+                f"Unexpected {self.field_head} decoder size: "
+                f"expected={expected[self.field_head]}, actual={actual}"
+            )
+
+    def set_phase1_training_stage(self, progress: float) -> int:
+        stage = 1 if progress < 0.2 else (2 if progress < 0.8 else 3)
+        for parameter in self.parameters():
+            parameter.requires_grad_(True)
+        return stage
+
+    def get_encode_name(self) -> str:
+        return self.encoding_type
+
+    def get_rep_name(self) -> str:
+        return self.encoding_type
+
+    def get_save_dict(self) -> dict:
+        payload = {
+            "encoding": self.encoding_type,
+            "use_directions": False,
+            "use_encoding": True,
+            "intensity_activation": self.intensity_activation,
+            "network_depth": self.network_depth,
+            "network_width": self.network_width,
+            "field_head": self.field_head,
+            "model_schema_version": (
+                self.MODEL_SCHEMA_VERSION
+                if self.field_head != self.LEGACY_FIELD_HEAD
+                else None
+            ),
+            "default_alpha": self.default_alpha,
+            "field_head_config": self.FIELD_HEAD_CONFIGS.get(self.field_head),
+            "training_progress": float(self.training_progress),
+            "parameter_counts": self.parameter_counts(),
+            "network_fn_state_dict": self.state_dict(),
+        }
+        if self.hash_encoder is not None:
+            encoder = self.hash_encoder
+            payload.update(
+                {
+                    "bounding_box": encoder.bounding_box,
+                    "n_levels": encoder.n_levels,
+                    "n_features_per_level": encoder.n_features_per_level,
+                    "log2_hashmap_size": encoder.log2_hashmap_size,
+                    "base_resolution": float(encoder.base_resolution.cpu()),
+                    "finest_resolution": float(encoder.finest_resolution.cpu()),
+                }
+            )
+        elif self.dual_encoder is not None:
+            encoder = self.dual_encoder
+            payload.update(
+                {
+                    "bounding_box": encoder.enc_low.bounding_box,
+                    "n_levels_low": encoder.enc_low.n_levels,
+                    "n_levels_high": encoder.enc_high.n_levels,
+                    "n_features_per_level": encoder.enc_low.n_features_per_level,
+                    "log2_hashmap_size": encoder.enc_low.log2_hashmap_size,
+                    "base_resolution_low": float(encoder.enc_low.base_resolution.cpu()),
+                    "finest_resolution_low": float(encoder.enc_low.finest_resolution.cpu()),
+                    "base_resolution_high": float(encoder.enc_high.base_resolution.cpu()),
+                    "finest_resolution_high": float(encoder.enc_high.finest_resolution.cpu()),
+                    "use_gate": encoder.use_gate,
+                    "hf_activate_ratio": encoder.hf_activate_ratio,
+                    "hf_max_weight": encoder.hf_max_weight,
+                }
+            )
+        return payload

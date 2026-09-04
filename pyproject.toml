@@ -7,7 +7,20 @@ name = "neuf"
 version = "0.1.0"
 description = "Neural Ultrasound Field training and reconstruction tools"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
+dependencies = [
+  "matplotlib>=3.7",
+  "numpy>=1.24",
+  "scikit-image>=0.21",
+  "scipy>=1.10",
+  "tensorboard>=2.14",
+  "torch>=2.2",
+  "torchvision>=0.17",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
 
 [project.scripts]
 neuf = "neuf.main:main"
