@@ -218,6 +218,27 @@ def build_phase1_split(
     return splits
 
 
+def build_single_slice_overfit_split(
+    dataset: Dataset,
+    frame_index: int,
+) -> dict[str, list[FrameRef]]:
+    """按原始帧编号选出唯一切片，并有意复用于训练和拟合效果预览。"""
+    training_pool, held_out_pool = _frame_refs(dataset)
+    matches = [
+        ref
+        for ref in training_pool + held_out_pool
+        if ref.original_frame_index == int(frame_index)
+    ]
+    if len(matches) != 1:
+        locations = [f"{ref.source}[{ref.source_index}]" for ref in matches]
+        raise Phase1DataBlockedError(
+            f"Expected exactly one frame_index={frame_index}, found "
+            f"{len(matches)} at {locations}"
+        )
+    ref = matches[0]
+    return {"training": [ref], "validation": [ref], "test": []}
+
+
 def _json_dump(path: Path, payload) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as output:
@@ -334,6 +355,41 @@ def freeze_phase1_manifests(
     return splits
 
 
+def freeze_single_slice_manifest(
+    dataset: Dataset,
+    dataset_path: str | Path,
+    output_dir: str | Path,
+    frame_index: int,
+) -> dict[str, list[FrameRef]]:
+    """在任何模型训练前冻结单切片身份；该模式不提供独立泛化评价。"""
+    splits = build_single_slice_overfit_split(dataset, frame_index)
+    ref = splits["training"][0]
+    _freeze_json(
+        Path(output_dir) / "manifests" / "single_slice_manifest.json",
+        {
+            "schema_version": 1,
+            "mode": "intentional_single_slice_overfit",
+            "dataset_path": str(Path(dataset_path).resolve()),
+            "original_frame_index": ref.original_frame_index,
+            "source_pool": ref.source,
+            "source_index": ref.source_index,
+            "stable_slice_id": ref.stable_slice_id,
+            "pixel_hash": ref.pixel_hash,
+            "pose_hash": ref.pose_hash,
+            "training_ids": [ref.stable_slice_id],
+            "preview_ids": [ref.stable_slice_id],
+            "test_ids": [],
+            "training_preview_overlap": "intentional",
+            "interpretation": (
+                "Single-slice fitting diagnostic only; it does not measure "
+                "held-out or three-dimensional generalization."
+            ),
+            "normalization": {"kind": "fixed", "minimum": 0.0, "maximum": 1.0},
+        },
+    )
+    return splits
+
+
 def _partition_tensor(
     dataset: Dataset,
     refs: Iterable[FrameRef],
@@ -401,6 +457,51 @@ def apply_phase1_training_split(dataset: Dataset, splits: dict[str, list[FrameRe
         "phase1_split_ids",
         {name: [ref.stable_slice_id for ref in refs] for name, refs in splits.items()},
     )
+    dataset._valid_patch_origins_cache = {}
+
+
+def apply_single_slice_training_view(
+    dataset: Dataset,
+    splits: dict[str, list[FrameRef]],
+) -> None:
+    """只物化一张训练切片，并复制同一视图供逐步重建预览。"""
+    train_refs = splits["training"]
+    valid_refs = splits["validation"]
+    if len(train_refs) != 1 or train_refs != valid_refs or splits.get("test"):
+        raise ValueError("Single-slice overfit split must reuse one frame for train and preview")
+
+    partition_names = (
+        ("pixels", "pixels_valid"),
+        ("points", "points_valid"),
+        ("viewdirs", "viewdirs_valid"),
+    )
+    if getattr(dataset, "has_gt", False):
+        partition_names += (("gt", "gt_valid"),)
+
+    for training_name, held_out_name in partition_names:
+        training = _partition_tensor(dataset, train_refs, training_name, held_out_name)
+        preview = training.clone()
+        setattr(dataset, training_name, training)
+        setattr(dataset, held_out_name, preview)
+        setattr(
+            dataset,
+            f"phase1_test_{training_name}",
+            torch.empty(
+                (0,) + tuple(training.shape[1:]),
+                dtype=training.dtype,
+                device=training.device,
+            ),
+        )
+
+    dataset.slices = _rebased_slices(train_refs, dataset.pixels_per_slice)
+    dataset.slices_valid = _rebased_slices(valid_refs, dataset.pixels_per_slice)
+    setattr(dataset, "phase1_test_slices", [])
+    setattr(
+        dataset,
+        "phase1_split_ids",
+        {name: [ref.stable_slice_id for ref in refs] for name, refs in splits.items()},
+    )
+    setattr(dataset, "single_slice_index", train_refs[0].original_frame_index)
     dataset._valid_patch_origins_cache = {}
 
 

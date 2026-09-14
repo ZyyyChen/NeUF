@@ -36,14 +36,17 @@ class SliceRenderer:
         component = str(component).lower()
         if component == "intensity":
             output = model.query(flat_points, flat_viewdirs, alpha=alpha)
-        elif component in {"anatomy", "speckle"}:
-            output = model.query_components(
+        elif component in {"anatomy", "speckle", "structure", "boundary", "residual"}:
+            components = model.query_components(
                 flat_points,
                 flat_viewdirs,
                 alpha=alpha,
-            )[component]
+            )
+            if component not in components:
+                raise ValueError(f"The selected model does not provide component={component!r}")
+            output = components[component]
         else:
-            raise ValueError("component must be intensity, anatomy, or speckle")
+            raise ValueError("Unknown intensity/decomposition component")
         return output.to(DEVICE)
 
     def query_point_components(

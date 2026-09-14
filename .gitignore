@@ -49,6 +49,7 @@ core.*
 /exports/
 /phase1_image_quality*/
 /artifacts/
+/comparisons/
 /trajectory_output/
 .matplotlib/
 

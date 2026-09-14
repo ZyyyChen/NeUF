@@ -33,7 +33,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument(
         "--component",
-        choices=["intensity", "anatomy", "speckle"],
+        choices=["intensity", "anatomy", "speckle", "structure", "boundary", "residual"],
         default="intensity",
     )
     parser.add_argument("--save-float-output", action="store_true")
@@ -95,11 +95,14 @@ def query_model_component(
 ) -> torch.Tensor:
     if component == "intensity":
         return model.query(points, directions, alpha=alpha)
-    if model.field_head != NeRF.ANATOMY_SPECKLE_FIELD_HEAD:
+    if model.field_head not in {NeRF.ANATOMY_SPECKLE_FIELD_HEAD, NeRF.FROZEN_STV_FIELD_HEAD}:
         raise ValueError(
             f"field_head={model.field_head} only supports component='intensity'"
         )
-    return model.query_components(points, directions, alpha=alpha)[component]
+    components = model.query_components(points, directions, alpha=alpha)
+    if component not in components:
+        raise ValueError(f"field_head={model.field_head} does not provide component={component!r}")
+    return components[component]
 
 
 @torch.no_grad()
@@ -157,7 +160,7 @@ def query_grid(
 
 
 def display_uint8(volume: np.ndarray, component: str) -> tuple[np.ndarray, list[float]]:
-    if component == "speckle":
+    if component in {"speckle", "boundary", "residual"}:
         window = (-0.5, 0.5)
     else:
         window = (0.0, 1.0)
@@ -170,10 +173,12 @@ def save_mhd(
     output_dir: Path,
     spacing_xyz: tuple[float, float, float],
     origin_xyz: np.ndarray,
+    *,
+    stem: str = "volume",
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    raw_path = output_dir / "volume.raw"
-    mhd_path = output_dir / "volume.mhd"
+    raw_path = output_dir / f"{stem}.raw"
+    mhd_path = output_dir / f"{stem}.mhd"
     np.ascontiguousarray(volume_zyx).tofile(raw_path)
     z_size, y_size, x_size = volume_zyx.shape
     element_type = "MET_UCHAR" if volume_zyx.dtype == np.uint8 else "MET_FLOAT"
@@ -208,12 +213,15 @@ def main() -> None:
         checkpoint_path=args.ckpt,
     )
     model = NeRF(checkpoint)
-    if (
-        args.component != "intensity"
-        and model.field_head != NeRF.ANATOMY_SPECKLE_FIELD_HEAD
-    ):
+    available_components = {"intensity"}
+    if model.field_head == NeRF.ANATOMY_SPECKLE_FIELD_HEAD:
+        available_components.update(("anatomy", "speckle"))
+    elif model.field_head == NeRF.FROZEN_STV_FIELD_HEAD:
+        available_components.update(("structure", "boundary", "residual", "anatomy"))
+    NeRF._validate_alpha(args.alpha)
+    if args.component not in available_components:
         raise ValueError(
-            f"field_head={model.field_head} only supports --component intensity"
+            f"field_head={model.field_head} supports components {sorted(available_components)}"
         )
     axes, spacing_xyz = resolve_axes(
         dataset,
@@ -232,8 +240,14 @@ def main() -> None:
     )
     output_dir = args.output.expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
-    if args.save_float_output:
-        np.save(output_dir / "volume_float.npy", volume.astype(np.float32, copy=False))
+    # 所有冻结 STV 输出保留浮点体数据；分割输入不经过 uint8 量化或逐体归一化。
+    save_float_output = args.save_float_output or (
+        model.field_head == NeRF.FROZEN_STV_FIELD_HEAD
+    )
+    if save_float_output:
+        volume_float = volume.astype(np.float32, copy=False)
+        np.save(output_dir / "volume_float.npy", volume_float)
+        save_mhd(volume_float, output_dir, spacing_xyz, np.asarray(dataset.point_min), stem="volume_float")
     display, display_window = display_uint8(volume, args.component)
     save_mhd(display, output_dir, spacing_xyz, np.asarray(dataset.point_min))
     metadata = {
@@ -248,9 +262,12 @@ def main() -> None:
         "point_min_xyz_mm": np.asarray(dataset.point_min).tolist(),
         "point_max_xyz_mm": np.asarray(dataset.point_max).tolist(),
         "display_window": display_window,
-        "float_output_saved": bool(args.save_float_output),
+        "display_policy": "fixed_window",
+        "float_output_saved": bool(save_float_output),
+        "composition": "S+B+alpha*R" if model.field_head == NeRF.FROZEN_STV_FIELD_HEAD else None,
+        "float_intensity_policy": "raw model output, no clipping or per-volume normalization",
         "quantitative_warning": (
-            "MHD is fixed-window display output; use volume_float.npy for analysis."
+            "volume.mhd is display only; use volume_float.mhd or volume_float.npy for analysis/segmentation."
         ),
     }
     (output_dir / "metadata.json").write_text(

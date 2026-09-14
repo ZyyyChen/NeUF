@@ -1,7 +1,7 @@
 """超声神经场的网络结构、编码器初始化、查询接口与检查点序列化。
 
-本模块只保留当前实验仍在使用的三种固定几何模型：基础单头 HashGrid、
-无门控双 HashGrid 单头模型，以及显式分离解剖结构与散斑的双头模型。已经移除的
+本模块保留基础单头 HashGrid、无门控双 HashGrid 单头、解剖/散斑双头，
+以及接受冻结 STV 教师监督的结构/边界/残差三输出模型。已经移除的
 视角方向编码、不确定性预测、位姿分支和射线物理分支不会在这里静默恢复。
 
 除非单个函数另有说明，输入坐标张量最后一维均为三维空间坐标，前面的维度可以是
@@ -88,7 +88,7 @@ class SkipMLP(nn.Module):
 class NeRF(nn.Module):
     """只包含当前保留的 HashGrid 方案的神经超声场。
 
-    三种 ``field_head`` 的用途如下：
+    ``field_head`` 的用途如下：
 
     * ``legacy_fixed_geometry``：基础单头 HashGrid，对每个坐标直接预测一个强度；
     * ``dual_single_head_matched``：直接拼接低频与高频特征后，用与基础模型相同
@@ -96,6 +96,8 @@ class NeRF(nn.Module):
     * ``anatomy_speckle_v1``：低频分支预测解剖基底，解剖输出与高频特征共同
       预测散斑残差，
       最终通过 ``anatomy + alpha * speckle`` 合成强度。
+    * ``frozen_stv_components_v1``：沿用 E1 主干，预测结构、边界和残差，
+      以 S+B+alpha*R 合成强度；教师仅参与外部训练监督，本模块不依赖 STV。
 
     本类不会创建已经淘汰的方向、不确定性、位姿、矢状面、Fourier、Kronecker
     或射线物理分支。遇到旧检查点时会明确拒绝不受支持的结构，避免加载成功但
@@ -106,6 +108,7 @@ class NeRF(nn.Module):
     LEGACY_FIELD_HEAD = "legacy_fixed_geometry"
     MATCHED_FIELD_HEAD = "dual_single_head_matched"
     ANATOMY_SPECKLE_FIELD_HEAD = "anatomy_speckle_v1"
+    FROZEN_STV_FIELD_HEAD = "frozen_stv_components_v1"
 
     # 每种场头只允许一种编码器，避免把 E0 的“基础单 Hash”对照静默运行成
     # 双频编码。该映射同时用于新模型初始化和检查点恢复。
@@ -113,10 +116,17 @@ class NeRF(nn.Module):
         LEGACY_FIELD_HEAD: "HASH",
         MATCHED_FIELD_HEAD: "DUAL_HASH",
         ANATOMY_SPECKLE_FIELD_HEAD: "DUAL_HASH",
+        FROZEN_STV_FIELD_HEAD: "DUAL_HASH",
     }
 
     # 非 legacy 模型通过版本号和结构字典共同验证检查点兼容性。
     MODEL_SCHEMA_VERSION = 1
+    DUAL_CONFIGURATION_KEYS = (
+        "encoding", "use_directions", "network_depth", "network_width",
+        "n_levels_low", "n_levels_high", "n_features_per_level", "log2_hashmap_size",
+        "base_resolution_low", "finest_resolution_low", "base_resolution_high",
+        "finest_resolution_high", "use_gate", "hf_activate_ratio", "hf_max_weight",
+    )
 
     # 该字典不仅用于说明结构，也会原样写入检查点并在恢复时严格比较。
     # E1 固定为 E0 同款解码器；E2 固定双头结构，避免实验配置静默漂移。
@@ -144,6 +154,21 @@ class NeRF(nn.Module):
             "progressive_high_frequency": False,
             "training": "joint",
             "loss": "masked_mse",
+        },
+        FROZEN_STV_FIELD_HEAD: {
+            # 保留 v1 checkpoint 的训练协议；此处 alpha=1 指完整重建训练端点。
+            # 推理合成系数由 default_alpha/query(alpha=...) 控制，不改变网络权重。
+            "input": "combined_raw",
+            "hidden_layers": 8,
+            "hidden_width": 256,
+            "skip_before_hidden_index": 5,
+            "output_channels": 3,
+            "component_order": ["structure", "boundary", "residual"],
+            "anatomy": "structure + boundary",
+            "intensity": "structure + boundary + residual",
+            "use_gate": False,
+            "progressive_high_frequency": False,
+            "alpha": 1.0,
         },
     }
 
@@ -179,6 +204,7 @@ class NeRF(nn.Module):
             self.LEGACY_FIELD_HEAD,
             self.MATCHED_FIELD_HEAD,
             self.ANATOMY_SPECKLE_FIELD_HEAD,
+            self.FROZEN_STV_FIELD_HEAD,
         }
         # 尽早拒绝拼写错误或已经删除的网络头，防止后面出现难理解的空模块错误。
         if self.field_head not in valid_heads:
@@ -205,12 +231,15 @@ class NeRF(nn.Module):
         self.intensity_activation = str(activation).lower()
         if self.intensity_activation not in {"identity", "sigmoid"}:
             raise ValueError("intensity_activation must be 'identity' or 'sigmoid'")
+        if self.field_head == self.FROZEN_STV_FIELD_HEAD:
+            if self.intensity_activation != "identity":
+                raise ValueError("frozen_stv_components_v1 requires identity activation")
 
         # 以下字段记录尚未初始化或训练过程中会变化的模型状态。
         self.encoding_type = ""
         self.encoding_initialized = False
         self.use_encoding = True
-        # 当前保留的三种模型均与观察方向无关；字段仅为旧调用接口兼容而保留。
+        # 当前模型均与观察方向无关；字段仅为旧调用接口兼容而保留。
         self.use_direction = False
         self.in_ch = 0
         self.out_ch = 1
@@ -226,6 +255,7 @@ class NeRF(nn.Module):
         self.matched_head: SkipMLP | None = None
         self.anatomy_head: SkipMLP | None = None
         self.speckle_head: SkipMLP | None = None
+        self.components_head: SkipMLP | None = None
 
         if ckpt is not None:
             # 恢复过程会依次建立编码器、解码器并加载 state_dict。
@@ -248,6 +278,16 @@ class NeRF(nn.Module):
                 raise ValueError("Missing or unsupported Phase 1 model schema")
             if ckpt.get("field_head_config") != self.FIELD_HEAD_CONFIGS[self.field_head]:
                 raise ValueError(f"Incompatible field_head_config for {self.field_head}")
+        if self.field_head == self.FROZEN_STV_FIELD_HEAD:
+            required = (*self.DUAL_CONFIGURATION_KEYS, "bounding_box", "default_alpha", "intensity_activation")
+            missing = [key for key in required if key not in ckpt]
+            if missing:
+                raise ValueError(f"Frozen STV checkpoint is missing configuration: {missing}")
+            if ckpt["use_gate"] is not False:
+                raise ValueError("Frozen STV checkpoints must explicitly disable the spatial gate")
+            self._validate_alpha(ckpt["default_alpha"])
+            if ckpt["intensity_activation"] != "identity":
+                raise ValueError("Frozen STV checkpoints require identity activation")
 
         if encoding == "HASH":
             self.init_hash_encoding(
@@ -333,6 +373,58 @@ class NeRF(nn.Module):
         if self.encoding_initialized:
             raise RuntimeError("Encoding has already been initialized")
 
+    def load_e1_initialization(self, checkpoint: dict) -> None:
+        """把匹配坐标系的 E1 权重迁移到已初始化的三输出场。
+
+        编码参数与毫米坐标边界必须完全一致。原始输出只写入结构通道，
+        边界与残差的输出行置零，因此初始合成强度继承 E1 的预测。
+        """
+        if self.field_head != self.FROZEN_STV_FIELD_HEAD or self.components_head is None:
+            raise ValueError("Initialize frozen_stv_components_v1 before loading E1 weights")
+        if checkpoint.get("field_head") != self.MATCHED_FIELD_HEAD:
+            raise ValueError("Initialization requires an E1 dual_single_head_matched checkpoint")
+        if checkpoint.get("model_schema_version") != self.MODEL_SCHEMA_VERSION:
+            raise ValueError("E1 initialization has an incompatible model schema")
+        if checkpoint.get("field_head_config") != self.FIELD_HEAD_CONFIGS[self.MATCHED_FIELD_HEAD]:
+            raise ValueError("E1 initialization has an incompatible decoder configuration")
+        if str(checkpoint.get("output_mode", "intensity")).lower() != "intensity":
+            raise ValueError("E1 initialization requires a point-intensity checkpoint")
+        current = self.get_save_dict()
+        for key in self.DUAL_CONFIGURATION_KEYS:
+            if key not in checkpoint or checkpoint[key] != current[key]:
+                raise ValueError(f"E1 initialization differs in {key}")
+        if "bounding_box" not in checkpoint or len(checkpoint["bounding_box"]) != 2:
+            raise ValueError("E1 initialization is missing its coordinate bounding box")
+        for source_bound, target_bound in zip(checkpoint["bounding_box"], current["bounding_box"]):
+            source = torch.as_tensor(source_bound).detach().cpu()
+            target = torch.as_tensor(target_bound).detach().cpu()
+            if source.shape != target.shape or not torch.equal(source, target):
+                raise ValueError("E1 initialization bounding box does not match the target model")
+        source_state = checkpoint.get("network_fn_state_dict")
+        if not isinstance(source_state, dict):
+            raise ValueError("E1 initialization is missing its network state")
+        target_state = self.state_dict()
+        expected_source_keys = {
+            key.replace("components_head.", "matched_head.", 1) for key in target_state
+        }
+        if set(source_state) != expected_source_keys:
+            raise ValueError("E1 initialization contains incompatible state keys")
+        migrated = {}
+        for key, target_value in target_state.items():
+            source_key = key.replace("components_head.", "matched_head.", 1)
+            source_value = source_state[source_key]
+            if key in {"components_head.output.weight", "components_head.output.bias"}:
+                if source_value.shape != target_value[:1].shape:
+                    raise ValueError(f"E1 initialization has incompatible shape for {source_key}")
+                value = torch.zeros_like(target_value)
+                value[:1].copy_(source_value)
+            else:
+                if source_value.shape != target_value.shape:
+                    raise ValueError(f"E1 initialization has incompatible shape for {source_key}")
+                value = source_value
+            migrated[key] = value
+        self.load_state_dict(migrated, strict=True)
+
     def init_hash_encoding(
         self,
         bounding_box,
@@ -383,6 +475,8 @@ class NeRF(nn.Module):
             raise ValueError(f"{self.field_head} requires HASH")
         if str(pe_type).lower() != "hash":
             raise ValueError("Only the retained DUAL_HASH encoder is supported")
+        if self.field_head == self.FROZEN_STV_FIELD_HEAD and use_gate:
+            raise ValueError("frozen_stv_components_v1 does not support a spatial gate")
         self.dual_encoder = DualFreqEncoder(
             bounding_box=bounding_box,
             n_levels_low=n_levels_low,
@@ -406,6 +500,8 @@ class NeRF(nn.Module):
             raise RuntimeError("Initialize HASH or DUAL_HASH before the decoder")
         self.network_depth = int(D)
         self.network_width = int(W)
+        if self.field_head == self.FROZEN_STV_FIELD_HEAD and (int(D), int(W)) != (8, 256):
+            raise ValueError("frozen_stv_components_v1 requires the E1 8x256 decoder")
 
         if self.field_head == self.LEGACY_FIELD_HEAD:
             self.legacy_head = SkipMLP(
@@ -423,6 +519,10 @@ class NeRF(nn.Module):
                     self.network_width,
                     self.network_depth,
                     skip_before=5 if self.network_depth > 5 else None,
+                )
+            elif self.field_head == self.FROZEN_STV_FIELD_HEAD:
+                self.components_head = SkipMLP(
+                    self.dual_encoder.out_dim, 256, 8, skip_before=5, output_dim=3,
                 )
             else:
                 self.anatomy_head = SkipMLP(
@@ -475,8 +575,29 @@ class NeRF(nn.Module):
         alpha: float | None = None,
     ) -> dict[str, torch.Tensor]:
         del dirs
+        if self.field_head == self.FROZEN_STV_FIELD_HEAD:
+            alpha_value = self._validate_alpha(self.default_alpha if alpha is None else alpha)
+            dual_encoder = self.dual_encoder
+            components_head = self.components_head
+            if dual_encoder is None or components_head is None:
+                raise RuntimeError("Frozen STV component model is not initialized")
+
+            def query_stv_chunk(coordinates: torch.Tensor) -> torch.Tensor:
+                features = dual_encoder.forward_decomposed(coordinates, self.training_progress)
+                return components_head(features["combined_raw"])
+
+            values = self._chunk_apply(inputs.reshape(-1, inputs.shape[-1]), netchunk, query_stv_chunk)
+            structure, boundary, residual = values[:, :1], values[:, 1:2], values[:, 2:3]
+            anatomy = structure + boundary
+            return {
+                "structure": structure,
+                "boundary": boundary,
+                "residual": residual,
+                "anatomy": anatomy,
+                "intensity": anatomy + alpha_value * residual,
+            }
         if self.field_head != self.ANATOMY_SPECKLE_FIELD_HEAD:
-            raise ValueError("Components are available only for anatomy_speckle_v1")
+            raise ValueError("Components require anatomy_speckle_v1 or frozen_stv_components_v1")
         dual_encoder = self.dual_encoder
         anatomy_head = self.anatomy_head
         speckle_head = self.speckle_head
@@ -515,7 +636,7 @@ class NeRF(nn.Module):
         del dirs
         if removed_kwargs.get("return_sigma", False):
             raise ValueError("The removed uncertainty head is no longer available")
-        if self.field_head == self.ANATOMY_SPECKLE_FIELD_HEAD:
+        if self.field_head in {self.ANATOMY_SPECKLE_FIELD_HEAD, self.FROZEN_STV_FIELD_HEAD}:
             return self.query_components(inputs, netchunk=netchunk, alpha=alpha)["intensity"]
 
         flat_inputs = inputs.reshape(-1, inputs.shape[-1])
@@ -557,6 +678,7 @@ class NeRF(nn.Module):
             self.LEGACY_FIELD_HEAD: (self.legacy_head,),
             self.MATCHED_FIELD_HEAD: (self.matched_head,),
             self.ANATOMY_SPECKLE_FIELD_HEAD: (self.anatomy_head, self.speckle_head),
+            self.FROZEN_STV_FIELD_HEAD: (self.components_head,),
         }[self.field_head]
         return sum(
             parameter.numel()
@@ -578,6 +700,7 @@ class NeRF(nn.Module):
         expected = {
             self.ANATOMY_SPECKLE_FIELD_HEAD: 63426,
             self.MATCHED_FIELD_HEAD: 477441,
+            self.FROZEN_STV_FIELD_HEAD: 477955,
         }
         actual = self.decoder_parameter_count()
         if actual != expected[self.field_head]:
