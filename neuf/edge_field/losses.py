@@ -62,6 +62,86 @@ def gradients(image):
     return dx, dy
 
 
+def sagittal_patch_losses(prediction, reference, support, feature_weights=None, *,
+                          pitch_mm=.131204, sigma_mm=.5):
+    """直接约束 sagittal 灰度图块，输入均为 [B,1,H,W]、灰度范围 [0,1]。
+
+    support 和特征权重由实采图固定，不能随预测改变。有效中心必须完整覆盖
+    Gaussian、中心差分及 7×7 统计邻域；返回标量损失、相似度及实际有效计数。
+    NCC 加入对称的小方差正则：相同常量窗口为 1，常量亮度差由 SSIM 约束。
+    """
+    if prediction.ndim != 4 or prediction.shape[1] != 1:
+        raise ValueError("sagittal prediction must have shape [B,1,H,W]")
+    if reference.shape != prediction.shape or support.shape != prediction.shape:
+        raise ValueError("sagittal reference/support must match prediction shape")
+    if pitch_mm <= 0 or sigma_mm < 0:
+        raise ValueError("sagittal pitch_mm must be positive and sigma_mm nonnegative")
+    sigma = float(sigma_mm) / float(pitch_mm)
+    # 与已有 blur 的截断半径严格一致；额外 1+3 覆盖差分和局部统计。
+    border = int(3 * sigma) + 4
+    if min(prediction.shape[-2:]) <= 2 * border:
+        raise ValueError(f"sagittal patch needs at least {2 * border + 1} pixels per side")
+    invalid = (support.detach() <= .999).to(prediction.dtype)
+    invalid = F.pad(invalid, (border,) * 4, value=1)
+    complete = F.max_pool2d(invalid, 2 * border + 1, stride=1) == 0
+    valid = complete[..., 4:-4, 4:-4]
+    valid_count = valid.sum()
+    if not bool(valid_count):
+        raise ValueError("sagittal batch has no complete supported statistical window")
+
+    target = reference.detach()
+    p, t = (blur(prediction, sigma), blur(target, sigma)) if sigma else (prediction, target)
+    pool = lambda image: F.avg_pool2d(image, 7, stride=1)
+
+    def statistics(a, b):
+        # 先减图块均值，减少近常量窗口中 E[x²]-E[x]² 的浮点抵消。
+        offset_a = a.mean((-2, -1), keepdim=True)
+        offset_b = b.mean((-2, -1), keepdim=True)
+        ac, bc = a - offset_a, b - offset_b
+        ma, mb = pool(ac), pool(bc)
+        va = (pool(ac.square()) - ma.square()).clamp_min(0)
+        vb = (pool(bc.square()) - mb.square()).clamp_min(0)
+        covariance = pool(ac * bc) - ma * mb
+        return ma + offset_a, mb + offset_b, va, vb, covariance
+
+    def correlation(va, vb, covariance):
+        return ((covariance + 1e-6) / ((va + 1e-6) * (vb + 1e-6)).sqrt()).clamp(-1, 1)
+
+    ma, mb, va, vb, covariance = statistics(p, t)
+    ssim_map = ((2 * ma * mb + .01 ** 2) * (2 * covariance + .03 ** 2)
+                / ((ma.square() + mb.square() + .01 ** 2) * (va + vb + .03 ** 2)))
+    ssim_map = ssim_map[..., 1:-1, 1:-1].clamp(-1, 1)
+    gray_map = correlation(va, vb, covariance)[..., 1:-1, 1:-1]
+    ssim, gray_ncc = mean_masked(ssim_map, valid), mean_masked(gray_map, valid)
+
+    px, py = gradients(p)
+    tx, ty = gradients(t)
+    # 梯度幅度差采用对称相对误差；平坦区域也约束额外的预测边缘。
+    epsilon = 1e-4
+    pm = (px.square() + py.square() + epsilon ** 2).sqrt()
+    tm = (tx.square() + ty.square() + epsilon ** 2).sqrt()
+    direction = .5 * (1 - (px * tx + py * ty + epsilon ** 2) / (pm * tm)).clamp(0, 2)
+    amplitude = (((pm - tm).square() + epsilon ** 2).sqrt() - epsilon) / (pm + tm + epsilon)
+    edge_map = (.5 * direction + .5 * amplitude)[..., 3:-3, 3:-3]
+    edge = mean_masked(edge_map, valid)
+
+    # 特征邻域同时匹配灰度和两个梯度分量的局部相关，不提取预测侧离散角点。
+    _, _, vpx, vtx, cx = statistics(px, tx)
+    _, _, vpy, vty, cy = statistics(py, ty)
+    gradient_map = correlation(vpx + vpy, vtx + vty, cx + cy)
+    if feature_weights is None:
+        weight = valid.to(prediction.dtype)
+    else:
+        fixed_weight = torch.broadcast_to(feature_weights.detach(), prediction.shape)
+        weight = fixed_weight[..., 4:-4, 4:-4].clamp_min(0) * valid
+    feature = (weight * (.5 * (1 - gray_map) + .5 * (1 - gradient_map))).sum()
+    feature = feature / weight.sum().clamp_min(1e-8)
+    loss = .4 * (1 - ssim) + .3 * (1 - gray_ncc) + .2 * edge + .1 * feature
+    return dict(loss=loss, ssim=ssim, gray_ncc=gray_ncc, edge=edge, feature=feature,
+                valid_count=valid_count, feature_count=(weight > 0).sum(),
+                constant_count=((vb[..., 1:-1, 1:-1] <= 1e-6) & valid).sum())
+
+
 def laplacian(image):
     """原生像素网格的五点 Laplacian，用二阶变化约束边缘过渡宽度。"""
     return (image[..., 2:, 1:-1] + image[..., :-2, 1:-1]

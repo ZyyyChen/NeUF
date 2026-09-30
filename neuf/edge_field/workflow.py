@@ -14,14 +14,16 @@ import torch
 from tqdm import tqdm
 
 from .data import EdgeData, SagittalIntersection, write_json
-from .evaluation import compare, compare_sweeps, evaluate, evaluate_sweep, export_volume, query, write_csv
-from .losses import edge_guided_losses, edge_preserving_losses, losses, response_losses
+from .evaluation import (compare, compare_sweeps, evaluate, evaluate_sweep, export_volume, query, write_csv,
+                         evaluate_guided_sagittal, compare_guided_sagittal)
+from .losses import edge_guided_losses, edge_preserving_losses, losses, response_losses, sagittal_patch_losses
 from .model import EdgeField, PoseRefiner, load_field, se3_exp
 from .response_evaluation import compare_responses, evaluate_response
 from .sweep_geometry import SweepPoseRefiner, load_sweep
 
 
-SWEEP_VARIANTS = {"HashObservedL1Angle": "angle", "HashObservedL1Velocity": "velocity"}
+SWEEP_VARIANTS = {"HashObservedL1Angle": "angle", "HashObservedL1Velocity": "velocity",
+                  "HashSagittalAllPoints": "velocity"}
 
 
 def timestamp():
@@ -41,7 +43,78 @@ def checkpoint(model, poses, data, optimizers, config, step, *, generators=None)
                 sweep_metadata=poses.metadata if isinstance(poses, SweepPoseRefiner) else None)
 
 
-def train_variant(data, output, name, args, *, smoke=False, preview_steps=(), sagittal=None):
+def align_all_landmarks(data, guidance, output, args):
+    """全 11 点同权初始化；独立保留各里程碑，直接重采样只使用训练帧。"""
+    output = Path(output)
+    for folder in ("checkpoints", "metrics", "plots", "predictions", "run_config"):
+        (output/folder).mkdir(parents=True, exist_ok=True)
+    device = data.initial.device
+    torch.manual_seed(args.seed)
+    frames = torch.unique(torch.cat((guidance.landmark_frames.round().long(), data.frame_ids[[0, -1]]))).sort().values
+    controls = torch.searchsorted(data.frame_ids, frames)
+    poses = SweepPoseRefiner(data.initial, controls, data.frame_ids,
+                            args.sweep_radial_offset_px * data.spacing[0], mode="angle").to(device)
+    optimizer = torch.optim.Adam([poses.raw], lr=.03)
+    steps = 8 if args.smoke else args.landmark_steps
+    milestones = sorted({(steps+1)//2, (3*steps+3)//4, steps})
+    config = dict(steps=steps, seed=args.seed, learning_rate=.03, landmark_count=11,
+                  control_frame_ids=frames.tolist(), smooth_weight=.05, prior_weight=.01,
+                  huber_scale_mm=1., max_offset_deg=args.sweep_max_offset_deg, max_step_deg=.05,
+                  guidance=guidance.metadata, source_training_frames=data.frame_ids[data.splits["training"]].tolist(),
+                  checkpoint_milestones=milestones, model_kind="all-landmark trajectory; no neural field")
+    write_json(output/"run_config/config.json", config)
+    rows, paths = [], []
+    start, stamp = time.perf_counter(), timestamp()
+    if not args.smoke:
+        evaluate_guided_sagittal(None, poses, data, guidance, output, 0, 1., raw_only=True)
+    with (output/"metrics/timing.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["step", "loss", "landmark_loss", "step_seconds", "elapsed_seconds"])
+        writer.writeheader()
+        progress = tqdm(range(1, steps+1), desc="AllPointAlignment", mininterval=5, file=__import__("sys").stdout)
+        for step in progress:
+            t0 = time.perf_counter()
+            optimizer.zero_grad(set_to_none=True)
+            point_loss = guidance.landmark_loss(poses)
+            offset = poses.angle_offsets()
+            control_speed = offset[controls].diff() / poses.training_gaps / poses.prior_velocity_scale
+            smooth = control_speed.diff().square().mean()
+            loss = point_loss + .01*(offset/poses.prior_angle_scale).square().mean() + .05*smooth
+            previous = poses.raw.detach().clone()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_([poses.raw], 1., error_if_nonfinite=True)
+            optimizer.step()
+            poses.limit_update_(previous, max_angle_step_deg=.05, max_angle_offset_deg=args.sweep_max_offset_deg)
+            row = dict(step=step, loss=float(loss.detach()), landmark_loss=float(point_loss.detach()),
+                       step_seconds=time.perf_counter()-t0, elapsed_seconds=time.perf_counter()-start)
+            writer.writerow(row)
+            rows.append(row)
+            progress.set_postfix(loss=f"{row['loss']:.4f}", refresh=False)
+            if step in milestones:
+                path = output/"checkpoints"/f"step_{step:06d}.pt"
+                payload = dict(schema="all_landmark_trajectory_v1", model=poses.state_dict(), poses=poses.state_dict(),
+                               sweep_metadata=poses.metadata, corrected_poses=poses.matrices().detach().cpu(),
+                               completed_steps=step, config=config, optimizer_states=[optimizer.state_dict()],
+                               torch_rng_state=torch.get_rng_state(),
+                               cuda_rng_states=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [])
+                torch.save(payload, path)
+                paths.append(str(path))
+                write_csv(output/"metrics"/f"landmarks_{step:06d}.csv", guidance.landmark_rows(poses))
+                if not args.smoke or step == steps:
+                    evaluate_guided_sagittal(None, poses, data, guidance, output, step, 1., raw_only=True)
+    # 完成后再分别重载，确认独立文件没有被后续步骤覆盖。
+    for step, path in zip(milestones, paths):
+        saved = torch.load(path, map_location=device, weights_only=False)
+        assert saved["completed_steps"] == step
+        torch.testing.assert_close(load_sweep(saved, device).matrices(), saved["corrected_poses"].to(device))
+    write_json(output/"metrics/training_summary.json", dict(status="complete", configured_total_steps=steps,
+               completed_total_steps=steps, start_timestamp=stamp, end_timestamp=timestamp(),
+               total_wall_time_sec=time.perf_counter()-start, retained_checkpoints=paths,
+               final_landmarks=guidance.landmark_rows(poses), quality="pending shared-ROI comparison"))
+    poses.raw.requires_grad_(False)
+    return poses
+
+
+def train_variant(data, output, name, args, *, smoke=False, preview_steps=(), sagittal=None, aligned=None):
     output = Path(output)
     stop_step = args.stop_step or args.steps
     # 按完整训练预算向上取整；中途停止不改变原定的 50% 和 75% 位置。
@@ -63,6 +136,7 @@ def train_variant(data, output, name, args, *, smoke=False, preview_steps=(), sa
     device = data.images.device
     response_only = name in ("EdgeFixed", "EdgePose")
     sweep_mode = SWEEP_VARIANTS.get(name)
+    all_points = name == "HashSagittalAllPoints"
     pure_l1 = name == "HashObservedL1" or sweep_mode is not None
     preserve_edges = name in ("HashObservedEdgePreserve", "HashObservedEdgePreserve3D")
     guided_names = (
@@ -107,6 +181,11 @@ def train_variant(data, output, name, args, *, smoke=False, preview_steps=(), sa
             data.initial, data.splits["training"], data.frame_ids,
             radial_offset_mm=args.sweep_radial_offset_px * data.spacing[0], mode=sweep_mode,
         ).to(device)
+        if aligned is not None:
+            # 把全点稀疏控制轨迹插值到既有训练帧控制，保留原世界标定和角度约束。
+            with torch.no_grad():
+                offsets = aligned.angle_offsets()[poses.train_indices]
+                poses.raw.copy_(offsets.diff() / poses.training_gaps / poses.velocity_scale)
     else:
         poses = PoseRefiner(data.initial, data.splits["training"].cpu(), data.bounds.mean(0)).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -193,6 +272,30 @@ def train_variant(data, output, name, args, *, smoke=False, preview_steps=(), sa
             sagittal_role="training reference for angle/velocity variants; not independent test ground truth",
             equal_budget="same field initialization, field batches and field updates; extra pose updates/time reported",
         )
+    if all_points:
+        config.update(supervision="observed frames + all 11 landmarks + fixed sagittal ROI",
+                      sagittal_guidance=sagittal.metadata,
+                      direct_sagittal_weight=args.sagittal_field_weight,
+                      direct_sagittal_terms=dict(ssim=.4, gray_ncc=.3, edge=.2, feature=.1),
+                      sweep_schedule=dict(start=.2, end=.8, every=args.pose_every),
+                      landmark_role="all 11 training landmarks; no held-out landmark claims",
+                      pose_structure_weight=args.sagittal_dense_weight,
+                      source_image_split="original 214 training frames; annotation positions use all 11")
+        if smoke:
+            # 只检查实际新增路径：小数帧投影、全点区域和图像损失方向。
+            points = sagittal.landmark_local[:3]
+            indices = data.splits["training"][:3]
+            fractional = poses.fractional_world(data.frame_ids[indices], points)
+            exact = poses(indices, points[:, None])[:, 0]
+            torch.testing.assert_close(fractional, exact, atol=2e-5, rtol=1e-5)
+            pixels = sagittal.landmark_target.round().long()
+            assert len(pixels) == 11 and bool(sagittal.roi[pixels[:, 1], pixels[:, 0]].all())
+            _, reference, support, features = sagittal.field_patches(model, 1., spatial_generator, batch_size=4, size=64)
+            perfect = sagittal_patch_losses(reference.clone(), reference, support, features, pitch_mm=sagittal.pitch_mm)
+            shifted = sagittal_patch_losses(torch.roll(reference, 5, -1), reference, support, features, pitch_mm=sagittal.pitch_mm)
+            assert abs(float(perfect["loss"])) < 2e-5 and shifted["loss"] > perfect["loss"]
+            config["sagittal_smoke"] = dict(integer_projection=True, all_11_inside_roi=True,
+                                            identity_loss=float(perfect["loss"]), shifted_loss=float(shifted["loss"]))
     if preserve_edges:
         config.update(
             equal_budget="same field updates and supervised pixel patches; extra spatial queries recorded separately",
@@ -216,7 +319,9 @@ def train_variant(data, output, name, args, *, smoke=False, preview_steps=(), sa
     start, stamp = time.perf_counter(), timestamp()
     complete, pose_updates, status, pose_grad = 0, 0, "failed", 0.
     history, evaluated = [], []
-    if sagittal is not None and not smoke:
+    if all_points and not smoke:
+        evaluate_guided_sagittal(model, poses, data, sagittal, output, 0, 0.)
+    elif sagittal is not None and not smoke:
         evaluate_sweep(model, poses, data, sagittal, output, 0, 0.)
     path = output / "checkpoints" / "latest.pt"
     progress_bar = tqdm(total=stop_step, desc=name, mininterval=20, file=__import__("sys").stdout)
@@ -233,17 +338,24 @@ def train_variant(data, output, name, args, *, smoke=False, preview_steps=(), sa
                 loss_keys += ("profile",)
         else:
             loss_keys = ("gray", "edge", "couple")
+        if all_points:
+            loss_keys += ("sag_field", "sag_field_ssim", "sag_field_ncc", "sag_field_edge", "sag_field_feature",
+                          "sag_field_ramp", "sag_field_grad", "source_field_grad", "sag_valid_count", "sag_feature_count")
         columns = ["epoch", "global_step", "step_time_sec", "elapsed_sec", "loss", *loss_keys,
                    "edge_centered_fraction", "pose_updates", "pose_gradient_norm"]
         if sagittal is not None:
             columns += ["pose_photo", "sagittal_loss", "sagittal_edge_ncc", "sagittal_ssim",
                         "sagittal_coverage", "pose_prior", "angle_step_max_deg", "angle_step_rms_deg"]
+        if all_points:
+            columns += ["landmark_loss", "dense_pose_loss", "landmark_grad", "dense_pose_grad"]
         writer = csv.DictWriter(timing_file, fieldnames=columns)
         writer.writeheader()
         try:
             for step in range(1, stop_step + 1):
                 step_start = time.perf_counter()
                 pose_metrics = {key: 0. for key in columns if key.startswith(("pose_photo", "sagittal_", "pose_prior", "angle_step_"))}
+                if all_points:
+                    pose_metrics.update(dict.fromkeys(("landmark_loss", "dense_pose_loss", "landmark_grad", "dense_pose_grad"), 0.))
                 ratio = (step-1) / max(args.steps-1, 1)
                 frequency_progress = min(ratio / (.5 if response_only else .7), 1.)
                 sampling_fraction = args.guided_fraction if guided_sampling else 0.
@@ -318,6 +430,25 @@ def train_variant(data, output, name, args, *, smoke=False, preview_steps=(), sa
                 else:
                     values = losses(prediction, patch, ratio, use_edges=name != "V0")
                     loss = values["gray"] + args.edge_weight * values["edge"] + args.couple_weight * values["couple"]
+                if all_points:
+                    ramp = min(1., max(0., (ratio - .1) / .1))
+                    sag_prediction, reference, support, features = sagittal.field_patches(
+                        model, frequency_progress, spatial_generator, batch_size=args.sagittal_patches, size=64)
+                    terms = sagittal_patch_losses(sag_prediction, reference, support, features,
+                                                  pitch_mm=sagittal.pitch_mm, sigma_mm=.5 if ratio < .5 else .25)
+                    sg, og = 0., 0.
+                    if step == 1 or step % 1000 == 0:
+                        probe = model.gray.weight
+                        sg = float(torch.autograd.grad(terms["loss"], probe, retain_graph=True)[0].norm())
+                        og = float(torch.autograd.grad(loss, probe, retain_graph=True)[0].norm())
+                        if smoke and (not math.isfinite(sg) or sg <= 0):
+                            raise AssertionError("sagittal 图像项未给场提供有效梯度")
+                    loss = loss + args.sagittal_field_weight * ramp * terms["loss"]
+                    values.update(sag_field=terms["loss"], sag_field_ssim=terms["ssim"],
+                                  sag_field_ncc=terms["gray_ncc"], sag_field_edge=terms["edge"],
+                                  sag_field_feature=terms["feature"], sag_field_ramp=loss.new_tensor(ramp),
+                                  sag_field_grad=loss.new_tensor(sg), source_field_grad=loss.new_tensor(og),
+                                  sag_valid_count=terms["valid_count"], sag_feature_count=terms["feature_count"])
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"{name} step {step}: non-finite loss")
                 loss.backward()
@@ -328,7 +459,7 @@ def train_variant(data, output, name, args, *, smoke=False, preview_steps=(), sa
                 ready = smoke or (history and np.mean([r["shape"] for r in history[-100:]]) < .8) if response_only else True
                 pose_stage = ((name == "V2" and .2 <= ratio < .7)
                               or (name == "EdgePose" and .35 <= ratio < .7 and ready)
-                              or (sweep_mode is not None and .2 <= ratio < .7))
+                              or (sweep_mode is not None and .2 <= ratio < (.8 if all_points else .7)))
                 if pose_stage and step % args.pose_every == 0:
                     model.requires_grad_(False)
                     poses.raw.requires_grad_(True)
@@ -342,6 +473,32 @@ def train_variant(data, output, name, args, *, smoke=False, preview_steps=(), sa
                         structure = sagittal.loss(poses.matrices(), data.splits["training"], ratio)
                         prior = poses.prior()
                         pose_loss = pose_photo + args.sagittal_weight * structure["loss"] + args.sweep_prior_weight * prior
+                        if all_points:
+                            landmarks = sagittal.landmark_loss(poses)
+                            chosen = torch.randperm(len(sagittal.training_indices), generator=pose_generator)[:32].to(device)
+                            frames = sagittal.training_indices[chosen]
+                            dense = sagittal.dense_pose_loss(model, poses, ratio, frame_indices=frames)
+                            pose_loss = pose_loss + args.landmark_weight * landmarks + args.sagittal_dense_weight * dense["loss"]
+                            if pose_updates == 0 or pose_updates % 200 == 0:
+                                lg = float(torch.autograd.grad(landmarks, poses.raw, retain_graph=True)[0].norm())
+                                dg = float(torch.autograd.grad(dense["loss"], poses.raw, retain_graph=True)[0].norm())
+                                pose_metrics.update(landmark_grad=lg, dense_pose_grad=dg)
+                                if smoke and (min(lg, dg) <= 0 or not math.isfinite(lg+dg)):
+                                    raise AssertionError("全点或点间结构项没有轨迹梯度")
+                            pose_metrics.update(landmark_loss=float(landmarks.detach()), dense_pose_loss=float(dense["loss"].detach()))
+                            if smoke and pose_updates == 0:
+                                candidates = sagittal.training_indices
+                                separation = (data.frame_ids[candidates, None] - sagittal.landmark_frames[None]).abs().amin(-1)
+                                unmarked = candidates[separation > 5][:16]
+                                if not len(unmarked):
+                                    raise AssertionError("缺少用于梯度验证的无标注源帧")
+                                unmarked_loss = sagittal.dense_pose_loss(model, poses, ratio, frame_indices=unmarked)["loss"]
+                                gradient = torch.autograd.grad(unmarked_loss, poses.raw)[0]
+                                if not torch.isfinite(gradient).all() or gradient.abs().sum() <= 0:
+                                    raise AssertionError("无标注帧未得到 NeRF 结构梯度")
+                                write_json(output/"metrics/unmarked_gradient_check.json", dict(
+                                    frames=data.frame_ids[unmarked].tolist(), minimum_landmark_gap_frames=5,
+                                    gradient_norm=float(gradient.norm()), status="PASS; gradient only"))
                         previous_raw = poses.raw.detach().clone()
                         if smoke and pose_updates == 0:
                             # 分别确认图像场和独立 sagittal 都能更新轨迹，避免只有先验在反传。
@@ -394,7 +551,9 @@ def train_variant(data, output, name, args, *, smoke=False, preview_steps=(), sa
                                          generators=dict(patch=generator, pose=pose_generator, spatial=spatial_generator))
                     torch.save(payload, path.with_name(f"step_{step:06d}.pt"))
                     torch.save(payload, path)
-                    if sagittal is not None and (not smoke or step == stop_step):
+                    if all_points and (not smoke or step == stop_step):
+                        evaluate_guided_sagittal(model, poses, data, sagittal, output, step, frequency_progress)
+                    elif sagittal is not None and (not smoke or step == stop_step):
                         evaluate_sweep(model, poses, data, sagittal, output, step, frequency_progress)
                 if step in {halfway_step, stop_step, *preview_steps}:
                     if not smoke:
@@ -685,6 +844,16 @@ def parser():
                         default=workspace/"logs/20260924_train13/cerebral/index_all/IntersectionRegistration/run_config/similarity_fixed_support.npz")
     parser.add_argument("--sagittal-weight", type=float, default=.05)
     parser.add_argument("--sagittal-ssim-weight", type=float, default=0.)
+    parser.add_argument("--landmarks", type=Path,
+                        default=root/"data/cerebral_data/Pre_traitement_echo_v2/Reconstruction_3D/Patient0/data_3D_Patient0_J35_2_reconstruction_points.mat")
+    parser.add_argument("--sagittal-margin-mm", type=float, default=10.)
+    parser.add_argument("--sagittal-field-weight", type=float, default=1.)
+    parser.add_argument("--sagittal-dense-weight", type=float, default=1.)
+    parser.add_argument("--landmark-weight", type=float, default=1.)
+    parser.add_argument("--landmark-steps", type=int, default=400)
+    parser.add_argument("--sagittal-patches", type=int, default=4)
+    parser.add_argument("--sagittal-baseline-checkpoint", type=Path,
+                        default=workspace/"logs/20260925_train02/cerebral/index_all/HashObservedL1Velocity/checkpoints/step_020000.pt")
     parser.add_argument("--sweep-pose-lr", type=float, default=.01)
     parser.add_argument("--sweep-prior-weight", type=float, default=.002)
     parser.add_argument("--sweep-max-step-deg", type=float, default=.01)
@@ -706,7 +875,7 @@ def parser():
         "V0", "V1", "V2", "EdgeFixed", "EdgePose",
         "ObservedUniform", "ObservedEdgeSample", "ObservedEdgeGuided",
         "HashObservedL1", "HashObservedUniform", "HashObservedEdgeSample", "HashObservedEdgeGuided",
-        "HashObservedL1Angle", "HashObservedL1Velocity",
+        "HashObservedL1Angle", "HashObservedL1Velocity", "HashSagittalAllPoints",
         "HashObservedEdgeGated", "HashObservedEdgeGatedSharp", "HashObservedEdgeGatedSharpFocused",
         "HashObservedEdgeGatedSharpProfile",
         "HashObservedEdgePreserve", "HashObservedEdgePreserve3D",
@@ -761,6 +930,15 @@ def main():
         raise ValueError("三维采样点数和毫米差分步长必须为正")
     response_only = all(name in ("EdgeFixed", "EdgePose") for name in args.variants)
     sweep_experiment = any(name in SWEEP_VARIANTS for name in args.variants)
+    all_points = "HashSagittalAllPoints" in args.variants
+    if all_points:
+        if args.variants != ["HashSagittalAllPoints"]:
+            raise ValueError("全点 sagittal 模式单独运行，旧 NeRF 由已保存的 checkpoint 统一评价")
+        if args.landmark_steps < 4 or args.sagittal_patches < 1 or args.sagittal_margin_mm <= 0:
+            raise ValueError("全点初始化步数>=4，sagittal图块数和扩张范围必须为正")
+        if any(not math.isfinite(v) or v < 0 for v in
+               (args.sagittal_field_weight, args.sagittal_dense_weight, args.landmark_weight)):
+            raise ValueError("全点 sagittal 权重必须为有限非负值")
     if sweep_experiment:
         if not set(args.variants) <= {"HashObservedL1", *SWEEP_VARIANTS}:
             raise ValueError("平面角度/角速度对照只与相同的纯 L1 基线比较")
@@ -857,14 +1035,23 @@ def main():
     if args.align_poses:
         align_poses(data, args)
         return
-    sagittal = (SagittalIntersection(data, args.sagittal_reference, args.sagittal_calibration,
-                                    ssim_weight=args.sagittal_ssim_weight) if sweep_experiment else None)
+    aligned = None
+    if all_points:
+        from .sagittal_guidance import SagittalGuidance
+        sagittal = SagittalGuidance(data, args.sagittal_reference, args.sagittal_calibration,
+                                    args.landmarks, margin_mm=args.sagittal_margin_mm)
+        data.bounds = sagittal.field_bounds
+        write_json(args.output/"comparison/run_config/guidance.json", sagittal.metadata)
+        aligned = align_all_landmarks(data, sagittal, args.output/"AllPointAlignment", args)
+    else:
+        sagittal = (SagittalIntersection(data, args.sagittal_reference, args.sagittal_calibration,
+                                        ssim_weight=args.sagittal_ssim_weight) if sweep_experiment else None)
     if args.smoke and sweep_experiment:
         from .sweep_geometry import smoke_check
         geometry = smoke_check(device)
     else:
         geometry = geometry_check(device) if args.smoke else None
-    results = [train_variant(data, args.output/name, name, args, smoke=args.smoke, sagittal=sagittal)
+    results = [train_variant(data, args.output/name, name, args, smoke=args.smoke, sagittal=sagittal, aligned=aligned)
                for name in args.variants]
     if args.smoke:
         # 所有里程碑在后续更新完成后仍需独立重载；不以这个检查判断重建质量。
@@ -881,16 +1068,28 @@ def main():
                     torch.testing.assert_close(load_sweep(saved).matrices(), saved["corrected_poses"].cpu())
                 paths.append(str(path))
             result["retained_checkpoints"] = paths
-        if sagittal is not None:
+        if sagittal is not None and not all_points:
             compare_sweeps(data, sagittal, args.output, args.variants)
         write_json(args.output/"comparison/metrics/smoke_result.json", dict(
             status="PASS; execution only", geometry=geometry, variants=results,
             response_only=response_only, gray_independence_checked=response_only,
             quality="not evaluated"))
     else:
-        comparison = compare_responses if response_only else compare
-        comparison(data, args.output, args.variants)
-        if sagittal is not None:
+        if all_points:
+            old, old_saved = load_field(args.sagittal_baseline_checkpoint, device)
+            old.evaluation_bounds = old_saved["bounds"]
+            old_poses = load_sweep(old_saved, device)
+            evaluate_guided_sagittal(old, old_poses, data, sagittal, args.output/"PreviousNeRFVelocity",
+                                     old_saved["completed_steps"], old_saved["frequency_progress"])
+            compare_guided_sagittal({
+                "PreviousNeRFVelocity": args.output/"PreviousNeRFVelocity/predictions"/f"guided_sagittal_step_{old_saved['completed_steps']:06d}.npz",
+                "AllPointAlignment": args.output/"AllPointAlignment/predictions"/f"guided_sagittal_step_{args.landmark_steps:06d}.npz",
+                "HashSagittalAllPoints": args.output/"HashSagittalAllPoints/predictions"/f"guided_sagittal_step_{args.steps:06d}.npz",
+            }, args.output/"comparison")
+        else:
+            comparison = compare_responses if response_only else compare
+            comparison(data, args.output, args.variants)
+        if sagittal is not None and not all_points:
             compare_sweeps(data, sagittal, args.output, args.variants)
 
 

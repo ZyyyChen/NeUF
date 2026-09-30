@@ -13,10 +13,12 @@ from matplotlib.colors import ListedColormap
 from matplotlib.patches import Rectangle
 import numpy as np
 import torch
-from scipy.ndimage import gaussian_filter, map_coordinates, maximum_filter, minimum_filter
+from scipy.ndimage import gaussian_filter, map_coordinates, maximum_filter, minimum_filter, sobel
+from scipy.interpolate import griddata
 from scipy.optimize import curve_fit
 from scipy.spatial import cKDTree
 from skimage.metrics import structural_similarity
+from skimage.feature import canny
 
 from .data import write_json
 from .losses import blur, edge_preserve_weights, gradients
@@ -1048,4 +1050,294 @@ def compare_sweeps(data, sagittal, run_root, variants):
                                 "heldout sweep intensities are not fitted; their angles follow the learned trajectory",
                                 "one seed; equal field updates do not imply equal runtime"])
     write_json(output / "metrics" / "sweep_summary.json", summary)
+    return summary
+
+
+def _guided_numpy(value):
+    return value.detach().cpu().numpy() if torch.is_tensor(value) else np.asarray(value)
+
+
+def _guided_reslice(data, matrices, guidance, xyz):
+    """只用同一 training split、原始分辨率及固定列；不借用留出帧填洞。"""
+    selected = _guided_numpy(data.splits["training"])
+    column = guidance.column
+    valid = _guided_numpy(data.mask)[:, column].astype(bool)
+    local = _guided_numpy(data.local)[:, column][valid]
+    matrices = _guided_numpy(matrices)[selected]
+    points = local[None] @ matrices[:, :3, :3].transpose(0, 2, 1) + matrices[:, None, :3, 3]
+    if np.max(np.abs(points[..., 0] - xyz[0, 0, 0])) > 1e-3:
+        raise ValueError("固定源图列与 sagittal 世界平面不共面")
+    values = _guided_numpy(data.images[data.splits["training"], :, column])[:, valid]
+    result = griddata(points[..., 1:].reshape(-1, 2), values.reshape(-1), xyz[..., 1:], method="linear")
+    return result.astype(np.float32), np.isfinite(result)
+
+
+def _guided_safe_support(support, pitch_mm):
+    # 两个尺度共享分母。0.5mm Gaussian 的 4σ，再留 Canny 4px Gaussian/梯度邻域。
+    radius = int(math.ceil(4 * .5 / pitch_mm)) + 6
+    return minimum_filter(support, size=2 * radius + 1, mode="constant", cval=0).astype(bool)
+
+
+def _guided_edge_thresholds(reference, fixed, roi, pitch_mm):
+    """双阈值只由固定参考图定义，跨模型/步数保持绝对梯度阈值一致。"""
+    mask = _guided_safe_support(fixed, pitch_mm) & roi
+    thresholds = []
+    for sigma_mm in (0., .5):
+        smoothed = gaussian_filter(reference, sigma_mm / pitch_mm) if sigma_mm else reference
+        canny_input = gaussian_filter(smoothed, 1.)
+        strength = np.hypot(sobel(canny_input, axis=0), sobel(canny_input, axis=1))
+        positive = strength[mask & (strength > 1e-8)]
+        high = float(np.quantile(positive, .8)) if positive.size else 1.
+        thresholds.append((.4 * high, high))
+    return np.asarray(thresholds, dtype=np.float64)
+
+
+def _guided_correlation(first, second):
+    if first.size < 2 or min(first.std(), second.std()) <= 1e-8:
+        return None
+    return float(np.corrcoef(first, second)[0, 1])
+
+
+def _guided_edge_metrics(predicted, reference, pitch_mm):
+    """两边的候选都先限制在该 ROI 内，禁止匹配 ROI 外边缘获取高分。"""
+    p, r = np.argwhere(predicted), np.argwhere(reference)
+    metrics = dict(predicted_edge_pixels=len(p), reference_edge_pixels=len(r),
+                   edge_mean_distance_mm=None, edge_p95_distance_mm=None)
+    if len(p) and len(r):
+        p_to_r = cKDTree(r).query(p, workers=2)[0] * pitch_mm
+        r_to_p = cKDTree(p).query(r, workers=2)[0] * pitch_mm
+        # 两个方向等权；p95 同时报告最差方向，避免密集预测淹没参考漏检。
+        metrics.update(edge_mean_distance_mm=float((p_to_r.mean() + r_to_p.mean()) / 2),
+                       edge_p95_distance_mm=float(max(np.quantile(p_to_r, .95), np.quantile(r_to_p, .95))))
+    else:
+        p_to_r = np.full(len(p), np.inf)
+        r_to_p = np.full(len(r), np.inf)
+    for tolerance, suffix in ((.5, "0p5mm"), (1., "1mm")):
+        precision = float(np.mean(p_to_r <= tolerance)) if len(p) else None
+        recall = float(np.mean(r_to_p <= tolerance)) if len(r) else None
+        f1 = (2 * precision * recall / (precision + recall)
+              if precision is not None and recall is not None and precision + recall > 0
+              else 0. if len(p) or len(r) else None)
+        metrics.update({f"edge_precision_{suffix}": precision, f"edge_recall_{suffix}": recall,
+                        f"edge_f1_{suffix}": f1})
+    return metrics
+
+
+def _guided_metric_rows(gray, reference, fixed, current, roi, core, pitch_mm, thresholds, *, domain="fixed"):
+    """保留固定分母；缺失灰度补零，缺失边缘算漏检且不计填零边界。"""
+    fixed_safe = _guided_safe_support(fixed, pitch_mm)
+    current_safe = _guided_safe_support(current, pitch_mm)
+    filled = np.where(current & np.isfinite(gray), gray, 0).astype(np.float32)
+    regions = dict(all=roi, core=core & roi, extension=roi & ~core)
+    rows, edge_panels = [], {}
+    for scale_index, (scale, sigma_mm) in enumerate((("native", 0.), ("smooth_0p5mm", .5))):
+        prediction = gaussian_filter(filled, sigma_mm / pitch_mm) if sigma_mm else filled
+        target = gaussian_filter(reference, sigma_mm / pitch_mm) if sigma_mm else reference
+        _, similarity = structural_similarity(target, prediction, data_range=1., win_size=7, full=True)
+        # 缺失区填零的跳变不能充当预测边缘，边缘 NCC 同样采用安全上下文 gate。
+        p_gradient = np.where(current_safe, np.hypot(*np.gradient(prediction)), 0)
+        r_gradient = np.hypot(*np.gradient(target))
+        low, high = thresholds[scale_index]
+        reference_edges = canny(target, sigma=1., low_threshold=low, high_threshold=high, mask=fixed)
+        predicted_edges = canny(prediction, sigma=1., low_threshold=low, high_threshold=high,
+                                mask=current) & current_safe
+        edge_panels[scale] = (reference_edges & fixed_safe & roi, predicted_edges & fixed_safe & roi)
+        for region, region_mask in regions.items():
+            selected = region_mask & fixed_safe
+            count = int(selected.sum())
+            requested = int(region_mask.sum())
+            row = dict(domain=domain, region=region, scale=scale, sigma_mm=sigma_mm,
+                       roi_pixels=requested, metric_pixels=count,
+                       reference_support_fraction=float(count / requested) if requested else None,
+                       coverage=float((selected & current).sum() / count) if count else None,
+                       edge_context_coverage=float((selected & current_safe).sum() / count) if count else None,
+                       ssim=float(similarity[selected].mean()) if count else None,
+                       gray_ncc=_guided_correlation(prediction[selected], target[selected]),
+                       edge_ncc=_guided_correlation(p_gradient[selected], r_gradient[selected]))
+            row.update(_guided_edge_metrics(predicted_edges & selected, reference_edges & selected, pitch_mm))
+            rows.append(row)
+    return rows, edge_panels
+
+
+def _guided_plot(gray_by_name, reference, fixed, current_by_name, roi, core, pitch_mm, thresholds, output, *, crop):
+    """固定原生方向和 [0,1]；白为边缘重叠，青为参考，紫为预测。"""
+    names = list(gray_by_name)
+    fig, axes = plt.subplots(3, len(names) + 1, figsize=(5 * (len(names) + 1), 12),
+                             squeeze=False, layout="constrained")
+    display = fixed
+    axes[0, 0].imshow(np.where(display, reference, np.nan), cmap="gray", vmin=0, vmax=1)
+    axes[0, 0].set_title("Sagittal reference (supervision)")
+    axes[1, 0].imshow(np.where(display, reference, np.nan), cmap="gray", vmin=0, vmax=1)
+    axes[1, 0].set_title("Fixed ROI: annotation hull + physical expansion")
+    axes[2, 0].imshow(np.where(display, reference, np.nan), cmap="gray", vmin=0, vmax=1)
+    axes[2, 0].set_title("Edges: cyan ref / magenta result / white overlap")
+    for column, name in enumerate(names, 1):
+        current = current_by_name[name]
+        gray = np.where(current, gray_by_name[name], 0)
+        axes[0, column].imshow(np.where(display, gray, np.nan), cmap="gray", vmin=0, vmax=1)
+        axes[0, column].set_title(name)
+        axes[1, column].imshow(np.where(display & roi, np.abs(gray - reference), np.nan),
+                               cmap="magma", vmin=0, vmax=1)
+        axes[1, column].set_title("Absolute gray difference [0,1]")
+        safe = _guided_safe_support(fixed, pitch_mm) & roi
+        current_safe = _guided_safe_support(current, pitch_mm)
+        low, high = thresholds[1]
+        ref_edge = canny(gaussian_filter(reference, .5 / pitch_mm), sigma=1.,
+                         low_threshold=low, high_threshold=high, mask=fixed) & safe
+        predicted_edge = canny(gaussian_filter(gray, .5 / pitch_mm), sigma=1.,
+                               low_threshold=low, high_threshold=high, mask=current) & current_safe & safe
+        overlay = np.repeat((np.where(display, reference, 0) * .45)[..., None], 3, axis=-1)
+        overlay[ref_edge] = (0., 1., 1.)
+        overlay[predicted_edge] = (1., 0., 1.)
+        overlay[ref_edge & predicted_edge] = (1., 1., 1.)
+        axes[2, column].imshow(overlay, vmin=0, vmax=1)
+        axes[2, column].set_title("Edges after 0.5 mm smoothing")
+    for axis in axes.flat:
+        if roi.any() and not roi.all():
+            axis.contour(roi, levels=[.5], colors=["yellow"], linewidths=.6)
+        if core.any() and not core.all():
+            axis.contour(core, levels=[.5], colors=["lime"], linewidths=.6)
+        axis.set(xlabel="Native sagittal column [px]", ylabel="Native sagittal row [px]")
+        if crop and roi.any():
+            rr, cc = np.nonzero(roi)
+            axis.set_xlim(max(0, cc.min() - 5), min(roi.shape[1] - 1, cc.max() + 5))
+            axis.set_ylim(min(roi.shape[0] - 1, rr.max() + 5), max(0, rr.min() - 5))
+    fig.suptitle("cerebral / index_all; same training frames, native grid, fixed ROI/support and [0,1]; missing result = 0")
+    fig.savefig(output, dpi=140)
+    plt.close(fig)
+
+
+@torch.no_grad()
+def evaluate_guided_sagittal(model, poses, data, guidance, output, step, progress, *, raw_only=False):
+    """全点 ROI 的统一评分；model=None 时评估相同训练帧的线性重采样。"""
+    output = Path(output)
+    plot_dir = output / "plots" / f"step_{step:06d}"
+    for folder in (plot_dir, output / "metrics", output / "predictions", output / "run_config"):
+        folder.mkdir(parents=True, exist_ok=True)
+    reference = _guided_numpy(guidance.reference).astype(np.float32)
+    xyz = _guided_numpy(guidance.xyz_grid).astype(np.float32)
+    roi, core = _guided_numpy(guidance.roi).astype(bool), _guided_numpy(guidance.core_roi).astype(bool)
+    reference_mask = _guided_numpy(guidance.reference_mask).astype(bool)
+    pitch = float(guidance.pitch_mm)
+    if not hasattr(guidance, "_guided_evaluation_support"):
+        _, initial_support = _guided_reslice(data, data.initial, guidance, xyz)
+        fixed = initial_support & reference_mask
+        if not (roi & _guided_safe_support(fixed, pitch)).any():
+            raise ValueError("固定初始训练支持与标注 ROI 没有足够的滤波上下文")
+        thresholds = _guided_edge_thresholds(reference, fixed, roi, pitch)
+        guidance._guided_evaluation_support = fixed, thresholds
+    fixed, thresholds = guidance._guided_evaluation_support
+    raw_gray, source_support = _guided_reslice(data, poses.matrices().detach(), guidance, xyz)
+    current = source_support & reference_mask
+    model_bounds = None
+    if model is None or raw_only:
+        gray = np.where(current, raw_gray, 0).astype(np.float32)
+        method = "training_frames_linear_griddata"
+    else:
+        if model.response_only:
+            raise ValueError("sagittal 灰度评价需要具有灰度输出的模型")
+        if hasattr(model, "evaluation_bounds"):
+            model_bounds = _guided_numpy(model.evaluation_bounds)
+        elif model.hash_encoder is not None:
+            model_bounds = np.stack((_guided_numpy(model.hash_encoder.bound_min), _guided_numpy(model.hash_encoder.bound_max)))
+        else:
+            center, extent = _guided_numpy(model.center), _guided_numpy(model.extent)
+            model_bounds = np.stack((center - extent / 2, center + extent / 2))
+        bounds_mask = ((xyz >= model_bounds[0]) & (xyz <= model_bounds[1])).all(-1)
+        current &= bounds_mask
+        gray = np.zeros_like(reference)
+        # 查询整个模型有效网格，为 ROI 边缘的滤波保留真实上下文，禁止只渲染 ROI。
+        if bounds_mask.any():
+            gray[bounds_mask] = query(model, torch.as_tensor(xyz[bounds_mask], device=data.initial.device,
+                                                            dtype=data.initial.dtype), progress)[..., 0]
+        if not np.isfinite(gray).all():
+            raise ValueError("sagittal 模型查询产生非有限灰度")
+        gray[~current] = 0
+        method = "neural_field_direct_world_grid"
+    rows, _ = _guided_metric_rows(gray, reference, fixed, current, roi, core, pitch, thresholds)
+    common = fixed & current
+    shared_rows, _ = _guided_metric_rows(gray, reference, common, current, roi, core, pitch, thresholds,
+                                       domain="own_current_support_auxiliary")
+    for row in rows + shared_rows:
+        row.update(model=output.name, step=int(step), method=method)
+    landmarks = guidance.landmark_rows(poses)
+    frame_ids = _guided_numpy(data.frame_ids[data.splits["training"]])
+    basename = f"guided_sagittal_step_{step:06d}"
+    prediction_path = output / "predictions" / f"{basename}.npz"
+    np.savez_compressed(prediction_path, gray=gray, reference=reference, fixed_support=fixed,
+                        current_support=current, source_support=source_support, reference_mask=reference_mask,
+                        roi=roi, core_roi=core, xyz_grid=xyz, training_frame_ids=frame_ids,
+                        pitch_mm=pitch, step=int(step), edge_thresholds=thresholds,
+                        model_bounds=np.asarray([]) if model_bounds is None else model_bounds)
+    primary = next(row for row in rows if row["region"] == "all" and row["scale"] == "smooth_0p5mm")
+    summary = dict(**primary, rows=rows + shared_rows, landmarks=landmarks,
+                   prediction_path=str(prediction_path), quality_claim="尚未验证；sagittal 与全部标注均参与监督")
+    write_csv(output / "metrics" / f"{basename}.csv", rows + shared_rows)
+    write_csv(output / "metrics" / f"landmarks_step_{step:06d}.csv", landmarks)
+    write_json(output / "metrics" / f"{basename}.json", summary)
+    manifest = dict(guidance=guidance.metadata, training_frame_ids=frame_ids.tolist(),
+                    source_image_shape=list(data.images.shape[1:]), source_column=int(guidance.column),
+                    fixed_support="finite initial training-frame linear griddata AND physical reference sector; independent of field bounds",
+                    current_support="finite corrected training-frame griddata AND physical reference sector AND field bounds (for NeRF)",
+                    main_domain="ROI intersect eroded fixed support; ROI itself is not eroded; same denominator for all methods",
+                    fill_policy="missing predictions are zero on fixed main domain; never silently drop unsupported pixels",
+                    edge_policy="reference-only absolute Canny thresholds; sigma=1 native pixel after stated gray smoothing; predicted edges gated by eroded current context; both matching sets restricted to each ROI",
+                    edge_thresholds_native_then_smoothed=thresholds.tolist(),
+                    edge_distance="mean: equally weighted mean of two directed distances; p95: maximum of two directed 95th percentiles",
+                    metric_context_radius_px=int(math.ceil(4 * .5 / pitch)) + 6,
+                    undefined_metrics="null, including correlation with constant images and distance with empty edge set",
+                    intensity_scale="shared [0,1], no model-specific normalization", pitch_mm=pitch,
+                    regions="all=hull+expansion, core=hull, extension=all-core",
+                    limitation="all landmarks and sagittal are training supervision; these are fit metrics, not heldout anatomical accuracy")
+    write_json(output / "run_config" / "guided_sagittal_manifest.json", manifest)
+    for crop, suffix in ((False, "full"), (True, "roi")):
+        _guided_plot({output.name: gray}, reference, fixed, {output.name: current}, roi, core, pitch, thresholds,
+                     plot_dir / f"guided_sagittal_{suffix}.png", crop=crop)
+    return summary
+
+
+def compare_guided_sagittal(paths, output):
+    """paths={显示名:统一评价 NPZ}；重新计算固定主域和跨方法共同覆盖辅助域。"""
+    if not paths:
+        raise ValueError("至少需要一个已经按全点 ROI 重新查询的 sagittal 结果")
+    output = Path(output)
+    for folder in ("metrics", "plots", "predictions", "run_config"):
+        (output / folder).mkdir(parents=True, exist_ok=True)
+    records = {}
+    for name, path in paths.items():
+        with np.load(path, allow_pickle=False) as saved:
+            records[name] = {key: saved[key].copy() for key in saved.files}
+    first = next(iter(records.values()))
+    for name, record in records.items():
+        for key in ("reference", "fixed_support", "roi", "core_roi", "xyz_grid", "training_frame_ids", "pitch_mm", "edge_thresholds"):
+            if not np.array_equal(record[key], first[key]):
+                raise ValueError(f"统一 sagittal 比较的固定输入不一致: {name}, {key}")
+    reference, fixed, roi, core = (first[key] for key in ("reference", "fixed_support", "roi", "core_roi"))
+    pitch, thresholds = float(first["pitch_mm"]), first["edge_thresholds"]
+    common = fixed & np.logical_and.reduce([record["current_support"] for record in records.values()])
+    rows = []
+    for name, record in records.items():
+        for domain, support in (("fixed", fixed), ("all_models_common_support_auxiliary", common)):
+            metrics, _ = _guided_metric_rows(record["gray"], reference, support, record["current_support"],
+                                            roi, core, pitch, thresholds, domain=domain)
+            rows.extend(dict(model=name, step=int(record["step"]), **row) for row in metrics)
+    write_csv(output / "metrics" / "guided_sagittal_comparison.csv", rows)
+    summary = dict(rows=rows, inputs={name: str(path) for name, path in paths.items()},
+                   common_support_pixels=int((common & roi).sum()),
+                   interpretation="fixed rows use identical initial support; shared-support rows are auxiliary; all sagittal metrics measure supervised fit",
+                   quality_claim="尚未验证；统一固定域图像、SSIM/NCC/边缘重合和覆盖率需共同审查")
+    write_json(output / "metrics" / "guided_sagittal_comparison.json", summary)
+    np.savez_compressed(output / "predictions" / "guided_sagittal_support.npz", fixed_support=fixed,
+                        common_support=common, roi=roi, core_roi=core,
+                        **{f"current_{name}": record["current_support"] for name, record in records.items()})
+    write_json(output / "run_config" / "comparison_manifest.json",
+               dict(comparison_indices=["native_sagittal"], inputs=summary["inputs"],
+                    normalization="shared [0,1] without per-model normalization", pitch_mm=pitch,
+                    training_frame_ids=first["training_frame_ids"].tolist(),
+                    crop="fixed annotation hull plus configured physical expansion", display_support="fixed initial support",
+                    metrics="same definitions as each guided_sagittal_manifest.json; full and ROI figures use fixed support"))
+    for crop, suffix in ((False, "full"), (True, "roi")):
+        _guided_plot({name: record["gray"] for name, record in records.items()}, reference, fixed,
+                     {name: record["current_support"] for name, record in records.items()}, roi, core, pitch,
+                     thresholds, output / "plots" / f"guided_sagittal_comparison_{suffix}.png", crop=crop)
     return summary

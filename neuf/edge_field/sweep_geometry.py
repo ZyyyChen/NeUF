@@ -127,6 +127,30 @@ class SweepPoseRefiner(nn.Module):
         matrices = self.matrices()[frame_indices]
         return torch.einsum("bij,bpj->bpi", matrices[:, :3, :3], local_points) + matrices[:, None, :3, 3]
 
+    def fractional_world(self, frame_ids, local_points):
+        """小数原始帧号上的 [M,3] 或 [M,P,3] 局部点，毫米单位。
+
+        角度与旋转中心分别插值，再构造正交旋转；不把弧上的两点或旋转
+        矩阵线性混合，避免改变标注点到探头旋转中心的物理半径。
+        """
+        ids = torch.as_tensor(frame_ids, device=self.initial.device, dtype=self.initial.dtype)
+        local = torch.as_tensor(local_points, device=self.initial.device, dtype=self.initial.dtype)
+        if ids.ndim != 1 or local.ndim not in (2, 3) or local.shape[0] != len(ids) or local.shape[-1] != 3:
+            raise ValueError("要求 frame_ids=[M]、local_points=[M,3] 或 [M,P,3]")
+        if not bool(torch.isfinite(ids).all()) or bool(((ids < self.frame_ids[0]) | (ids > self.frame_ids[-1])).any()):
+            raise ValueError("小数帧号必须位于已加载帧号范围内")
+        right = torch.searchsorted(self.frame_ids.to(ids.dtype), ids).clamp(1, len(self.frame_ids) - 1)
+        left = right - 1
+        alpha = (ids - self.frame_ids[left]) / (self.frame_ids[right] - self.frame_ids[left])
+        angles = self.angles()
+        angle = angles[left] * (1 - alpha) + angles[right] * alpha
+        rotation = _rotation_x(angle - self.initial_angles[left]) @ self.initial[left, :3, :3]
+        center = self.centers[left] * (1 - alpha[:, None]) + self.centers[right] * alpha[:, None]
+        translation = center + self.radial_offset * rotation[:, :, 0]
+        if local.ndim == 2:
+            return torch.einsum("bij,bj->bi", rotation, local) + translation
+        return torch.einsum("bij,bpj->bpi", rotation, local) + translation[:, None]
+
     def prior_components(self):
         """两种参数化都在同一物理角度/速度尺度下正则化，避免 raw 尺度偏置。"""
         offset = self.angle_offsets()

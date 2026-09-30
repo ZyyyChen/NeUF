@@ -151,7 +151,7 @@ class SagittalIntersection:
 
     def __init__(self, data, reference_path, calibration_path, *, column=477,
                  world_x_mm=-.659604, sigmas_mm=(.5, .25), window_mm=6., stride_mm=3.,
-                 minimum_edge_std=.005, ssim_weight=0., coverage_weight=.2):
+                 minimum_edge_std=.005, ssim_weight=0., coverage_weight=.2, reference_mask=None):
         if not hasattr(data, "images"):
             raise ValueError("sagittal 交线监督需要缓存实测灰度图")
         if len(sigmas_mm) != 2 or min(sigmas_mm) <= 0 or not 0 <= column < data.width:
@@ -162,7 +162,8 @@ class SagittalIntersection:
             reference = np.asarray(handle["data_sag"]).T.astype(np.float32) / 255.
         with np.load(calibration_path, allow_pickle=False) as calibration:
             linear, offset = calibration["linear"].copy(), calibration["offset"].copy()
-            structure = calibration["sagittal_structure"].astype(bool)
+            structure = (calibration["sagittal_structure"].astype(bool) if reference_mask is None
+                         else np.asarray(reference_mask, dtype=bool))
         if reference.shape != structure.shape or linear.shape != (2, 2) or offset.shape != (2,):
             raise ValueError("sagittal 图像和冻结标定形状不一致")
         if not np.isfinite(reference).all() or reference.min() < 0 or reference.max() > 1:
@@ -239,6 +240,7 @@ class SagittalIntersection:
         self.metadata = dict(
             reference=str(Path(reference_path).resolve()), calibration=str(Path(calibration_path).resolve()),
             reference_sha256=hash_file(reference_path), calibration_sha256=hash_file(calibration_path),
+            reference_mask_sha256=hash_array(structure), reference_mask_override=reference_mask is not None,
             reference_normalization="data_sag.T / 255", column_zero_based=column, world_x_mm=world_x_mm,
             sigmas_mm=list(sigmas_mm), sample_spacing_mm=self.sample_spacing_mm,
             window_mm=window_mm, stride_mm=stride_mm, minimum_edge_std=minimum_edge_std,
