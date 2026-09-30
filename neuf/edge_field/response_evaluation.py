@@ -176,11 +176,12 @@ def evaluate_response(model, poses, data, output, step, progress, *, final=False
     directory = output / "plots" / f"step_{step:06d}"
     directory.mkdir(parents=True, exist_ok=True)
     matrices = poses.matrices().detach()
-    train_preview = int(data.splits["training"][len(data.splits["training"])//2])
-    display = set(data.comparison + [train_preview])
+    training = data.splits["training"].cpu().tolist()
+    train_previews = training if "fit_frames_only" in data.metadata else [training[len(training)//2]]
+    display = set(data.comparison + train_previews)
     indices = [(split, int(index)) for split in (("validation", "test") if final else ("validation",))
                for index in data.splits[split].cpu().tolist()]
-    indices.append(("training_diagnostic", train_preview))
+    indices.extend(("training_diagnostic", index) for index in train_previews)
     rows = []
     valid, interior = data.mask.cpu().numpy(), data.interior.cpu().numpy()
     for split, index in indices:

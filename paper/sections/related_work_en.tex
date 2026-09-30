@@ -1,0 +1,38 @@
+\section{Related Work}
+\label{sec:related-work}
+
+\subsection{Freehand Three-Dimensional Ultrasound Reconstruction}
+
+% P1：采集、融合和插值的基本问题。
+Freehand three-dimensional (3D) ultrasound reconstruction combines two-dimensional B-mode frames acquired at different probe poses into a volume~\cite{prager2010three}. In tracked systems, probe localization and image-to-probe calibration place the measured pixels in a common spatial coordinate system. Reconstruction then requires both interpolation between sampled planes and the combination of overlapping observations. These operations depend on the acquisition trajectory, spatial sampling, and calibration accuracy~\cite{solberg2007freehand}. Rohling et al.~\cite{rohling1999interpolation} investigated radial-basis-function approximation and compared it with three standard reconstruction methods, illustrating the trade-off between reconstruction quality and computational cost for irregularly spaced B-scans.
+
+% P2：连续表示与实际边界保真应分开讨论。
+A continuous interpolant defines values between acquired frames, but boundary fidelity also depends on the relationship between the observations being combined. Misregistration can place observations of the same interface at different spatial locations, while changes in insonification direction can alter its appearance. These effects motivate geometric correction and ultrasound-specific models of image formation, respectively~\cite{dou2026gau,wysocki2024ultranerf}. For a single B-mode intensity field, preserving observed boundaries therefore depends on both spatial alignment and the consistency of image appearances across frames.
+
+\subsection{Implicit Representations for Ultrasound}
+
+% P3：表示基础；多分辨率参数化不等于分辨率提升。
+Implicit neural representations parameterize a signal as a function of its coordinates. NeRF couples such a representation to a rendering model for novel-view synthesis~\cite{mildenhall2020nerf}, while the multiresolution hash encoding of M\"uller et al.~\cite{mueller2022instant} provides trainable features at several spatial scales and reduces the cost of fitting neural graphics primitives. Ultrasound studies have adopted coordinate-based representations for volumetric reconstruction, including the carotid-vessel work of Song et al.~\cite{song2022carotid}. Coordinate-based volume models support resampling on different output grids~\cite{yeung2024sensorless}, although the recoverable spatial detail remains constrained by the acquired data and the reconstruction model.
+
+% P4：位姿未知或不可靠时的联合估计路线。
+The role of the neural representation also depends on the availability and reliability of the acquisition geometry. Yeung et al.~\cite{yeung2024sensorless} addressed sensorless fetal-brain reconstruction by estimating frame locations and refining them together with an implicit volume representation. For tracked freehand ultrasound, the ImplicitCell preprint combines an ultrasound resolution-cell model with joint volume reconstruction and pose refinement~\cite{song2025implicitcell}. GAU-NeRF addresses misalignment between sweeps through joint field reconstruction and probe-pose refinement, using gradient reweighting and smoothing to stabilize the early optimization~\cite{dou2026gau}. These methods treat frame geometry as a variable to be estimated jointly with the reconstructed volume.
+
+% P5：方向相关成像由前向模型与参数化共同决定。
+A separate question concerns how ultrasound observations are formed. Ultra-NeRF predicts spatially varying tissue parameters and uses an ultrasound ray-based renderer to account for attenuation, reflection, and scattering~\cite{wysocki2024ultranerf}. Its direction-dependent image formation is implemented through rendering, even though the parameter field itself is queried by position. The UlRe-NeRF preprint further investigates reflection-direction parameterization and directional encoding~\cite{guo2024ulre}. Such approaches separate the representation of the medium from the synthesis of an observed image, allowing probe direction to influence the rendered B-mode appearance.
+
+% P6：与本文最接近的多尺度表示；避免泛化的新颖性宣称。
+Multiscale feature representations have also been used in physically motivated ultrasound rendering. Liu et al.~\cite{liu2026geometry} infer acoustic impedance and use its spatial gradients to model geometry-dependent reflection. Their method assigns coarse-scale hash features to reflection and fine-scale features to scattering. UltraSoundNeRF reduces redundancy in the acoustic parameterization through a revised forward model and uses physics-inspired regularization to improve the interpretability of the recovered acoustic maps~\cite{wysocki2026usnerf}. These methods model B-mode image detail through an explicit description of the medium and its interaction with ultrasound.
+
+\subsection{Structural Priors and Boundary Preservation}
+
+% P7：超声保边与散斑处理的既有研究。
+Ultrasound image filtering has long sought to reduce speckle while preserving boundaries. Speckle-reducing anisotropic diffusion adapts diffusion to local image statistics so that smoothing responds to edges in speckled data~\cite{yu2002srad}. Oriented speckle-reducing anisotropic diffusion extends this idea to direction-dependent filtering, with different diffusion strengths across contours and along principal curvature directions~\cite{krissian2007osrad}. These methods show how local image structure can guide spatially varying regularization. Their objective concerns filtering an image or volume; incorporating related structural information into the fitting of a continuous field from multiple frames raises an additional question about consistency between observations.
+
+% P8：STV 与非局部结构张量先验的准确归属。
+Structure-tensor regularization summarizes gradient information over image neighborhoods. Lefkimmiatis et al.~\cite{lefkimmiatis2015stv} introduced structure tensor total variation (STV), using the tensor eigenvalues to define a family of regularizers for inverse imaging problems. Lefkimmiatis and Osher~\cite{lefkimmiatis2015nonlocal} extended this formulation to nonlocal structure-tensor functionals, incorporating information from similar image neighborhoods. The resulting regularizers combine local directional structure with nonlocal image similarity, providing a basis for deriving structural guidance from measured intensities.
+
+% P9：必须承认 NLSTV 已用于超声重建；区分 RF 波束形成和 B-mode 体重建。
+In ultrasound, Li et al.~\cite{li2026ipbnlstv} incorporated nonlocal structure tensor total variation (NLSTV) into an inverse formulation of beamforming. Their method regularizes the reconstruction of a complex ultrasound image from radio-frequency measurements and was evaluated on plane-wave imaging data. Here, the prior acts during image formation from acoustic measurements. This differs from B-mode volume reconstruction, which combines already formed images acquired at different probe poses.
+
+% P10：本文定位，只描述已实现机制，不预设效果或物理可辨识性。
+NeUF uses structural guidance to fit a continuous B-mode volume under fixed acquisition geometry. An auxiliary response field is supervised using fixed NLSTV-derived responses computed from the training frames. The predicted response gates a bounded residual in logit space before the final intensity activation, while the observed B-mode intensities provide the reconstruction targets. This formulation uses an image-domain prior to regulate detail in a directly fitted intensity field, with fidelity to observed boundaries as the focus.

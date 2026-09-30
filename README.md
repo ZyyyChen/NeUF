@@ -1,5 +1,47 @@
 # Neural Ultrasound Field (NeUF)
 
+## Observed B-mode 灰度与 NLSTV 边缘引导实验
+
+`HashObservedUniform`、`HashObservedEdgeSample`、`HashObservedEdgeGuided` 使用相同
+16-level 三维 HashGrid（每层 2 特征、`2^19` 表、16→512 分辨率）和灰度/response
+双头 MLP，固定初始位姿、seed 3407 和 40000 次场更新。三者均以原始 observed
+B-mode 为灰度目标；第二、三种方案将 40% patch 中心放在 response>0.15 的位置，
+第三种方案再加入：
+
+```text
+L = Lcharbonnier(gray, observed)
+  + ramp * (0.1 * Lgradient + 0.02 * Ledge)
+Lgradient = mean((1 + 2 * response) * |∇gray - ∇observed|₁)
+```
+
+`ramp` 在前 10% 为 0，10%–20% 线性增至 1。response 只作为软权重和 edge
+head 目标，不直接加到灰度强度。正式运行使用 `qsub/neuf/edge_guided.sh`；
+结果同时导出灰度体 `volume_float.*` 和辅助边缘体 `edge_volume_float.*`。
+
+边缘宽度实验比较 `HashObservedEdgeGuided`、`HashObservedEdgeGated` 和
+`HashObservedEdgeGatedSharp`。Gated 模型把前 8 层 Hash 特征送入基础灰度分支，
+完整 16 层特征预测 NLSTV gate 和有界高频残差：
+
+```text
+gray = sigmoid(coarse_gray_logit + predicted_edge * fine_detail_logit)
+```
+
+因此细层 Hash 特征必须经过 edge head 才能改变灰度。Sharp 版本再以 0.05 权重
+匹配 response 加权的 observed 灰度 Laplacian，直接约束 10–90% 边缘过渡宽度。
+两种 Gated 模型推理时都只输入世界坐标，不读取 teacher response。
+
+Patient0、seed 3407 的 `20260915_train02` 结果中，固定 12 条 profile 有 11 条
+对所有模型保持有效；平均 10–90% 宽度比由 Guided 的 1.498 降至 Gated 的
+1.241，并由 GatedSharp 进一步降至 1.211。GatedSharp validation SSIM 为
+0.91024（Guided 为 0.90971），平均 overshoot 由 0.1429 降至 0.1232；
+response correlation 从 0.8303 降至 0.8160，因此该结果只支持边缘宽度改善，
+不支持 response 预测本身改善或下游分割结论。
+
+项目目标与测试原则：本实验检验边缘采样和辅助监督能否改善固定验证切片及
+三维重切片的边界保真。smoke 只验证数据方向、采样比例、损失梯度和 checkpoint
+链路；测试通过不代表重建质量或下游分割改善。没有人工分割标签时不报告
+Dice/HD95，也不把 NLSTV response 称为解剖边界真值。
+
 新增的 `neuf.edge_field` 是独立的 V0–V2 实验路径：原始 B-mode 监督灰度，
 固定的传统 NLSTV λ=0.009 response 监督边缘，并在 V2 中矫正训练帧位姿。
 它不使用 Neural STV，也不采用 anatomy/residual 分解。下文原有固定几何

@@ -1,0 +1,60 @@
+% 中文逐段对照入口。优先使用 xeCJK；集群缺少该宏包时使用 XeTeX 原生中文断行。
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=25mm]{geometry}
+\usepackage{fontspec}
+\newfontfamily\referencefont{Latin Modern Roman}
+\IfFileExists{xeCJK.sty}{%
+  \usepackage{xeCJK}
+  \setmainfont{Latin Modern Roman}
+  \IfFontExistsTF{FandolSong-Regular}{%
+    \setCJKmainfont{FandolSong-Regular}
+  }{%
+    \setCJKmainfont[AutoFakeBold=2]{Droid Sans Fallback}
+  }
+}{%
+  \setmainfont{Latin Modern Roman}
+  \newfontfamily\chinesefont[AutoFakeBold=2]{Droid Sans Fallback}
+  % Droid 字体只有中文字形；显式注册汉字和中文标点，保留拉丁字体。
+  \newXeTeXintercharclass\chineseclass
+  \newcount\chinesecode
+  \chinesecode="3000
+  \loop\XeTeXcharclass\chinesecode=\chineseclass
+    \ifnum\chinesecode<"303F \advance\chinesecode by 1 \repeat
+  \chinesecode="3400
+  \loop\XeTeXcharclass\chinesecode=\chineseclass
+    \ifnum\chinesecode<"4DBF \advance\chinesecode by 1 \repeat
+  \chinesecode="4E00
+  \loop\XeTeXcharclass\chinesecode=\chineseclass
+    \ifnum\chinesecode<"9FFF \advance\chinesecode by 1 \repeat
+  \chinesecode="FF00
+  \loop\XeTeXcharclass\chinesecode=\chineseclass
+    \ifnum\chinesecode<"FFEF \advance\chinesecode by 1 \repeat
+  \XeTeXinterchartokenstate=1
+  \XeTeXinterchartoks 0 \chineseclass={\chinesefont}
+  \XeTeXinterchartoks 4095 \chineseclass={\chinesefont}
+  \XeTeXinterchartoks \chineseclass 0={\referencefont}
+  \XeTeXinterchartoks 4095 0={\referencefont}
+  \XeTeXlinebreaklocale "zh"
+  \XeTeXlinebreakskip=0pt plus 1pt
+}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage[hidelinks]{hyperref}
+\renewcommand{\refname}{参考文献}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.35em}
+\setlength{\emergencystretch}{2em}
+\linespread{1.18}
+\title{NeUF：相关工作}
+\author{}
+\date{英文稿逐段中文译稿，供作者审阅\\2026年9月22日}
+\begin{document}
+\maketitle
+\input{sections/related_work_zh}
+\bibliographystyle{unsrtnat}
+\section*{参考文献}
+\begingroup
+\referencefont
+\renewcommand{\bibsection}{}
+\bibliography{references}
+\endgroup
+\end{document}

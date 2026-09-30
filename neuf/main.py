@@ -1036,6 +1036,12 @@ class NeUFTrainer:
             raise RuntimeError("Phase 1 fixed geometry changed during training")
 
     def run(self) -> None:
+        # 按训练总步数向上取整保存 50%、75% 和最终状态，续训不重新计算比例。
+        checkpoint_steps = {
+            (self.iterations + 1) // 2,
+            (3 * self.iterations + 3) // 4,
+            self.iterations,
+        }
         started = time.perf_counter()
         start_timestamp = datetime.now().astimezone().isoformat()
         completed = self.start_iteration
@@ -1112,7 +1118,7 @@ class NeUFTrainer:
                         f"iteration={step} train={loss_value:.6f} "
                         f"validation_mse={validation_loss:.6f}"
                     )
-                if step % self.save_frequency == 0 or step == self.iterations:
+                if step % self.save_frequency == 0 or step in checkpoint_steps:
                     self._save_checkpoint(step)
             status = "complete"
         finally:
