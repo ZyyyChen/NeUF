@@ -1123,11 +1123,32 @@ def _guided_edge_metrics(predicted, reference, pitch_mm):
     return metrics
 
 
+_GUIDED_QUALITY_DEFINITIONS = dict(
+    regions="仅用参考图 Gaussian sigma=0.5mm 后梯度（强度/mm）选区；固定安全 ROI 内 >=80% 分位且梯度>1e-8 为边缘候选，<=25% 分位为平坦候选，包含并列值；两个尺度复用相同区域",
+    clarity="固定参考边缘候选区内，当前图像尺度下梯度 RMS 与参考 RMS 之比；不代表测得的空间分辨率",
+    flat_highpass="原生灰度减 Gaussian sigma=0.5mm，在固定参考平坦候选区计算 RMS；各尺度行重复同一原生指标，缺失上下文贡献零并单独报告覆盖率",
+    interpretation="平坦区高频减少可能来自适度降噪、细节损失或覆盖缺失；须联合边缘重合/距离、梯度、灰度 MAE、对比度和覆盖率判断，不按高频越低越好排序；跨方向超声外观可不同",
+)
+
+
 def _guided_metric_rows(gray, reference, fixed, current, roi, core, pitch_mm, thresholds, *, domain="fixed"):
     """保留固定分母；缺失灰度补零，缺失边缘算漏检且不计填零边界。"""
     fixed_safe = _guided_safe_support(fixed, pitch_mm)
     current_safe = _guided_safe_support(current, pitch_mm)
     filled = np.where(current & np.isfinite(gray), gray, 0).astype(np.float32)
+    # 区域只由参考图定义，两个评价尺度复用；低梯度仅表示平坦候选，并非无噪声真值。
+    reference_lowpass = gaussian_filter(reference, .5 / pitch_mm)
+    structure_gradient = np.hypot(*np.gradient(reference_lowpass)) / pitch_mm
+    selection = fixed_safe & roi
+    flat_threshold, edge_threshold = (np.quantile(structure_gradient[selection], (.25, .8))
+                                      if selection.any() else (None, None))
+    edge_region = (selection & (structure_gradient >= edge_threshold) & (structure_gradient > 1e-8)
+                   if selection.any() else selection.copy())
+    flat_region = (selection & (structure_gradient <= flat_threshold)
+                   if selection.any() else selection.copy())
+    # 高频代理始终作用于原生灰度，避免不同 scale 改变“平坦区高频”的定义与滤波上下文。
+    p_highpass = np.where(current_safe, filled - gaussian_filter(filled, .5 / pitch_mm), 0)
+    r_highpass = reference - reference_lowpass
     regions = dict(all=roi, core=core & roi, extension=roi & ~core)
     rows, edge_panels = [], {}
     for scale_index, (scale, sigma_mm) in enumerate((("native", 0.), ("smooth_0p5mm", .5))):
@@ -1146,14 +1167,34 @@ def _guided_metric_rows(gray, reference, fixed, current, roi, core, pitch_mm, th
             selected = region_mask & fixed_safe
             count = int(selected.sum())
             requested = int(region_mask.sum())
+            edge_selected, flat_selected = selected & edge_region, selected & flat_region
+            edge_count, flat_count = int(edge_selected.sum()), int(flat_selected.sum())
+            p_edge = float(np.sqrt(np.mean(p_gradient[edge_selected] ** 2)) / pitch_mm) if edge_count else None
+            r_edge = float(np.sqrt(np.mean(r_gradient[edge_selected] ** 2)) / pitch_mm) if edge_count else None
+            p_flat = float(np.sqrt(np.mean(p_highpass[flat_selected] ** 2))) if flat_count else None
+            r_flat = float(np.sqrt(np.mean(r_highpass[flat_selected] ** 2))) if flat_count else None
+            reference_std = float(target[selected].std()) if count else None
             row = dict(domain=domain, region=region, scale=scale, sigma_mm=sigma_mm,
                        roi_pixels=requested, metric_pixels=count,
                        reference_support_fraction=float(count / requested) if requested else None,
                        coverage=float((selected & current).sum() / count) if count else None,
                        edge_context_coverage=float((selected & current_safe).sum() / count) if count else None,
+                       gray_mae=float(np.abs(prediction[selected] - target[selected]).mean()) if count else None,
+                       contrast_std_ratio=(float(prediction[selected].std()) / reference_std
+                                           if reference_std is not None and reference_std > 1e-8 else None),
                        ssim=float(similarity[selected].mean()) if count else None,
                        gray_ncc=_guided_correlation(prediction[selected], target[selected]),
-                       edge_ncc=_guided_correlation(p_gradient[selected], r_gradient[selected]))
+                       edge_ncc=_guided_correlation(p_gradient[selected], r_gradient[selected]),
+                       reference_edge_region_pixels=edge_count, reference_flat_region_pixels=flat_count,
+                       reference_edge_threshold_per_mm=float(edge_threshold) if edge_threshold is not None else None,
+                       reference_flat_threshold_per_mm=float(flat_threshold) if flat_threshold is not None else None,
+                       edge_region_context_coverage=float((edge_selected & current_safe).sum() / edge_count) if edge_count else None,
+                       edge_gradient_rms_per_mm=p_edge, reference_edge_gradient_rms_per_mm=r_edge,
+                       edge_gradient_rms_ratio=p_edge / r_edge if r_edge is not None and r_edge > 1e-8 else None,
+                       flat_region_context_coverage=float((flat_selected & current_safe).sum() / flat_count) if flat_count else None,
+                       flat_native_highpass_rms=p_flat, reference_flat_native_highpass_rms=r_flat,
+                       flat_native_highpass_rms_ratio=p_flat / r_flat if r_flat is not None and r_flat > 1e-8 else None,
+                       flat_native_highpass_sigma_mm=.5)
             row.update(_guided_edge_metrics(predicted_edges & selected, reference_edges & selected, pitch_mm))
             rows.append(row)
     return rows, edge_panels
@@ -1260,7 +1301,8 @@ def evaluate_guided_sagittal(model, poses, data, guidance, output, step, progres
                                        domain="own_current_support_auxiliary")
     for row in rows + shared_rows:
         row.update(model=output.name, step=int(step), method=method)
-    landmarks = guidance.landmark_rows(poses)
+    uses_guidance = hasattr(poses, "fractional_world")
+    landmarks = guidance.landmark_rows(poses) if uses_guidance else []
     frame_ids = _guided_numpy(data.frame_ids[data.splits["training"]])
     basename = f"guided_sagittal_step_{step:06d}"
     prediction_path = output / "predictions" / f"{basename}.npz"
@@ -1271,9 +1313,13 @@ def evaluate_guided_sagittal(model, poses, data, guidance, output, step, progres
                         model_bounds=np.asarray([]) if model_bounds is None else model_bounds)
     primary = next(row for row in rows if row["region"] == "all" and row["scale"] == "smooth_0p5mm")
     summary = dict(**primary, rows=rows + shared_rows, landmarks=landmarks,
-                   prediction_path=str(prediction_path), quality_claim="尚未验证；sagittal 与全部标注均参与监督")
+                   quality_diagnostics=_GUIDED_QUALITY_DEFINITIONS,
+                   prediction_path=str(prediction_path),
+                   guidance_role="training" if uses_guidance else "evaluation_only",
+                   quality_claim="sagittal 为引导方法的训练参考；此处评估拟合程度，不代表留出解剖精度")
     write_csv(output / "metrics" / f"{basename}.csv", rows + shared_rows)
-    write_csv(output / "metrics" / f"landmarks_step_{step:06d}.csv", landmarks)
+    if landmarks:
+        write_csv(output / "metrics" / f"landmarks_step_{step:06d}.csv", landmarks)
     write_json(output / "metrics" / f"{basename}.json", summary)
     manifest = dict(guidance=guidance.metadata, training_frame_ids=frame_ids.tolist(),
                     source_image_shape=list(data.images.shape[1:]), source_column=int(guidance.column),
@@ -1284,11 +1330,13 @@ def evaluate_guided_sagittal(model, poses, data, guidance, output, step, progres
                     edge_policy="reference-only absolute Canny thresholds; sigma=1 native pixel after stated gray smoothing; predicted edges gated by eroded current context; both matching sets restricted to each ROI",
                     edge_thresholds_native_then_smoothed=thresholds.tolist(),
                     edge_distance="mean: equally weighted mean of two directed distances; p95: maximum of two directed 95th percentiles",
+                    quality_diagnostics=_GUIDED_QUALITY_DEFINITIONS,
                     metric_context_radius_px=int(math.ceil(4 * .5 / pitch)) + 6,
-                    undefined_metrics="null, including correlation with constant images and distance with empty edge set",
+                    undefined_metrics="null for empty regions, correlation with constant images, ratios with reference denominator <=1e-8, and distance with empty edge set",
                     intensity_scale="shared [0,1], no model-specific normalization", pitch_mm=pitch,
                     regions="all=hull+expansion, core=hull, extension=all-core",
-                    limitation="all landmarks and sagittal are training supervision; these are fit metrics, not heldout anatomical accuracy")
+                    guidance_role="training" if uses_guidance else "evaluation_only",
+                    limitation="sagittal and approximate landmarks guide the sagittal methods; these fit metrics do not establish heldout anatomical accuracy")
     write_json(output / "run_config" / "guided_sagittal_manifest.json", manifest)
     for crop, suffix in ((False, "full"), (True, "roi")):
         _guided_plot({output.name: gray}, reference, fixed, {output.name: current}, roi, core, pitch, thresholds,
@@ -1322,10 +1370,13 @@ def compare_guided_sagittal(paths, output):
                                             roi, core, pitch, thresholds, domain=domain)
             rows.extend(dict(model=name, step=int(record["step"]), **row) for row in metrics)
     write_csv(output / "metrics" / "guided_sagittal_comparison.csv", rows)
-    summary = dict(rows=rows, inputs={name: str(path) for name, path in paths.items()},
+    primary = [row for row in rows if row["domain"] == "fixed" and row["region"] == "all"
+               and row["scale"] == "smooth_0p5mm"]
+    summary = dict(rows=rows, primary_rows=primary, inputs={name: str(path) for name, path in paths.items()},
                    common_support_pixels=int((common & roi).sum()),
+                   quality_diagnostics=_GUIDED_QUALITY_DEFINITIONS,
                    interpretation="fixed rows use identical initial support; shared-support rows are auxiliary; all sagittal metrics measure supervised fit",
-                   quality_claim="尚未验证；统一固定域图像、SSIM/NCC/边缘重合和覆盖率需共同审查")
+                   quality_claim="尚未验证；统一固定域图像、边缘重合/距离、清晰度、灰度保真和覆盖率需共同审查；平坦区高频降低不能单独证明降噪成功")
     write_json(output / "metrics" / "guided_sagittal_comparison.json", summary)
     np.savez_compressed(output / "predictions" / "guided_sagittal_support.npz", fixed_support=fixed,
                         common_support=common, roi=roi, core_roi=core,

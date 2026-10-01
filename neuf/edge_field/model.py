@@ -83,7 +83,8 @@ class EdgeField(nn.Module):
                  plane_resolutions=(), plane_channels=4, encoding="fourier",
                  hash_levels=16, hash_features=2, log2_hashmap_size=19,
                  hash_base_resolution=16, hash_finest_resolution=512,
-                 edge_conditioned=False, coarse_hash_levels=8, detail_scale=2.):
+                 edge_conditioned=False, coarse_hash_levels=8, detail_scale=2.,
+                 progressive_hash=False):
         super().__init__()
         if encoding not in ("fourier", "hash"):
             raise ValueError(f"未知坐标编码: {encoding}")
@@ -93,6 +94,8 @@ class EdgeField(nn.Module):
             raise ValueError("edge-conditioned 灰度残差只用于 HashGrid 灰度重建")
         if edge_conditioned and not 1 <= coarse_hash_levels < hash_levels:
             raise ValueError("edge-conditioned 要求 1<=coarse_hash_levels<hash_levels")
+        if progressive_hash and (encoding != "hash" or not 1 <= coarse_hash_levels < hash_levels):
+            raise ValueError("渐进 Hash 要求 hash 编码且 1<=coarse_hash_levels<hash_levels")
         if detail_scale <= 0:
             raise ValueError("detail_scale 必须为正")
         bounds = torch.as_tensor(bounds, dtype=torch.float32)
@@ -109,11 +112,13 @@ class EdgeField(nn.Module):
             edge_conditioned=edge_conditioned,
             coarse_hash_levels=coarse_hash_levels,
             detail_scale=detail_scale,
+            progressive_hash=bool(progressive_hash),
         )
         self.response_only = response_only
         self.encoding = encoding
         self.edge_conditioned = bool(edge_conditioned)
         self.detail_scale = float(detail_scale)
+        self.progressive_hash = bool(progressive_hash)
         self.hash_encoder = MultiresHashEncoder(
             bounds, levels=hash_levels, features=hash_features,
             log2_size=log2_hashmap_size, base_resolution=hash_base_resolution,
@@ -151,6 +156,14 @@ class EdgeField(nn.Module):
         progress = self.progress if progress is None else progress
         if self.hash_encoder is not None:
             encoded = self.hash_encoder(xyz)
+            if self.progressive_hash and progress < 1:
+                # progress=总进度/0.7；前 20% 仅保留粗层，20%–70% 逐层余弦开放。
+                opened = min(1., max(0., (progress - 2 / 7) / (1 - 2 / 7)))
+                coarse = self.config["coarse_hash_levels"]
+                alpha = coarse + (self.hash_encoder.levels - coarse) * opened
+                levels = torch.arange(self.hash_encoder.levels, device=encoded.device, dtype=encoded.dtype)
+                weight = .5 * (1 - torch.cos(math.pi * (alpha - levels).clamp(0, 1)))
+                encoded = encoded * weight.repeat_interleave(self.hash_encoder.features)
             if self.edge_conditioned:
                 base_features = self.trunk(encoded[..., :self.coarse_encoded_dimension])
                 detail_features = self.detail_trunk(encoded) # pyright: ignore[reportOptionalCall]

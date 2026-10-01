@@ -26,9 +26,13 @@ class SagittalGuidance(SagittalIntersection):
     [2,3] 毫米包围盒。标注文件采用 MATLAB 一基坐标，在读取时减一。
     """
 
-    def __init__(self, data, reference_path, calibration_path, landmarks_path, margin_mm=10.):
+    def __init__(self, data, reference_path, calibration_path, landmarks_path, margin_mm=10.,
+                 landmark_tolerance_mm=0.):
         if not np.isfinite(margin_mm) or margin_mm <= 0:
             raise ValueError("ROI 外扩距离必须为正的有限毫米数")
+        if not np.isfinite(landmark_tolerance_mm) or landmark_tolerance_mm < 0:
+            raise ValueError("标注容差必须为非负有限毫米数")
+        self.landmark_tolerance_mm = float(landmark_tolerance_mm)
         with h5py.File(reference_path, "r") as handle:
             reference = np.asarray(handle["data_sag"]).T.astype(np.float32) / 255.
         if reference.shape != (708, 944):
@@ -115,7 +119,9 @@ class SagittalGuidance(SagittalIntersection):
         self.metadata.update(
             kind="all-point sagittal field and trajectory guidance", landmarks=str(Path(landmarks_path).resolve()),
             landmarks_sha256=hash_file(landmarks_path), fit_landmark_ids=list(range(1, 12)), diagnostic_landmark_ids=[],
-            landmark_loss="mean vector Huber in estimated mm, delta=1 mm; all 11 points",
+            landmark_loss="mean vector Huber outside reference-location tolerance, delta=1 estimated mm; all 11 points",
+            landmark_tolerance_mm=self.landmark_tolerance_mm,
+            landmark_interpretation="approximate localization references, not exact anatomical ground truth",
             landmark_source_convention="zero-based fractional original frame and row; axial=(row+0.5)*pitch",
             margin_mm=float(margin_mm), roi_definition="all 11 target-point convex hull dilated in mm, intersect true fan",
             reference_mask_definition="detect_ultrasound_sector_mask(data_sag.T / 255), safety_margin_px=2",
@@ -136,6 +142,8 @@ class SagittalGuidance(SagittalIntersection):
 
     def landmark_loss(self, poses):
         distance = torch.linalg.vector_norm(self.landmark_projection(poses) - self.target_landmarks, dim=-1) * self.pitch_mm
+        # 容差内不追逐手工点；容差外保留 Huber 的有界影响，不把参考点当精确真值。
+        distance = (distance - self.landmark_tolerance_mm).clamp_min(0)
         return torch.where(distance <= 1, .5 * distance.square(), distance - .5).mean()
 
     @torch.no_grad()
