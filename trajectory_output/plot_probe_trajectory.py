@@ -400,8 +400,8 @@ def save_combined_animation(trajectories, parameters, output_path, fps):
     half_width = parameters.image_width / (2 * parameters.plot_scale)
     planes = np.array([image_rectangle(trajectories, i, half_width)
                        for i in range(parameters.frames)])
-    # 与参考姿态动画使用相同的探头位置、局部 YZ 平面和局部 X 方向。
-    probe_points = trajectories.probe + rotations[:, :, 0] * parameters.arrow_length
+    # 探头实体中心和箭头起点与蓝色轨迹点重合；方向与尺寸沿用参考姿态。
+    probe_points = trajectories.probe
     rectangles = np.array([
         point + sy * rotation[:, 1] * parameters.rectangle_y / 2
         + sz * rotation[:, 2] * parameters.rectangle_z / 2
