@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation, PillowWriter
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from PIL import Image
 
 
 @dataclass(frozen=True)
@@ -394,8 +395,28 @@ def save_pose_animation(
     plt.close(fig)
 
 
-def save_combined_animation(trajectories, parameters, output_path, fps):
-    """在成像平面轨迹中叠加紫色探头实体及局部方向。"""
+def image_texture_grid(plane: np.ndarray, width: int, height: int) -> np.ndarray:
+    """返回像素网格角点：首行在探头侧，末行在成像深度末端。"""
+    # image_rectangle 的顺序是远左、远右、近右、近左；列方向保持原图左右。
+    u, v = np.meshgrid(np.linspace(0, 1, width + 1), np.linspace(0, 1, height + 1))
+    return (plane[3] + u[..., None] * (plane[2] - plane[3])
+            + v[..., None] * (plane[0] - plane[3]))
+
+
+def save_combined_animation(trajectories, parameters, output_path, fps, coronal_images=None):
+    """在成像平面轨迹中叠加探头姿态，可选逐帧 coronal 原图贴图。"""
+    if coronal_images is not None:
+        coronal_images = coronal_images.resolve()
+        expected_size = (int(parameters.image_width), int(parameters.image_height))
+        for index in range(parameters.frames):
+            path = coronal_images / f"us{index}.jpg"
+            if not path.resolve().is_relative_to(coronal_images):
+                raise ValueError(f"图像路径离开指定数据目录: {path}")
+            with Image.open(path) as source:
+                if source.size != expected_size:
+                    raise ValueError(f"图像尺寸不匹配: {path}, {source.size} != {expected_size}")
+        print(f"Coronal inputs: {coronal_images}, frames={parameters.frames}, size={expected_size}", flush=True)
+        print("Texture: 160x120, full image / 255, top=probe edge, bottom=image-end edge", flush=True)
     rotations = calculate_rotation_matrices(parameters)
     half_width = parameters.image_width / (2 * parameters.plot_scale)
     planes = np.array([image_rectangle(trajectories, i, half_width)
@@ -414,7 +435,8 @@ def save_combined_animation(trajectories, parameters, output_path, fps):
     low, high = points.min(axis=0), points.max(axis=0)
     margin = max(5., .05 * (high - low).max())
     fig = plt.figure(figsize=(8, 7))
-    ax = fig.add_subplot(111, projection="3d")
+    # 贴图放在底层，轨迹和紫色探头标记保持可见。
+    ax = fig.add_subplot(111, projection="3d", computed_zorder=coronal_images is None)
 
     def update(index):
         ax.clear()
@@ -426,8 +448,22 @@ def save_combined_animation(trajectories, parameters, output_path, fps):
             ax.plot(*path[:index + 1].T, color=color, linestyle=style,
                     linewidth=2, label=label)
             ax.scatter(*path[index], color=color, s=35)
-        ax.add_collection3d(Poly3DCollection(
-            [planes[index]], facecolor="#457B9D", edgecolor="#457B9D", alpha=.12))
+        if coronal_images is not None:
+            with Image.open(coronal_images / f"us{index}.jpg") as source:
+                texture = np.asarray(source.convert("RGB").resize(
+                    (160, 120), Image.Resampling.LANCZOS), dtype=np.float32) / 255.0
+            grid = image_texture_grid(planes[index], texture.shape[1], texture.shape[0])
+            ax.plot_surface(*np.moveaxis(grid, -1, 0), facecolors=texture,
+                            rstride=1, cstride=1, shade=False,
+                            linewidth=0, antialiased=False, zorder=0)
+            # 闭合蓝色边框使用相同的四个角点。
+            ax.plot(*np.vstack((planes[index], planes[index, 0])).T,
+                    color="#457B9D", linewidth=1, zorder=2)
+            if index % 40 == 0 or index == parameters.frames - 1:
+                print(f"Rendering coronal frame {index + 1}/{parameters.frames}: us{index}.jpg", flush=True)
+        else:
+            ax.add_collection3d(Poly3DCollection(
+                [planes[index]], facecolor="#457B9D", edgecolor="#457B9D", alpha=.12))
         ax.add_collection3d(Poly3DCollection(
             [rectangles[index]], facecolor="#A020F0", edgecolor="#A020F0", alpha=.5))
         ax.scatter(*probe_points[index], color="#A020F0", s=45, label="probe pose")
@@ -471,6 +507,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=Path("trajectory_output"))
     parser.add_argument("--no-gif", action="store_true", help="Skip GIF generation.")
     parser.add_argument("--combined-only", action="store_true", help="Save only the combined trajectory and pose GIF.")
+    parser.add_argument("--coronal-images", type=Path,
+                        help="Folder containing us0.jpg, us1.jpg, ... for the combined GIF.")
     return parser
 
 
@@ -498,8 +536,9 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.combined_only:
-        path = args.output_dir / "probe_trajectory_with_pose.gif"
-        save_combined_animation(trajectories, parameters, path, args.fps)
+        filename = "probe_trajectory_with_coronal.gif" if args.coronal_images else "probe_trajectory_with_pose.gif"
+        path = args.output_dir / filename
+        save_combined_animation(trajectories, parameters, path, args.fps, args.coronal_images)
         print(f"Saved: {path}")
         return
 
