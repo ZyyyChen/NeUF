@@ -20,9 +20,9 @@ export MPLCONFIGDIR="${TMPDIR:-/tmp}/neuf-probe-trajectory-${PBS_JOBID}/matplotl
 mkdir -p "${EXPERIMENT_LOG_DIR}" "${MPLCONFIGDIR}"
 exec > >(tee "${EXPERIMENT_LOG_DIR}/execution.log") 2>&1
 trap 'status=$?; echo "Exit status: ${status}"; echo "结果目录: ${RESULT_DIR}"; echo "实验日志: ${EXPERIMENT_LOG_DIR}"; echo "qsub日志: ${QSUB_LOG_DIR}"; echo "qsub脚本: ${REPO_DIR}/qsub/neuf/plot_probe_trajectory.sh"; echo "Job ID: ${PBS_JOBID}"' EXIT
-echo "Command: ${PYTHON_BIN} ${RESULT_DIR}/plot_probe_trajectory.py --combined-only --frames 242 --fps 20 --output-dir ${RESULT_DIR}"
+echo "Command: ${PYTHON_BIN} ${RESULT_DIR}/plot_probe_trajectory.py --combined-only --frames 242 --fps 20 --rectangle-y 50 --output-dir ${RESULT_DIR}"
 "${PYTHON_BIN}" -u "${RESULT_DIR}/plot_probe_trajectory.py" \
-  --combined-only --frames 242 --fps 20 --output-dir "${RESULT_DIR}"
+  --combined-only --frames 242 --fps 20 --rectangle-y 50 --output-dir "${RESULT_DIR}"
 
 # 确认静态图可读，动画所有帧完整。
 "${PYTHON_BIN}" - "${RESULT_DIR}" <<'PY'
