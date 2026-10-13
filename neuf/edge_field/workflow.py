@@ -339,6 +339,8 @@ def train_variant(data, output, name, args, *, smoke=False, preview_steps=(), sa
     write_json(output / "run_config" / "comparison_manifest.json", data.metadata)
     start, stamp = time.perf_counter(), timestamp()
     complete, pose_updates, status, pose_grad = 0, 0, "failed", 0.
+    pose_block_size = getattr(args, "pose_block_size", 1)
+    pending_pose_updates = 0
     history, evaluated = [], []
     if guided_roi and not smoke:
         evaluate_guided_sagittal(model, poses, data, sagittal, output, 0, 0.)
@@ -389,6 +391,8 @@ def train_variant(data, output, name, args, *, smoke=False, preview_steps=(), sa
                     config["first_source_batch_sha256"] = tensor_signature((patch["frames"], patch["local"], patch["image"]))
                     write_json(output / "run_config" / "config.json", config)
                 poses.raw.requires_grad_(False)
+                if smoke:
+                    raw_before_field = poses.raw.detach().clone()
                 model.requires_grad_(True)
                 optimizer.zero_grad(set_to_none=True)
                 xyz = poses(patch["frames"], patch["local"])
@@ -491,89 +495,105 @@ def train_variant(data, output, name, args, *, smoke=False, preview_steps=(), sa
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
                 optimizer.step()
+                if smoke:
+                    torch.testing.assert_close(poses.raw, raw_before_field, atol=0, rtol=0)
                 for group in optimizer.param_groups:
                     group["lr"] = args.lr * (1 - .9 * ratio)
                 ready = smoke or (history and np.mean([r["shape"] for r in history[-100:]]) < .8) if response_only else True
                 pose_stage = ((name == "V2" and .2 <= ratio < .7)
                               or (name == "EdgePose" and .35 <= ratio < .7 and ready)
                               or (sweep_mode is not None and .2 <= ratio < (.8 if all_points else .7)))
-                if pose_stage and step % args.pose_every == 0:
+                # 累积原短周期应做的更新，再在场块末尾集中执行，保持两类更新预算。
+                pending_pose_updates += int(pose_stage and step % args.pose_every == 0)
+                pose_end = .8 if all_points else .7
+                stage_finishes = pose_stage and step / max(args.steps - 1, 1) >= pose_end
+                pose_batch = pending_pose_updates if (
+                    step % pose_block_size == 0 or stage_finishes or step == stop_step
+                ) else 0
+                if pose_batch:
                     if device.type == "cuda":
                         torch.cuda.synchronize(device)
                     pose_start = time.perf_counter()
+                    pending_pose_updates = 0
                     model.requires_grad_(False)
-                    poses.raw.requires_grad_(True)
-                    pose_optimizer.zero_grad(set_to_none=True)
-                    pose_patch = data.patches(args.patches, args.patch_size, pose_generator) if response_only or sweep_mode else patch
-                    xyz = poses(pose_patch["frames"], pose_patch["local"])
-                    prediction = model(xyz, frequency_progress).transpose(1, 2).reshape(args.patches, channels, args.patch_size, args.patch_size)
-                    if sweep_mode:
-                        # 冻结网络参数但保留坐标梯度；运动更新同时受场重建和实采交线约束。
-                        pose_photo = (prediction[:, :1] - pose_patch["image"]).abs()[pose_patch["mask"]].mean()
-                        structure = sagittal.loss(poses.matrices(), data.splits["training"], ratio)
-                        prior = poses.prior()
-                        pose_loss = pose_photo + args.sagittal_weight * structure["loss"] + args.sweep_prior_weight * prior
-                        if all_points:
-                            landmarks = sagittal.landmark_loss(poses)
-                            chosen = torch.randperm(len(sagittal.training_indices), generator=pose_generator)[:32].to(device)
-                            frames = sagittal.training_indices[chosen]
-                            dense = sagittal.dense_pose_loss(model, poses, ratio, frame_indices=frames)
-                            pose_loss = pose_loss + args.landmark_weight * landmarks + args.sagittal_dense_weight * dense["loss"]
-                            if pose_updates == 0 or pose_updates % 200 == 0:
-                                lg = float(torch.autograd.grad(landmarks, poses.raw, retain_graph=True)[0].norm())
-                                dg = float(torch.autograd.grad(dense["loss"], poses.raw, retain_graph=True)[0].norm())
-                                pose_metrics.update(landmark_grad=lg, dense_pose_grad=dg)
-                                if smoke and (min(lg, dg) <= 0 or not math.isfinite(lg+dg)):
-                                    raise AssertionError("全点或点间结构项没有轨迹梯度")
-                            pose_metrics.update(landmark_loss=float(landmarks.detach()), dense_pose_loss=float(dense["loss"].detach()))
+                    if smoke:
+                        field_before_pose = [parameter.detach().clone() for parameter in model.parameters()]
+                    for pose_substep in range(pose_batch):
+                        poses.raw.requires_grad_(True)
+                        pose_optimizer.zero_grad(set_to_none=True)
+                        pose_patch = data.patches(args.patches, args.patch_size, pose_generator) if response_only or sweep_mode else patch
+                        xyz = poses(pose_patch["frames"], pose_patch["local"])
+                        prediction = model(xyz, frequency_progress).transpose(1, 2).reshape(args.patches, channels, args.patch_size, args.patch_size)
+                        if sweep_mode:
+                            # 冻结网络参数但保留坐标梯度；运动更新同时受场重建和实采交线约束。
+                            pose_photo = (prediction[:, :1] - pose_patch["image"]).abs()[pose_patch["mask"]].mean()
+                            structure = sagittal.loss(poses.matrices(), data.splits["training"], ratio)
+                            prior = poses.prior()
+                            pose_loss = pose_photo + args.sagittal_weight * structure["loss"] + args.sweep_prior_weight * prior
+                            if all_points:
+                                landmarks = sagittal.landmark_loss(poses)
+                                chosen = torch.randperm(len(sagittal.training_indices), generator=pose_generator)[:32].to(device)
+                                frames = sagittal.training_indices[chosen]
+                                dense = sagittal.dense_pose_loss(model, poses, ratio, frame_indices=frames)
+                                pose_loss = pose_loss + args.landmark_weight * landmarks + args.sagittal_dense_weight * dense["loss"]
+                                if pose_updates == 0 or pose_updates % 200 == 0:
+                                    lg = float(torch.autograd.grad(landmarks, poses.raw, retain_graph=True)[0].norm())
+                                    dg = float(torch.autograd.grad(dense["loss"], poses.raw, retain_graph=True)[0].norm())
+                                    pose_metrics.update(landmark_grad=lg, dense_pose_grad=dg)
+                                    if smoke and (min(lg, dg) <= 0 or not math.isfinite(lg+dg)):
+                                        raise AssertionError("全点或点间结构项没有轨迹梯度")
+                                pose_metrics.update(landmark_loss=float(landmarks.detach()), dense_pose_loss=float(dense["loss"].detach()))
+                                if smoke and pose_updates == 0:
+                                    candidates = sagittal.training_indices
+                                    separation = (data.frame_ids[candidates, None] - sagittal.landmark_frames[None]).abs().amin(-1)
+                                    unmarked = candidates[separation > 5][:16]
+                                    if not len(unmarked):
+                                        raise AssertionError("缺少用于梯度验证的无标注源帧")
+                                    unmarked_loss = sagittal.dense_pose_loss(model, poses, ratio, frame_indices=unmarked)["loss"]
+                                    gradient = torch.autograd.grad(unmarked_loss, poses.raw)[0]
+                                    if not torch.isfinite(gradient).all() or gradient.abs().sum() <= 0:
+                                        raise AssertionError("无标注帧未得到 NeRF 结构梯度")
+                                    write_json(output/"metrics/unmarked_gradient_check.json", dict(
+                                        frames=data.frame_ids[unmarked].tolist(), minimum_landmark_gap_frames=5,
+                                        gradient_norm=float(gradient.norm()), status="PASS; gradient only"))
+                            previous_raw = poses.raw.detach().clone()
                             if smoke and pose_updates == 0:
-                                candidates = sagittal.training_indices
-                                separation = (data.frame_ids[candidates, None] - sagittal.landmark_frames[None]).abs().amin(-1)
-                                unmarked = candidates[separation > 5][:16]
-                                if not len(unmarked):
-                                    raise AssertionError("缺少用于梯度验证的无标注源帧")
-                                unmarked_loss = sagittal.dense_pose_loss(model, poses, ratio, frame_indices=unmarked)["loss"]
-                                gradient = torch.autograd.grad(unmarked_loss, poses.raw)[0]
-                                if not torch.isfinite(gradient).all() or gradient.abs().sum() <= 0:
-                                    raise AssertionError("无标注帧未得到 NeRF 结构梯度")
-                                write_json(output/"metrics/unmarked_gradient_check.json", dict(
-                                    frames=data.frame_ids[unmarked].tolist(), minimum_landmark_gap_frames=5,
-                                    gradient_norm=float(gradient.norm()), status="PASS; gradient only"))
-                        previous_raw = poses.raw.detach().clone()
-                        if smoke and pose_updates == 0:
-                            # 分别确认图像场和独立 sagittal 都能更新轨迹，避免只有先验在反传。
-                            for label, term in (("field_photo", pose_photo), ("sagittal_edge_ncc", structure["edge_ncc"])):
-                                gradient = torch.autograd.grad(term, poses.raw, retain_graph=True)[0]
-                                if not torch.isfinite(gradient).all() or gradient.abs().sum() <= 0:
-                                    raise AssertionError(f"{name}: {label} 未提供有效角度梯度")
-                            print(f"{name}: field and sagittal coordinate gradients PASS", flush=True)
-                        pose_metrics.update(pose_photo=float(pose_photo.detach()),
-                                            sagittal_loss=float(structure["loss"].detach()),
-                                            sagittal_edge_ncc=float(structure["edge_ncc"].detach()),
-                                            sagittal_ssim=float(structure["ssim"].detach()),
-                                            sagittal_coverage=float(structure["coverage"].detach()),
-                                            pose_prior=float(prior.detach()))
-                    elif response_only:
-                        pose_values = response_losses(prediction, pose_patch, ratio, pose_step=True)
-                        pose_loss = pose_values["response"] + .5*pose_values["shape"]
-                    else:
-                        pose_values = losses(prediction, pose_patch, ratio, use_edges=True, pose_step=True)
-                        pose_loss = pose_values["edge"] + .2 * pose_values["gray"]
-                    if not sweep_mode:
-                        pose_loss = pose_loss + .01 * poses.prior(data.splits["training"], data.frame_ids)
-                    if not torch.isfinite(pose_loss):
-                        raise FloatingPointError(f"{name} step {step}: non-finite pose loss")
-                    pose_loss.backward()
-                    pose_grad = float(torch.nn.utils.clip_grad_norm_([poses.raw], 1., error_if_nonfinite=True))
-                    pose_optimizer.step()
-                    if sweep_mode:
-                        movement = poses.limit_update_(previous_raw, max_angle_step_deg=args.sweep_max_step_deg,
-                                                       max_angle_offset_deg=args.sweep_max_offset_deg)
-                        pose_metrics.update(angle_step_max_deg=movement["actual_angle_step_max_deg"],
-                                            angle_step_rms_deg=movement["actual_angle_step_rms_deg"])
-                    pose_updates += 1
-                    if device.type == "cuda":
-                        torch.cuda.synchronize(device)
+                                # 分别确认图像场和独立 sagittal 都能更新轨迹，避免只有先验在反传。
+                                for label, term in (("field_photo", pose_photo), ("sagittal_edge_ncc", structure["edge_ncc"])):
+                                    gradient = torch.autograd.grad(term, poses.raw, retain_graph=True)[0]
+                                    if not torch.isfinite(gradient).all() or gradient.abs().sum() <= 0:
+                                        raise AssertionError(f"{name}: {label} 未提供有效角度梯度")
+                                print(f"{name}: field and sagittal coordinate gradients PASS", flush=True)
+                            pose_metrics.update(pose_photo=float(pose_photo.detach()),
+                                                sagittal_loss=float(structure["loss"].detach()),
+                                                sagittal_edge_ncc=float(structure["edge_ncc"].detach()),
+                                                sagittal_ssim=float(structure["ssim"].detach()),
+                                                sagittal_coverage=float(structure["coverage"].detach()),
+                                                pose_prior=float(prior.detach()))
+                        elif response_only:
+                            pose_values = response_losses(prediction, pose_patch, ratio, pose_step=True)
+                            pose_loss = pose_values["response"] + .5*pose_values["shape"]
+                        else:
+                            pose_values = losses(prediction, pose_patch, ratio, use_edges=True, pose_step=True)
+                            pose_loss = pose_values["edge"] + .2 * pose_values["gray"]
+                        if not sweep_mode:
+                            pose_loss = pose_loss + .01 * poses.prior(data.splits["training"], data.frame_ids)
+                        if not torch.isfinite(pose_loss):
+                            raise FloatingPointError(f"{name} step {step}: non-finite pose loss")
+                        pose_loss.backward()
+                        pose_grad = float(torch.nn.utils.clip_grad_norm_([poses.raw], 1., error_if_nonfinite=True))
+                        pose_optimizer.step()
+                        if sweep_mode:
+                            movement = poses.limit_update_(previous_raw, max_angle_step_deg=args.sweep_max_step_deg,
+                                                           max_angle_offset_deg=args.sweep_max_offset_deg)
+                            pose_metrics.update(angle_step_max_deg=movement["actual_angle_step_max_deg"],
+                                                angle_step_rms_deg=movement["actual_angle_step_rms_deg"])
+                        pose_updates += 1
+                        if device.type == "cuda":
+                            torch.cuda.synchronize(device)
+                    if smoke:
+                        for parameter, before in zip(model.parameters(), field_before_pose):
+                            torch.testing.assert_close(parameter, before, atol=0, rtol=0)
                     pose_seconds = time.perf_counter() - pose_start
                 if device.type == "cuda":
                     torch.cuda.synchronize()
@@ -882,6 +902,8 @@ def parser():
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--pose-lr", type=float, default=2e-3)
     parser.add_argument("--pose-every", type=int, default=5)
+    parser.add_argument("--pose-block-size", type=int, default=1,
+                        help="每个场更新块结束后集中执行累计轨迹更新；1保留原短周期")
     parser.add_argument("--sagittal-reference", type=Path,
                         default=root/"data/cerebral_data/Pre_traitement_echo_v2/Repositionnement/Patient0/data_repos_Patient0_J35_2_sag.mat")
     parser.add_argument("--sagittal-calibration", type=Path,
@@ -984,6 +1006,9 @@ def main():
     response_only = all(name in ("EdgeFixed", "EdgePose") for name in args.variants)
     sweep_experiment = any(name in SWEEP_VARIANTS for name in args.variants)
     all_points = any(name in SAGITTAL_FIELD_VARIANTS for name in args.variants)
+    if args.pose_block_size < 1 or (args.pose_block_size != 1 and (
+            not all_points or args.pose_block_size % args.pose_every)):
+        raise ValueError("分块更新仅用于全点sagittal模式，块长须为pose-every的正整数倍")
     if all_points:
         if not args.sagittal_three_way and (len(args.variants) != 1 or args.variants[0] not in SAGITTAL_FIELD_VARIANTS):
             raise ValueError("全点 sagittal 模式单独运行，旧 NeRF 由已保存的 checkpoint 统一评价")
