@@ -157,6 +157,7 @@ class SagittalIntersection:
         if len(sigmas_mm) != 2 or min(sigmas_mm) <= 0 or not 0 <= column < data.width:
             raise ValueError("要求两个正的物理平滑尺度和有效源图列号")
         device, dtype = data.initial.device, data.initial.dtype
+        self.pose = None
         tensor = lambda value: torch.as_tensor(value, device=device, dtype=dtype)
         with h5py.File(reference_path, "r") as handle:
             reference = np.asarray(handle["data_sag"]).T.astype(np.float32) / 255.
@@ -256,8 +257,78 @@ class SagittalIntersection:
         derivative = (profile[..., 2:] - profile[..., :-2]) / (2 * self.sample_spacing_mm)
         return F.pad(derivative.abs(), (1, 1), mode="replicate")
 
+    def enable_pose(self, pose, data):
+        """为可移动交线缓存两种相同毫米尺度的二维实测图，不缓存固定列。"""
+        self.pose = pose
+        origin = data.local[0, 0, :2]
+        axes = torch.stack((data.local[0, 1, :2]-origin, data.local[1, 0, :2]-origin))
+        self.source_origin, self.source_inverse = origin, torch.linalg.inv(axes)
+        self.source_pixel_spacing = axes.norm(dim=-1)
+        self.source_maximum = origin.new_tensor([data.width-1, data.height-1])
+        images = data.images.detach().cpu().numpy()
+        self.source_features = torch.stack([
+            torch.as_tensor(gaussian_filter(images, (0, sigma/data.spacing[0], sigma/data.spacing[1]),
+                                           mode="nearest"), device=origin.device, dtype=origin.dtype)
+            for sigma in self.sigmas_mm], 1)
+        radii = [int(np.ceil(4*max(self.sigmas_mm)/pitch)) + 2 for pitch in data.spacing]
+        safe = minimum_filter(data.mask.cpu().numpy(), size=tuple(2*r+1 for r in radii),
+                              mode="constant", cval=0)
+        self.source_valid = torch.as_tensor(safe, device=origin.device, dtype=origin.dtype)[None, None]
+        self.source_distance = torch.as_tensor(distance_transform_edt(~safe, sampling=data.spacing),
+                                               device=origin.device, dtype=origin.dtype)[None, None]
+
+    def intersection(self, matrices, frame_indices=None, *, depths=None):
+        """当前两个物理平面的真实交线；固定 axial 采样，求解 lateral 坐标。
+
+        近乎平行时返回有限坐标和退化标记，由覆盖惩罚处理，禁止除以零。
+        """
+        indices = torch.arange(len(self.frame_ids), device=matrices.device) if frame_indices is None else frame_indices
+        coronal, sag = matrices[indices], self.pose.matrix()
+        depths = self.depth_mm if depths is None else depths
+        normal = sag[:3, 2]
+        numerator = ((coronal[:, :3, 3]-sag[:3, 3])*normal).sum(-1)[:, None]
+        numerator = numerator + (coronal[:, :3, 0]*normal).sum(-1)[:, None]*depths
+        denominator = (coronal[:, :3, 1]*normal).sum(-1)
+        singular = denominator.abs() < 1e-4
+        safe = torch.where(denominator >= 0, denominator.clamp_min(1e-4), denominator.clamp_max(-1e-4))
+        lateral = -numerator/safe[:, None]
+        local = torch.stack((depths.expand_as(lateral), lateral, torch.zeros_like(lateral)), -1)
+        world = local @ coronal[:, :3, :3].transpose(-1, -2) + coronal[:, None, :3, 3]
+        xy, _ = self.pose.native(world)
+        source_xy = (local[..., :2]-self.source_origin) @ self.source_inverse
+        return dict(world=world, xy=xy, source_xy=source_xy, singular=singular, indices=indices,
+                    spacing_mm=local.diff(dim=1).norm(dim=-1).mean(-1))
+
+    def sample_moving(self, matrices, frame_indices=None):
+        line = self.intersection(matrices, frame_indices)
+        xy, source_xy, indices = line["xy"], line["source_xy"], line["indices"]
+        grid = (2*xy/self.maximum_xy-1)[None]
+        sampled = F.grid_sample(self.features, grid, padding_mode="border", align_corners=True)[0]
+        source_grid = (2*source_xy/self.source_maximum-1)[:, None]
+        source = F.grid_sample(self.source_features[indices], source_grid, padding_mode="border",
+                               align_corners=True)[:, :, 0].permute(1, 0, 2)
+        count = len(indices)
+        valid = F.grid_sample(self.source_valid.expand(count, -1, -1, -1), source_grid,
+                              padding_mode="border", align_corners=True)[:, 0, 0]
+        distance = F.grid_sample(self.source_distance.expand(count, -1, -1, -1), source_grid,
+                                 padding_mode="border", align_corners=True)[:, 0, 0]
+        overflow = (torch.relu(-xy)+torch.relu(xy-self.maximum_xy)).sum(-1)*self.pitch_mm
+        source_overflow = ((torch.relu(-source_xy)+torch.relu(source_xy-self.source_maximum))
+                           * self.source_pixel_spacing).sum(-1)
+        valid = valid*sampled[2]*(overflow == 0)*(source_overflow == 0)*(~line["singular"][:, None])
+        valid = torch.minimum(valid, torch.minimum(torch.roll(valid, 1, -1), torch.roll(valid, -1, -1)))
+        # 实际交线间距同时用于两侧导数，倾斜后仍使用相同的 1/mm 单位。
+        def response(profile):
+            derivative = (profile[..., 2:]-profile[..., :-2])/(2*line["spacing_mm"][None, :, None])
+            return F.pad(derivative.abs(), (1, 1), mode="replicate")
+        return dict(gray=sampled[:2], edge=response(sampled[:2]), source_gray=source,
+                    source_edge=response(source), valid=valid, xy=xy,
+                    distance_mm=sampled[3]+distance+overflow+source_overflow+line["singular"][:, None]*100.)
+
     def sample(self, matrices, frame_indices=None):
         """matrices 始终为全部帧的 [N,4,4] 可微位姿；像素坐标顺序为 (列,行)。"""
+        if self.pose is not None:
+            return self.sample_moving(matrices, frame_indices)
         indices = torch.arange(len(self.frame_ids), device=matrices.device) if frame_indices is None else frame_indices
         poses = matrices[indices]
         world = self.local[None] @ poses[:, :3, :3].transpose(-1, -2) + poses[:, None, :3, 3]
@@ -275,8 +346,8 @@ class SagittalIntersection:
         stage = 0 if progress < .5 else 1
         sample = self.sample(matrices, indices)
         result = sagittal_profile_losses(
-            self.source_gray[stage, indices], sample["gray"][stage],
-            self.source_edge[stage, indices], sample["edge"][stage], windows=self.windows,
+            sample["source_gray"][stage] if self.pose is not None else self.source_gray[stage, indices], sample["gray"][stage],
+            sample["source_edge"][stage] if self.pose is not None else self.source_edge[stage, indices], sample["edge"][stage], windows=self.windows,
             window_weight=self.window_weight[indices], support=self.support[indices],
             valid=sample["valid"], distance_mm=sample["distance_mm"],
             minimum_variance=self.minimum_variance[stage, indices],
@@ -297,8 +368,8 @@ class SagittalIntersection:
         indices = torch.arange(len(self.frame_ids), device=matrices.device)
         result, sample, stage = self._components(matrices, indices, progress)
         result.update(frame_ids=self.frame_ids, depth_mm=self.depth_mm, xy=sample["xy"],
-                      source_profile=self.source_gray[stage], reference_profile=sample["gray"][stage],
-                      source_edge=self.source_edge[stage], reference_edge=sample["edge"][stage],
+                      source_profile=sample["source_gray"][stage] if self.pose is not None else self.source_gray[stage], reference_profile=sample["gray"][stage],
+                      source_edge=sample["source_edge"][stage] if self.pose is not None else self.source_edge[stage], reference_edge=sample["edge"][stage],
                       fixed_support=self.support, window_count=self.window_count)
         for key in ("loss", "edge_ncc", "ssim", "coverage"):
             result[key] = result[key].masked_fill(self.window_count == 0, float("nan"))

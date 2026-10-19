@@ -507,6 +507,138 @@ def run_frozen_smoke(dataset_path: Path, output_dir: Path, teacher_path: Path) -
     return result
 
 
+def run_sagittal_pose_smoke(output_dir: Path, *, baseline=False) -> dict:
+    """同一合成三维场上的最小训练检查；不读取患者数据，不评价医学重建质量。"""
+    import h5py
+    from scipy.io import savemat
+    from scipy.spatial.transform import Rotation
+    from neuf.edge_field.data import EdgeData, write_json
+    from neuf.edge_field.sagittal_guidance import SagittalGuidance
+    from neuf.edge_field.sweep_geometry import load_sweep
+    from neuf.edge_field.workflow import defaults, train_variant, tensor_signature
+
+    torch.manual_seed(3407)
+    device = DEVICE
+    config_dir = output_dir/"run_config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    pitch, count, height, width = .131204, 12, 708, 944
+    rows, cols = np.mgrid[:height, :width]
+    local = np.stack(((rows+.5)*pitch, (cols-477)*pitch-.659604, np.zeros_like(rows)), -1).astype(np.float32)
+    angles = np.linspace(-.4, .4, count)
+    matrices = np.tile(np.eye(4, dtype=np.float32), (count, 1, 1))
+    matrices[:, :3, 0] = np.stack((np.zeros(count), np.sin(angles), -np.cos(angles)), -1)
+    matrices[:, :3, 1] = [1, 0, 0]
+    matrices[:, :3, 2] = np.cross(matrices[:, :3, 0], matrices[:, :3, 1])
+    matrices[:, :3, 3] = np.array([0, 0, 70])+28.1915615*pitch*matrices[:, :3, 0]
+
+    def field(xyz):
+        x, y, z = np.moveaxis(xyz, -1, 0)
+        return .5+.15*np.sin(.4*z)+.15*np.cos(.3*y)+.08*np.sin(.6*x+.2*y-.1*z)
+
+    images = np.stack([field(local @ matrix[:3, :3].T+matrix[:3, 3]) for matrix in matrices]).astype(np.float32)
+    linear = np.diag([1/pitch, -1/pitch]).astype(np.float32)
+    offset = np.array([472, 70/pitch], dtype=np.float32)
+    native = np.stack((cols, rows), -1)
+    initial_world = np.concatenate((np.full((*rows.shape, 1), -.659604), (native-offset) @ np.linalg.inv(linear)), -1)
+    center = initial_world.mean((0, 1))
+    true_rotation = Rotation.from_rotvec([.005, -.004, .003]).as_matrix()
+    true_shift = np.array([.3, -.2, .15])
+    measured_world = (initial_world-center) @ true_rotation.T+center+true_shift
+    fan = (np.abs(cols-472) < .48*(rows+20)) & (rows > 30) & (rows < 660)
+    reference = np.where(fan, np.rint(255*field(measured_world)), 0).astype(np.uint8)
+    with h5py.File(config_dir/"reference.mat", "w") as handle:
+        handle.create_dataset("data_sag", data=reference.T)
+    np.savez(config_dir/"calibration.npz", linear=linear, offset=offset)
+    frame_ids = np.arange(count)*10
+    frame = np.linspace(1, count-2, 11)*10
+    depth = np.array([180, 300, 450, 220, 510, 350, 550, 260, 470, 330, 190])
+    theta = np.interp(frame, frame_ids, angles)
+    axis = np.stack((np.zeros(11), np.sin(theta), -np.cos(theta)), -1)
+    points = np.array([-.659604, 0, 70])+(depth[:, None]+.5+28.1915615)*pitch*axis
+    target = (((points-center-true_shift) @ true_rotation+center)[:, 1:] @ linear+offset)
+    savemat(config_dir/"landmarks.mat", dict(coord_pts_img_seqdyn=np.stack((frame, depth), -1)+1,
+                                            coord_pts_img_ref=target+1))
+    # 仅绕过未修改的患者文件读取，训练采样、引导构造、梯度和保存均走正式实现。
+    data = EdgeData.__new__(EdgeData)
+    tensor = lambda value: torch.as_tensor(value, device=device)
+    data.local, data.images, data.initial = tensor(local), tensor(images), tensor(matrices)
+    data.height, data.width, data.spacing = height, width, (pitch, pitch)
+    data.frame_ids = tensor(frame_ids)
+    data.splits = {name: tensor(np.array(indices, dtype=np.int64)) for name, indices in
+                   dict(training=[0, 1, 3, 4, 6, 7, 9, 11], validation=[2, 5], test=[8, 10]).items()}
+    data.mask = tensor((rows > 35) & (rows < 670) & (cols > 35) & (cols < 910))
+    data.interior = tensor((rows > 70) & (rows < 640) & (cols > 70) & (cols < 875))
+    data.valid_centers = torch.nonzero(data.interior).cpu()
+    data.edges = torch.zeros_like(data.images)
+    data.edge_centers = [data.valid_centers]*count
+    data.bounds = tensor(np.array([[-80, -80, -30], [80, 80, 100]], dtype=np.float32))
+    data.metadata = dict(synthetic=True, seed=3407, quality="not evaluated",
+        source_sha256=tensor_signature((data.images, data.initial, data.local)),
+        splits={name: indices.cpu().tolist() for name, indices in data.splits.items()})
+    guidance = SagittalGuidance(data, config_dir/"reference.mat", config_dir/"calibration.npz",
+                                config_dir/"landmarks.mat")
+    # 新旧模型固定相同的世界包围盒、源图批次、初始化和 INR 更新预算。
+    guidance.field_bounds = data.bounds
+    geometry = None
+    if not baseline:
+        from neuf.edge_field.sweep_geometry import SagittalPoseRefiner, load_sagittal_pose
+        pose = SagittalPoseRefiner(tensor(linear).double(), tensor(offset).double(), -.659604,
+                                   (height, width)).to(device)
+        xy = tensor(np.array([[400., 220.], [530., 260.], [460., 510.]])).double()
+        world = pose.world(xy)
+        expected_yz = (xy-tensor(offset).double()) @ torch.linalg.inv(tensor(linear).double())
+        torch.testing.assert_close(world[:, 1:], expected_yz)
+        torch.testing.assert_close(pose.native(world)[0], xy)
+        jacobian = torch.stack([torch.autograd.grad(value, pose.raw, retain_graph=True)[0]
+                                for value in world.reshape(-1)])
+        assert int(torch.linalg.matrix_rank(jacobian)) == 6
+        numeric = []
+        for axis_index in range(6):
+            with torch.no_grad():
+                pose.raw[axis_index] = 1e-5
+                plus = pose.world(xy).clone()
+                pose.raw[axis_index] = -1e-5
+                minus = pose.world(xy).clone()
+                pose.raw.zero_()
+            numeric.append(((plus-minus)/2e-5).reshape(-1))
+        torch.testing.assert_close(jacobian, torch.stack(numeric, -1), atol=1e-7, rtol=1e-5)
+        with torch.no_grad():
+            guidance.pose.raw.copy_(tensor(np.array([.1, -.1, .05, .1, -.05, .08], dtype=np.float32)))
+        line = guidance.intersection(data.initial)
+        torch.testing.assert_close(guidance.pose.native(line["world"])[1], torch.zeros_like(line["xy"][..., 0]), atol=2e-5, rtol=0)
+        cor_local = (line["world"]-data.initial[:, None, :3, 3]) @ data.initial[:, :3, :3]
+        torch.testing.assert_close(cor_local[..., 2], torch.zeros_like(cor_local[..., 2]), atol=2e-5, rtol=0)
+        with torch.no_grad():
+            guidance.pose.raw.zero_()
+        geometry = dict(six_dof_jacobian_rank=6, finite_difference=True, tilted_intersection=True,
+                        old_checkpoint_zero_correction=load_sagittal_pose({}) is None)
+    args = defaults()
+    args.steps, args.patches, args.patch_size, args.pose_every = 40, 4, 64, 5
+    args.encoding, args.width, args.hash_levels, args.coarse_hash_levels = "hash", 32, 4, 2
+    args.log2_hashmap_size, args.hash_base_resolution, args.hash_finest_resolution = 10, 4, 32
+    args.sagittal_patches, args.sagittal_three_way = 2, False
+    result = train_variant(data, output_dir, "HashSagittalAllPoints", args, smoke=True, sagittal=guidance)
+    milestones = []
+    for step in (20, 30, 40):
+        path = output_dir/"checkpoints"/f"step_{step:06d}.pt"
+        saved = torch.load(path, map_location="cpu", weights_only=False)
+        assert saved["completed_steps"] == step and saved["optimizer_states"] and saved["generator_states"]
+        torch.testing.assert_close(load_sweep(saved).matrices().detach(), saved["corrected_poses"].cpu())
+        if not baseline:
+            torch.testing.assert_close(load_sagittal_pose(saved).matrix(), saved["corrected_sagittal_pose"].cpu())
+        milestones.append(str(path))
+    if not baseline:
+        frozen = torch.load(output_dir/"checkpoints/step_000030.pt", map_location="cpu", weights_only=False)
+        torch.testing.assert_close(frozen["poses"]["raw"], saved["poses"]["raw"], atol=0, rtol=0)
+        torch.testing.assert_close(frozen["sagittal_pose"]["raw"], saved["sagittal_pose"]["raw"], atol=0, rtol=0)
+        geometry["final_geometry_frozen"] = True
+        geometry["sagittal_correction_mm_rad"] = load_sagittal_pose(saved).corrections().detach().tolist()
+    result.update(geometry=geometry, retained_checkpoints=milestones, data=data.metadata,
+                  quality="not evaluated; synthetic implementation comparison only")
+    write_json(output_dir/"metrics/sagittal_pose_smoke.json", result)
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="One lightweight Phase 1 smoke run")
     parser.add_argument(
@@ -522,8 +654,12 @@ def main() -> None:
     parser.add_argument("--teacher-checkpoint", type=Path, help="验证冻结 Neural STV 三分量训练与独立推理；省略时保留 E2 smoke")
     parser.add_argument("--edge-teacher", type=Path, help="验证传统 NLSTV response 的 V0–V2 路径")
     parser.add_argument("--edge-source-images", type=Path, help="teacher 对应的原始 uint8 images.npy")
+    parser.add_argument("--sagittal-pose-smoke", action="store_true", help="合成三维场上检查 sag 六自由度与梯度隔离")
+    parser.add_argument("--sagittal-pose-baseline", action="store_true", help="由 qsub 用修改前源代码运行同条件对照")
     args = parser.parse_args()
-    if args.edge_teacher is not None:
+    if args.sagittal_pose_smoke:
+        result = run_sagittal_pose_smoke(args.output_dir, baseline=args.sagittal_pose_baseline)
+    elif args.edge_teacher is not None:
         if args.teacher_checkpoint is not None or args.edge_source_images is None:
             parser.error("--edge-teacher 需要 --edge-source-images，且不能同时指定 neural teacher")
         from neuf.edge_field.workflow import run_smoke as run_edge_smoke

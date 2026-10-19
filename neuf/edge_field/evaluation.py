@@ -1058,7 +1058,24 @@ def _guided_numpy(value):
 
 
 def _guided_reslice(data, matrices, guidance, xyz):
-    """只用同一 training split、原始分辨率及固定列；不借用留出帧填洞。"""
+    """只用 training split 的原始图像与当前交线，不借用留出帧填洞。"""
+    if getattr(guidance, "pose", None) is not None:
+        selected = data.splits["training"]
+        matrices = torch.as_tensor(matrices, device=data.initial.device, dtype=data.initial.dtype)
+        with torch.no_grad():
+            line = guidance.intersection(matrices, selected, depths=data.local[:, 0, 0])
+            grid = (2*line["source_xy"]/guidance.source_maximum-1)[:, None]
+            values = torch.nn.functional.grid_sample(data.images[selected, None], grid,
+                        padding_mode="border", align_corners=True)[:, 0, 0]
+            mask = torch.nn.functional.grid_sample(data.mask[None, None].float().expand(len(selected), -1, -1, -1),
+                        grid, align_corners=True)[:, 0, 0] > .999
+            mask &= ((grid[:, 0] >= -1) & (grid[:, 0] <= 1)).all(-1) & ~line["singular"][:, None]
+            points = _guided_numpy(line["xy"][mask])
+            query_xy = _guided_numpy(guidance.native_grid)
+            result = (griddata(points, _guided_numpy(values[mask]), query_xy, method="linear")
+                      if len(points) >= 3 and np.linalg.matrix_rank(points-points.mean(0)) == 2
+                      else np.full(query_xy.shape[:-1], np.nan))
+        return result.astype(np.float32), np.isfinite(result)
     selected = _guided_numpy(data.splits["training"])
     column = guidance.column
     valid = _guided_numpy(data.mask)[:, column].astype(bool)
@@ -1261,7 +1278,15 @@ def evaluate_guided_sagittal(model, poses, data, guidance, output, step, progres
     reference_mask = _guided_numpy(guidance.reference_mask).astype(bool)
     pitch = float(guidance.pitch_mm)
     if not hasattr(guidance, "_guided_evaluation_support"):
-        _, initial_support = _guided_reslice(data, data.initial, guidance, xyz)
+        # 主评价域始终来自初始几何，不能因优化后覆盖缩小而改变分母。
+        saved_raw = guidance.pose.raw.detach().clone()
+        with torch.no_grad():
+            guidance.pose.raw.zero_()
+        try:
+            _, initial_support = _guided_reslice(data, data.initial, guidance, _guided_numpy(guidance.initial_xyz_grid))
+        finally:
+            with torch.no_grad():
+                guidance.pose.raw.copy_(saved_raw)
         fixed = initial_support & reference_mask
         if not (roi & _guided_safe_support(fixed, pitch)).any():
             raise ValueError("固定初始训练支持与标注 ROI 没有足够的滤波上下文")
@@ -1309,6 +1334,8 @@ def evaluate_guided_sagittal(model, poses, data, guidance, output, step, progres
     np.savez_compressed(prediction_path, gray=gray, reference=reference, fixed_support=fixed,
                         current_support=current, source_support=source_support, reference_mask=reference_mask,
                         roi=roi, core_roi=core, xyz_grid=xyz, training_frame_ids=frame_ids,
+                        initial_xyz_grid=_guided_numpy(guidance.initial_xyz_grid),
+                        sagittal_pose=_guided_numpy(guidance.pose.matrix()),
                         pitch_mm=pitch, step=int(step), edge_thresholds=thresholds,
                         model_bounds=np.asarray([]) if model_bounds is None else model_bounds)
     primary = next(row for row in rows if row["region"] == "all" and row["scale"] == "smooth_0p5mm")
@@ -1322,7 +1349,10 @@ def evaluate_guided_sagittal(model, poses, data, guidance, output, step, progres
         write_csv(output / "metrics" / f"landmarks_step_{step:06d}.csv", landmarks)
     write_json(output / "metrics" / f"{basename}.json", summary)
     manifest = dict(guidance=guidance.metadata, training_frame_ids=frame_ids.tolist(),
-                    source_image_shape=list(data.images.shape[1:]), source_column=int(guidance.column),
+                    source_image_shape=list(data.images.shape[1:]),
+                    source_sampling="bilinear samples on current 3D plane intersections",
+                    sagittal_pose=_guided_numpy(guidance.pose.matrix()).tolist(),
+                    initial_sagittal_pose=_guided_numpy(guidance.pose.initial).tolist(),
                     fixed_support="finite initial training-frame linear griddata AND physical reference sector; independent of field bounds",
                     current_support="finite corrected training-frame griddata AND physical reference sector AND field bounds (for NeRF)",
                     main_domain="ROI intersect eroded fixed support; ROI itself is not eroded; same denominator for all methods",
@@ -1341,6 +1371,24 @@ def evaluate_guided_sagittal(model, poses, data, guidance, output, step, progres
     for crop, suffix in ((False, "full"), (True, "roi")):
         _guided_plot({output.name: gray}, reference, fixed, {output.name: current}, roi, core, pitch, thresholds,
                      plot_dir / f"guided_sagittal_{suffix}.png", crop=crop)
+    if model is not None and not raw_only:
+        # 同时提供固定世界平面的查询，区分重建变化和参考平面的重新定位。
+        initial_xyz = _guided_numpy(guidance.initial_xyz_grid)
+        inside = ((initial_xyz >= model_bounds[0]) & (initial_xyz <= model_bounds[1])).all(-1)
+        fixed_gray = np.zeros_like(reference)
+        if inside.any():
+            fixed_gray[inside] = query(model, torch.as_tensor(initial_xyz[inside], device=data.initial.device,
+                                                        dtype=data.initial.dtype), progress)[..., 0]
+        np.savez_compressed(output/"predictions"/f"fixed_world_sagittal_step_{step:06d}.npz",
+                            gray=fixed_gray, xyz_grid=initial_xyz, support=inside)
+        figure, axes = plt.subplots(1, 3, figsize=(15, 5), layout="constrained")
+        for axis, panel, label in zip(axes, (reference, gray, fixed_gray),
+                ("Measured reference", "Current 6DoF sagittal plane", "Fixed initial world plane")):
+            axis.imshow(panel, cmap="gray", vmin=0, vmax=1)
+            axis.set_title(label)
+            axis.axis("off")
+        figure.savefig(plot_dir/"sagittal_current_and_fixed_world.png", dpi=130)
+        plt.close(figure)
     return summary
 
 
@@ -1357,11 +1405,16 @@ def compare_guided_sagittal(paths, output):
             records[name] = {key: saved[key].copy() for key in saved.files}
     first = next(iter(records.values()))
     for name, record in records.items():
-        for key in ("reference", "fixed_support", "roi", "core_roi", "xyz_grid", "training_frame_ids", "pitch_mm", "edge_thresholds"):
+        for key in ("reference", "roi", "core_roi", "training_frame_ids", "pitch_mm"):
             if not np.array_equal(record[key], first[key]):
                 raise ValueError(f"统一 sagittal 比较的固定输入不一致: {name}, {key}")
+        np.testing.assert_allclose(record.get("initial_xyz_grid", record["xyz_grid"]),
+                                   first.get("initial_xyz_grid", first["xyz_grid"]), atol=2e-5, rtol=1e-6)
     reference, fixed, roi, core = (first[key] for key in ("reference", "fixed_support", "roi", "core_roi"))
-    pitch, thresholds = float(first["pitch_mm"]), first["edge_thresholds"]
+    # 旧固定列与新交线插值的边界数值可能相差一个像素；主域取各自初始支持的交集。
+    fixed = np.logical_and.reduce([record["fixed_support"] for record in records.values()])
+    pitch = float(first["pitch_mm"])
+    thresholds = _guided_edge_thresholds(reference, fixed, roi, pitch)
     common = fixed & np.logical_and.reduce([record["current_support"] for record in records.values()])
     rows = []
     for name, record in records.items():
@@ -1375,7 +1428,7 @@ def compare_guided_sagittal(paths, output):
     summary = dict(rows=rows, primary_rows=primary, inputs={name: str(path) for name, path in paths.items()},
                    common_support_pixels=int((common & roi).sum()),
                    quality_diagnostics=_GUIDED_QUALITY_DEFINITIONS,
-                   interpretation="fixed rows use identical initial support; shared-support rows are auxiliary; all sagittal metrics measure supervised fit",
+                   interpretation="fixed rows use intersection of initial supports and reference-only common thresholds; current-support rows are auxiliary; supervised fit only",
                    quality_claim="尚未验证；统一固定域图像、边缘重合/距离、清晰度、灰度保真和覆盖率需共同审查；平坦区高频降低不能单独证明降噪成功")
     write_json(output / "metrics" / "guided_sagittal_comparison.json", summary)
     np.savez_compressed(output / "predictions" / "guided_sagittal_support.npz", fixed_support=fixed,

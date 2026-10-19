@@ -7,6 +7,90 @@ import math
 import torch
 from torch import nn
 
+from .model import se3_exp
+
+
+class SagittalPoseRefiner(nn.Module):
+    """原生 (列,行) 像素与三维世界坐标间的刚体标定；像素间距固定。
+
+    修正围绕参考图中心进行，前三个参数控制中心平移，后三个为旋转向量。
+    raw 为无量纲参数；幅度和单次更新均按三维向量范数约束。
+    """
+
+    def __init__(self, linear, offset, world_x_mm, shape, *, translation_mm=2., rotation_deg=3.):
+        super().__init__()
+        linear = torch.as_tensor(linear)
+        offset = torch.as_tensor(offset, dtype=linear.dtype, device=linear.device)
+        if linear.shape != (2, 2) or offset.shape != (2,):
+            raise ValueError("sag 标定要求 linear=[2,2]、offset=[2]")
+        if any(not math.isfinite(float(v)) or v <= 0 for v in (translation_mm, rotation_deg)):
+            raise ValueError("sag 位姿幅度必须为正的有限值")
+        pitch = 1 / torch.linalg.vector_norm(linear[0])
+        torch.testing.assert_close(linear @ linear.T, torch.eye(2, device=linear.device,
+                                   dtype=linear.dtype) / pitch.square(), rtol=1e-5, atol=1e-6)
+        center = linear.new_tensor([(shape[1]-1)/2, (shape[0]-1)/2])
+        basis = torch.cat((linear.new_zeros(1, 2), torch.linalg.inv(linear).T / pitch), 0)
+        rotation = torch.cat((basis, torch.linalg.cross(basis[:, 0], basis[:, 1])[:, None]), -1)
+        initial = torch.eye(4, device=linear.device, dtype=linear.dtype)
+        initial[:3, :3] = rotation
+        initial[:3, 3] = torch.cat((linear.new_tensor([world_x_mm]), (center-offset) @ torch.linalg.inv(linear)))
+        for name, value in dict(initial=initial, pixel_center=center, pitch=pitch,
+                                calibration_linear=linear, calibration_offset=offset,
+                                native_shape=linear.new_tensor(shape),
+                                limits=linear.new_tensor([translation_mm]*3 + [math.radians(rotation_deg)]*3)).items():
+            self.register_buffer(name, value.detach().clone())
+        self.raw = nn.Parameter(linear.new_zeros(6))
+
+    def corrections(self):
+        return self.raw * self.limits
+
+    def matrix(self):
+        delta = self.corrections()
+        result = self.initial.clone()
+        result[:3, :3] = se3_exp(delta)[:3, :3] @ self.initial[:3, :3]
+        result[:3, 3] = self.initial[:3, 3] + delta[:3]
+        return result
+
+    def world(self, xy, *, initial=False):
+        matrix = self.initial if initial else self.matrix()
+        local = torch.cat(((xy-self.pixel_center)*self.pitch, torch.zeros_like(xy[..., :1])), -1)
+        return local @ matrix[:3, :3].T + matrix[:3, 3]
+
+    def native(self, world):
+        matrix = self.matrix()
+        local = (world-matrix[:3, 3]) @ matrix[:3, :3]
+        return local[..., :2] / self.pitch + self.pixel_center, local[..., 2]
+
+    def prior(self):
+        return self.raw.square().mean()
+
+    @torch.no_grad()
+    def limit_update_(self, previous_raw, *, translation_step_mm=.02, rotation_step_deg=.02):
+        previous, proposed = previous_raw*self.limits, self.corrections()
+        change = proposed-previous
+        fraction = torch.stack((change.new_tensor(1.),
+                    translation_step_mm/change[:3].norm().clamp_min(1e-12),
+                    math.radians(rotation_step_deg)/change[3:].norm().clamp_min(1e-12))).amin()
+        accepted = previous + fraction*change
+        for part, limit in ((slice(0, 3), self.limits[0]), (slice(3, 6), self.limits[3])):
+            accepted[part] *= (limit/accepted[part].norm().clamp_min(1e-12)).clamp_max(1.)
+        self.raw.copy_(accepted/self.limits)
+        return dict(sag_translation_step_mm=float((accepted-previous)[:3].norm()),
+                    sag_rotation_step_deg=math.degrees(float((accepted-previous)[3:].norm())))
+
+
+def load_sagittal_pose(checkpoint, device="cpu"):
+    """旧 checkpoint 没有 sag 修正；调用方在原标定上使用零修正。"""
+    state = checkpoint.get("sagittal_pose")
+    if state is None:
+        return None
+    pose = SagittalPoseRefiner(state["calibration_linear"], state["calibration_offset"],
+                              float(state["initial"][0, 3]), state["native_shape"].tolist(),
+                              translation_mm=float(state["limits"][0]),
+                              rotation_deg=math.degrees(float(state["limits"][3]))).to(device)
+    pose.load_state_dict(state)
+    return pose
+
 
 def _rotation_x(angle):
     c, s, z = angle.cos(), angle.sin(), torch.zeros_like(angle)

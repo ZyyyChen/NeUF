@@ -1,5 +1,66 @@
 # Neural Ultrasound Field (NeUF)
 
+## Sagittal 只更新几何，coronal 只更新 INR
+
+`HashSagittalAllPoints` 和 `HashSagittalAllPointsProgressive` 将更新分为两个阶段：
+
+- coronal 阶段只用 observed B-mode L1 更新 INR，冻结探头轨迹及 sagittal 位姿。
+- 几何阶段冻结 INR 参数，保留输入坐标导数。sag 图像的 SSIM/NCC/边缘项仅更新
+  sagittal 六自由度位姿；两侧实测图的三维交线和全部 11 个三维标注对应约束更新
+  探头轨迹及 sagittal 位姿。coronal photo/dense 拟合不参与几何更新。
+
+参考图位姿由原 similarity 标定初始化，在图像中心优化三维平移与旋转，像素间距固定。
+交线随两侧位姿重新计算，双线性采样原始两幅图；不再沿固定源列或忽略离面距离。
+首个 coronal 训练帧固定，保留轨迹单调、平滑和幅度限制。sag 中心平移范数默认
+不超过 2 mm，旋转向量范数不超过 3°；每次更新分别限制为 0.02 mm 和 0.02°。
+这些是可配置的优化先验，不代表已验证的真实定位误差。
+
+默认 `--pose-start 0.2 --pose-end 0.8 --pose-every 5 --pose-block-size 1`：
+前20%预热 INR，中间60%每5次 INR 更新后追加1次几何更新，最后20%固定几何。
+两阶段各自重新前向，使用独立优化器；几何优化器为轨迹和 sag 位姿设置不同参数组，
+后者默认 `--sagittal-pose-lr 0.001`。每一步的计数始终指 INR 更新次数。
+
+`--sagittal-image-weight` 与原 `--sagittal-field-weight` 是同一参数的别名，
+现在仅作用于 sag 位姿。旧 `--sagittal-dense-weight` 必须移除或设为0；传入非零值会报错。
+独立 checkpoint 含 INR、探头与 sag 位姿、优化器、配置和随机状态，按总预算
+向上取整保存50%、75%及结束状态。`load_sagittal_pose` 可独立读取新位姿；旧权重
+没有该状态时，在原标定上采用零修正。原生参考像素的 ROI、显示尺度和初始支持固定；
+同时导出当前 sag 平面与初始固定世界平面的图像，避免将平面移动混同为重建改善。
+
+最小验证通过 `qsub/neuf/sagittal_pose.sh` 提交（提交前创建对应 qsub 日志目录）：
+
+```bash
+mkdir -p qsub/logs/neuf/20261018_train01
+qsub -o "$PWD/qsub/logs/neuf/20261018_train01/stdout.log" \
+     -e "$PWD/qsub/logs/neuf/20261018_train01/stderr.log" \
+     -v RUN_ID=20261018_train01 qsub/neuf/sagittal_pose.sh
+```
+
+该脚本默认只运行合成场：同 seed、初始化、数据、包围盒及40次 INR 更新预算的新旧对照，
+各5次几何更新，独立重载20/30/40步 checkpoint。结果位于
+`logs/<RUN_ID>/synthetic_cerebral/index_all/{SagittalPose6D,PreviousSagittalINR,comparison}/`。
+脚本的 `MODE=train` 需要明确传入患者数据、teacher、源图、参考图、标定、标注及基线
+checkpoint 路径；正式训练不会由最小检查自动启动。
+
+示例 RUN_ID 必须替换为未使用编号。已完成的 `20261018_train03`（Job `5100513`）
+通过梯度隔离、六自由度有限差分、倾斜交线、末期几何冻结和独立里程碑重载；
+图像对照在其 `comparison/plots/`。40步的新旧结果都尚未形成有效结构，只能作为
+实现检查，不支持质量改善结论。
+
+本次修改路径：
+
+```text
+neuf/edge_field/{data,evaluation,sagittal_guidance,sweep_geometry,workflow}.py
+neuf/phase1_smoke.py
+qsub/neuf/sagittal_pose.sh
+README.md
+```
+
+项目目标与测试原则：以实际超声图像的结构清晰度、几何一致性、对比度和散斑保留为目标。
+仅扩展现有轻量检查，检查梯度隔离、六自由度导数、三维交线、坐标往返与里程碑重载。
+合成图像对照和测试通过不能证明真实重建质量提高；当前方法的真实超声效果尚未验证，
+必须用固定数据、预算、评价图像和重建范围的修改前后对照再判断。
+
 ## Observed B-mode 灰度与 NLSTV 边缘引导实验
 
 `HashObservedUniform`、`HashObservedEdgeSample`、`HashObservedEdgeGuided` 使用相同
