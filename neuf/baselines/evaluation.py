@@ -153,15 +153,79 @@ def report(run_id):
         step = result["completed_total_steps"]
         evaluation = output / "metrics" / f"evaluation_step_{step:06d}.json"
         metric = json.loads(evaluation.read_text())["metrics"] if evaluation.exists() else {}
+        baseline = {}
+        validation = output / "metrics" / f"validation_step_{step:06d}.csv"
+        if validation.exists():
+            with validation.open() as stream:
+                values = [r for r in csv.DictReader(stream) if r["model"] == "temporal_linear"]
+            baseline = {f"baseline_{key}": float(np.mean([float(r[key]) for r in values])) for key in ("mae", "psnr", "ssim")}
         rows.append(dict(case=config["input"]["case"], model=config["model_name"], status=result["status"],
-                         steps=step, unit=result["unit"], **metric, result_dir=str(output)))
+                         steps=step, unit=result["unit"], wall_sec=result["session_wall_sec"],
+                         **metric, **baseline, result_dir=str(output)))
     folder.mkdir(parents=True, exist_ok=True)
     write_json(folder / "metrics/results.json", rows)
+    if rows:
+        with (folder / "metrics/summary.csv").open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(dict.fromkeys(k for row in rows for k in row)))
+            writer.writeheader()
+            writer.writerows(rows)
     text = "# ImplicitVol / NeSVoR 重建比较\n\n项目目标与测试原则：关注实际结构、几何、对比度与散斑；测试与 checkpoint 重载只验证实现，不能证明质量提高。\n\n"
     text += "留出观测不是三维 GT；比较仅限同病例、同划分、相同帧与掩膜。PSNR/SSIM 越高越好，MAE 越低越好；两模型架构与损失不同，等更新数不代表等计算量。\n\n"
-    text += "|病例|模型|状态|步数|MAE|PSNR|SSIM|单位|\n|---|---|---|---:|---:|---:|---:|---|\n"
+    text += "|病例|模型|状态|步数|MAE↓|PSNR↑|SSIM↑|线性插值SSIM|耗时秒|单位|\n|---|---|---|---:|---:|---:|---:|---:|---:|---|\n"
     for row in rows:
-        text += f"|{row['case']}|{row['model']}|{row['status']}|{row['steps']}|{row.get('mae', '未产生')}|{row.get('psnr', '未产生')}|{row.get('ssim', '未产生')}|{row['unit']}|\n"
+        text += f"|{row['case']}|{row['model']}|{row['status']}|{row['steps']}|{row.get('mae', '未产生')}|{row.get('psnr', '未产生')}|{row.get('ssim', '未产生')}|{row.get('baseline_ssim','未产生')}|{row['wall_sec']:.2f}|{row['unit']}|\n"
     text += "\nPatient106 扫描为空；Recalage 两份相同 MAT 共用结果，不计作两个患者。Cropping 像素初始化须用户授权，结果不具有已验证的毫米尺度。\n"
+    from .data import cases
+    coverage = []
+    for record in cases():
+        for name in ("ImplicitVol", "NeSVoR"):
+            done = next((row for row in rows if row["case"] == record["case"] and row["model"] == name), None)
+            output = root / record["cohort"] / ("index_" + record["case"]) / name
+            progress = output / "metrics/progress.json"
+            steps = done["steps"] if done else json.loads(progress.read_text())["step"] if progress.exists() else 0
+            status = done["status"] if done else "running" if (output / "run_config/config.json").exists() else "未训练：缺少核实的标定"
+            checkpoints = {}
+            for milestone in (5000, 7500, 10000):
+                checkpoint = output / "checkpoints" / f"step_{milestone:06d}.pt"
+                checkpoints[str(milestone)] = str(checkpoint) if checkpoint.is_file() else "未达到" if steps < milestone else "缺失"
+            coverage.append(dict(case=record["case"], model=name, status=status, steps=steps, checkpoints=checkpoints))
+    write_json(folder / "metrics/coverage.json", coverage)
+    text += "\n## 独立 checkpoint 与覆盖范围\n\n"
+    for entry in coverage:
+        text += f"- {entry['case']} / {entry['model']}：{entry['status']}，{entry['steps']}/10000 步。\n"
+        for milestone, path in entry["checkpoints"].items():
+            text += f"  - step {milestone}：{path}\n"
+    (folder / "plots").mkdir(exist_ok=True)
+    for case in sorted({row["case"] for row in rows}):
+        pair = [next((row for row in rows if row["case"] == case and row["model"] == name and row["status"] == "complete"), None)
+                for name in ("ImplicitVol", "NeSVoR")]
+        if not all(pair):
+            continue
+        samples = [np.load(Path(row["result_dir"]) / "predictions/fixed_step_010000.npz") for row in pair]
+        if not all(np.array_equal(samples[0][key], samples[1][key]) for key in ("observed", "indices", "mask")):
+            raise ValueError(f"两个模型的固定评价条件不一致：{case}")
+        count = len(samples[0]["indices"])
+        fig, axes = plt.subplots(count, 6, figsize=(17, count * 2.4), squeeze=False)
+        for index, frame in enumerate(samples[0]["indices"]):
+            observed, baseline = samples[0]["observed"][index], samples[0]["baseline"][index]
+            a, b = samples[0]["result"][index], samples[1]["result"][index]
+            for axis, image, title, error in zip(axes[index], (observed, baseline, a, b, abs(a-observed), abs(b-observed)),
+                    (f"Input {frame}", "Temporal linear", "ImplicitVol", "NeSVoR", "ImplicitVol error", "NeSVoR error"),
+                    (False, False, False, False, True, True)):
+                axis.imshow(image, cmap="magma" if error else "gray", vmin=0, vmax=.3 if error else 1)
+                axis.set_title(title)
+                axis.axis("off")
+        fig.suptitle(f"{case} | 10000 updates | fixed held-out frames | shared [0,1] | no 3D GT")
+        fig.tight_layout()
+        target = folder / "plots" / f"{case}_comparison.png"
+        fig.savefig(target, dpi=120)
+        plt.close(fig)
+        text += f"\n- [{case} 固定图像对比]({target})\n"
+    recovery = folder / "run_config/recovered_geometry.json"
+    if recovery.exists():
+        info = json.loads(recovery.read_text())
+        text += (f"\n补充标定核对：Patient103 七参数模型标注 RMS={info.get('landmark_rms_pixels')} 像素，"
+                 f"体积尺寸误差={info.get('extent_error_pixels')} 像素；原始 Cropping 到已配准图的方向核对"
+                 f"状态={info['status']}。不能把二维 t_form 当作完整三维位姿。Patient103/104/105 的 delta_X 元数据未明确注明单位。\n")
     (folder / "metrics/comparison_report.md").write_text(text)
     print(text, flush=True)

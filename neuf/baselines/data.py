@@ -11,6 +11,8 @@ from pathlib import Path
 import numpy as np
 from scipy.io import loadmat, whosmat
 from scipy.spatial.transform import Rotation
+from scipy.ndimage import affine_transform
+from scipy.optimize import least_squares
 
 from neuf.registration_comparison import load_volume
 
@@ -80,7 +82,79 @@ def inspect_reconstruction(output):
                     entry["variables"][name] = item
             entries.append(entry)
     write_json(output, entries)
+    recovery = recover_patient103()
+    write_json(Path(output).with_name("recovered_geometry.json"), recovery)
     print(Path(output).read_text(), flush=True)
+    print(json.dumps(recovery, ensure_ascii=False, indent=2, default=json_default), flush=True)
+
+
+def recover_patient103():
+    """从该病例保存的标注恢复原七参数扫描模型，并验证二维变换方向。"""
+    case = "Patient103_J0_0"
+    parent = ROOT / "code_seg_3D/Pre_traitement_echo_v2"
+    folder = parent / "Reconstruction_3D" / case
+    points_path = folder / f"data_3D_{case}_reconstruction_points.mat"
+    points = loadmat(points_path, simplify_cells=True)
+    saved = loadmat(folder / f"data_3D_{case}.mat", variable_names=["metadata"], simplify_cells=True)["metadata"]
+    table = loadmat(ROOT / "code_seg_3D/Ref_Files/ReconstructionParameters_v2.mat")["params_patients_echo_v2"]
+    matching = table[np.isclose(table[:, 12], saved["delta_X"], rtol=1e-8, atol=0)]
+    if len(matching) != 1 or matching[0, 13] <= 0:
+        return dict(case=case, status="blocked", reason="不能唯一对应原像素尺度")
+    ratio = float(matching[0, 13] / saved["delta_X"])
+    reference = points["coord_pts_img_ref"][:, [1, 0]] * ratio
+    source = points["coord_pts_img_seqdyn"][:, [1, 0]]
+    r, t = source.T
+    recal_path = parent / "Recalage" / case / f"data_recal_{case}_d_0.5.mat"
+    shape = next(shape for name, shape, _ in whosmat(recal_path) if name == "data_recal")
+    def transform(parameters, r, t):
+        cx, cz, vx, vz, delta, omega, theta = parameters
+        phi = t * omega + theta
+        return np.stack((cx + vx * t + (r + delta) * np.cos(phi),
+                         cz + vz * t + (r + delta) * np.sin(phi)), -1)
+    bounds = ([-30, 200, -.08, -2, -80, -np.pi/2/shape[2], -np.pi/3],
+              [80, 800, .08, 2, 30, np.pi/2/shape[2], np.pi/3])
+    fit = least_squares(lambda x: (transform(x, r, t) - reference).ravel(),
+                        [0, 350, 0, 0, 0, 0, 0], bounds=bounds,
+                        ftol=1e-8, xtol=1e-8, gtol=1e-8, max_nfev=2000,
+                        diff_step=np.full(7, 1e-6))
+    rr, tt = np.mgrid[1:shape[0]+1, 1:shape[2]+1]
+    projected = transform(fit.x, rr, tt)
+    projected += np.abs(np.minimum(projected.min((0, 1)), 0)) + 1
+    predicted_shape = np.ceil(projected.max((0, 1))).astype(int)
+    volume_shape = next(s for k, s, _ in whosmat(folder / f"data_3D_{case}.mat") if k == "data_3D")
+    extent_error = np.abs(predicted_shape - np.array(volume_shape)[[0, 2]])
+    original = load_volume(parent / "Cropping" / case / f"data_repos_{case}.mat", "data_repos")
+    registered = load_volume(recal_path, "data_recal")
+    forms = loadmat(recal_path, variable_names=["t_form"], simplify_cells=True)["t_form"]
+    # 原 MATLAB 文件同时有 T/A/R；用实际图像辨认正反变换和1-based中心约定。
+    scores = []
+    for field in ("A", "T"):
+        for invert in (False, True):
+            for one_based in (False, True):
+                errors = []
+                for i in (0, shape[2]//2, shape[2]-1):
+                    matrix = np.asarray(forms[i][field], dtype=float)
+                    if field == "T":
+                        matrix = matrix.T
+                    if invert:
+                        matrix = np.linalg.inv(matrix)
+                    rot, trans = matrix[:2, :2], matrix[:2, 2]
+                    if one_based:
+                        trans = trans + rot @ np.ones(2) - 1
+                    inverse = np.linalg.inv(rot[::-1, ::-1])
+                    warped = affine_transform(original[:, :, i].astype(np.float32), inverse,
+                                              offset=-inverse @ trans[::-1], order=1, prefilter=False)
+                    errors.append(float(np.abs(warped - registered[:, :, i]).mean()))
+                scores.append(dict(field=field, inverse=invert, one_based=one_based, mae=float(np.mean(errors))))
+    best = min(scores, key=lambda item: item["mae"])
+    rms = float(np.sqrt(np.square(transform(fit.x, r, t) - reference).mean()))
+    verified = fit.success and np.max(extent_error) <= 2 and best["mae"] < 1.0 and rms < 10
+    return dict(case=case, status="verified" if verified else "blocked", parameters=fit.x.tolist(),
+                reference_scale_ratio=ratio, landmark_rms_pixels=rms, extent_error_pixels=extent_error.tolist(),
+                original_metadata_delta_X=float(saved["delta_X"]),
+                native_unit="像素；原delta_X元数据未注明单位，不推断毫米",
+                transform_convention=best, transform_candidates=scores,
+                sources=[str(points_path.relative_to(ROOT)), str(recal_path.relative_to(ROOT))])
 
 
 def cases():

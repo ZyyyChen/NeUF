@@ -14,7 +14,7 @@ MODEL="${MODEL:-all}"
 CASE="${CASE:-all}"
 [[ "${RUN_ID}" =~ ^[0-9]{8}_train[0-9]{2,}$ ]]
 RESULT_DIR="${REPO_DIR}/logs/${RUN_ID}"
-QSUB_LOG_DIR="${REPO_DIR}/qsub/logs/neuf/${RUN_ID}/${MODE}_${CASE}_${MODEL}"
+QSUB_LOG_DIR="${QSUB_LOG_DIR:-${REPO_DIR}/qsub/logs/neuf/${RUN_ID}/${MODE}_${CASE}_${MODEL}}"
 mkdir -p "${QSUB_LOG_DIR}"
 printf '%s\n' "${PBS_JOBID}" > "${QSUB_LOG_DIR}/job_id.txt"
 finish() {
@@ -52,4 +52,31 @@ else
     fi
     printf 'Command:'; printf ' %q' "${cmd[@]}"; printf '\n'
     "${cmd[@]}"
+    if [[ "${MODE}" == report ]]; then
+        KERNEL_PREFIX="${TMPDIR:-/tmp}/neuf-baselines-${PBS_JOBID}/kernel"
+        "${PYTHON_BIN}" -m ipykernel install --prefix "${KERNEL_PREFIX}" --name neuf-baselines --display-name "NeUF official baselines"
+        export JUPYTER_PATH="${KERNEL_PREFIX}/share/jupyter"
+        export BASELINE_RUN_ID="${RUN_ID}"
+        /usr/bin/python3 - <<'PY'
+from copy import deepcopy
+from pathlib import Path
+import nbformat
+from nbclient import NotebookClient
+
+path = Path("analysis_workbench.ipynb")
+notebook = nbformat.read(path, as_version=4)
+selected = [deepcopy(cell) for cell in notebook.cells if "official-baselines" in cell.metadata.get("tags", [])]
+execution = nbformat.v4.new_notebook(cells=selected)
+NotebookClient(execution, kernel_name="neuf-baselines", timeout=1200,
+               resources={"metadata": {"path": str(path.parent.resolve())}}).execute()
+# 执行后重新读取，避免覆盖其他同时进行的 notebook 编辑。
+notebook = nbformat.read(path, as_version=4)
+executed = {cell.id: cell for cell in execution.cells}
+for cell in notebook.cells:
+    if cell.id in executed and cell.cell_type == "code":
+        cell.outputs = executed[cell.id].get("outputs", [])
+        cell.execution_count = executed[cell.id].get("execution_count")
+nbformat.write(notebook, path)
+PY
+    fi
 fi
