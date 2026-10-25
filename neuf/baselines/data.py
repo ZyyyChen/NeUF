@@ -63,6 +63,19 @@ def inspect_reconstruction(output):
     entries = []
     parent = ROOT / "code_seg_3D/Pre_traitement_echo_v2"
     for folder in ("Recalage", "Reconstruction_3D"):
+        import pydicom
+        for path in sorted((parent / folder).rglob("*.dcm")):
+            ds = pydicom.dcmread(path, stop_before_pixels=True)
+            fields = ("Rows", "Columns", "NumberOfFrames", "PixelSpacing", "SliceThickness",
+                      "SpacingBetweenSlices", "ImageOrientationPatient", "ImagePositionPatient",
+                      "SequenceOfUltrasoundRegions", "SharedFunctionalGroupsSequence")
+            entry = {"path": str(path.relative_to(ROOT)),
+                     "dicom": {key: str(getattr(ds, key)) for key in fields if hasattr(ds, key)}}
+            frames = getattr(ds, "PerFrameFunctionalGroupsSequence", [])
+            entry["per_frame_geometry_count"] = len(frames)
+            if frames:
+                entry["first_frame_geometry"], entry["last_frame_geometry"] = str(frames[0]), str(frames[-1])
+            entries.append(entry)
         for path in sorted((parent / folder).rglob("*.mat")):
             entry = {"path": str(path.relative_to(ROOT)), "variables": {}}
             if h5py.is_hdf5(path):
@@ -82,8 +95,9 @@ def inspect_reconstruction(output):
                     entry["variables"][name] = item
             entries.append(entry)
     write_json(output, entries)
-    recovery = recover_patient103()
-    write_json(Path(output).with_name("recovered_geometry.json"), recovery)
+    recovery_path = Path(output).with_name("recovered_geometry.json")
+    recovery = json.loads(recovery_path.read_text()) if recovery_path.exists() else recover_patient103()
+    write_json(recovery_path, recovery)
     print(Path(output).read_text(), flush=True)
     print(json.dumps(recovery, ensure_ascii=False, indent=2, default=json_default), flush=True)
 
