@@ -1,5 +1,44 @@
 # Neural Ultrasound Field (NeUF)
 
+## 官方 ImplicitVol / NeSVoR 逐序列重建基线
+
+统一入口 `python -m neuf.baselines.workflow` 使用固定版本的官方网络：
+ImplicitVol `996f6ea5a4c818b150333890c2db9feb6346e2f6`，NeSVoR `v0.5.0 / 730ddaa3711a2304386de34193ea4b957892fe7b`。
+官方仓库分别为 `https://github.com/pakheiyeung/ImplicitVol` 和 `https://github.com/daviddmc/NeSVoR`，
+下载在本地 `third_party/{ImplicitVol,NeSVoR}`，保持其原始代码与作者说明，不将第三方源码、依赖、数据或权重加入本仓库。
+所有执行经 `qsub/neuf/baselines.sh` 提交；所缺 nibabel 5.3.2 安装到本项目 `.baseline_deps`，不改现有 conda 环境。
+
+本次无兼容预训练重建权重，逐病例从头优化。默认 seed 3407、10000 **优化更新步**；
+不是原始 ImplicitVol 示例的10001个 epoch，也不宣称完整复现其训练预算。
+ImplicitVol 复用原 SIREN、位置编码、LearnPose、5×5 SSIM，原生像素64×64 patch；
+NeSVoR 复用原 NeSVoR 网络、PSF、位姿/方差/成像损失和 AdamW，batch=1024、PSF samples=32、float32，
+使用官方 PyTorch 后备实现；不启用 SVoRT、MRI 脑分割或 N4 预处理。
+两个方法更新数相同，单步采样量及耗时不同，不能解释为等计算量。
+
+数据适配复用已核对的 MAT/DICOM 方向：Patient100 主 MAT 缺失时采用 DICOM；
+Patient106 的空序列明确排除。Recalage 两份相同 MAT 共用一个结果，两个 JPEG 表示分别处理。
+Patient0 采用 `infos.json` 的毫米标定与位姿，裁剪图只应用 ROI 偏移；
+离面厚度使用相邻帧中心距离与像素间距的较大值，是记录在配置中的 PSF 假设。
+Cropping 没有完整物理标定时默认拒绝训练；只有用户明确授权后才能传 `--pixel-geometry`，
+此时平行、等间距初始化仅按像素单位解释，不能冒充真实扫描尺度。
+
+固定每10帧留出1帧，从第5帧开始；模型与位姿只更新训练帧。
+统一选择5张留出图用于初始、50%、75%、结束对照；指标曲线始终基于这5张图，最终另评全部留出帧。
+报告观测图、时间线性插值、重建图、绝对误差及 MAE/PSNR/SSIM/梯度误差。
+指标用固定扇区掩膜、uint8/255，显示范围统一[0,1]；留出观测不是三维 GT。
+导出复用初始世界包围盒，最小0.75单位、长边最多256点；配置及图像均记录单位与尺度。
+
+独立 checkpoint 在 `ceil(N/2)`、`ceil(3N/4)` 和 N 保存为 `checkpoints/step_<实际步数>.pt`，
+包含完整模型/位姿、已完成与计划步数、配置、优化器、调度器、Python/NumPy/Torch/CUDA随机状态。
+禁止覆盖现有独立文件；每次保存新建网络独立加载并比较世界坐标查询。
+`--resume` 必须采用相同输入、原总预算和结果目录，里程碑仍以原总目标计算；SIGTERM/INT 在完成当前更新后保存并标记停止。
+结果位于 `logs/<RUN_ID>/<数据组>/index_<病例>/<模型>/`；
+qsub 原生日志位于 `qsub/logs/neuf/<RUN_ID>/<MODE>_<CASE>_<MODEL>/`。
+
+项目目标与测试原则：以超声结构清晰度、几何一致性、对比度、散斑与伪影为目标。
+只保留同一入口的轻量检查（两个官方网络各20步，独立重载10/15/20步），不扩展测试框架。
+检查通过不能证明重建质量提高；以固定数据、预算、范围与留出图像对照评价研究效果。
+
 ## Sagittal 只更新几何，coronal 只更新 INR
 
 `HashSagittalAllPoints` 和 `HashSagittalAllPointsProgressive` 将更新分为两个阶段：

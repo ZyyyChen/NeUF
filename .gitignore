@@ -76,3 +76,7 @@ core.*
 
 # temporary office files
 ~$*
+
+# 固定版本第三方源码及本次实验的隔离依赖，不混入项目提交。
+/third_party/
+/.baseline_deps/
