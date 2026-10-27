@@ -1,5 +1,35 @@
 # Neural Ultrasound Field (NeUF)
 
+## Coronal 空间 CNN + Fourier PE 短实验
+
+`python -m neuf.edge_field.workflow --coronal-cnn-comparison --output <新目录>`
+比较相同初始 PE 主干的 `PE` 和 `PECNN`。全部 coronal 共享三层 2D CNN
+（8/16/32 通道，输入96×128）；查询三维点时逆变换到各帧，按正确卷积中心双线性
+采样，再按有效 mask 与法向距离 Gaussian（sigma=0.75mm）融合32维特征，
+拼接在 Fourier PE 后输入 MLP。新增输入列零初始化，两个模型初始预测一致。
+
+coronal 只以单尺度 `1−SSIM` 更新 CNN/INR；固定 sag 参考平面，sag 只更新
+coronal 六自由度位姿。两组都将固定 sag 点投影到最近两个覆盖的 coronal 平面，
+查询 INR 并按距离插值，保证纯 PE 基线也有位姿梯度。sag 阶段冻结全部 CNN/INR
+参数，但保留查询、特征采样和插值对位置的导数；不会用 `no_grad` 切断几何路径。
+SSIM 使用11×11 Gaussian（sigma=1.5px），只统计参考 mask 与重建支持交集内的完整窗口。
+
+进度按已完成 INR 更新数/总预算计算：0–20%只训练 CNN/INR，20–40%位置更新率
+由0线性升至每次INR更新后1次位置更新，40–70%线性降至0，70%后位置严格冻结。
+使用确定性小数累积计数，无随机开关；首帧固定，平移生成元各分量限1mm，旋转向量
+各分量限2°。全部原始帧参与输入与拟合，固定展示帧不再宣称是留出测试。
+
+通过工作区 `qsub/neuf/coronal_cnn.sh` 提交；`MODE=smoke` 运行已有轻量检查入口的
+合成场40步两组验证，`MODE=train` 运行Patient0两组各2000步。结果在工作区
+`logs/<RUN_ID>/<cerebral或synthetic_cerebral>/index_patient0/{PE,PECNN,comparison}/`；
+qsub日志在 `qsub/logs/neuf/<RUN_ID>/`。正式实验独立保存
+`checkpoints/step_{001000,001500,002000}.pt`，排他创建禁止覆盖，包含完整CNN输入、
+权重、物理标定、位姿、优化器、原总预算及随机状态，支持 `load_field` 独立查询。
+
+项目目标与测试原则：以相同原生切面、共同支持域内的图像与SSIM评价结构、散斑和伪影；
+梯度隔离、阶段冻结和checkpoint重载只证明实现可用，不证明质量或几何精度提高。
+本轮真实效果待实验完成；历史模型、配置和checkpoint保留。
+
 ## 官方 ImplicitVol / NeSVoR 逐序列重建基线
 
 统一入口 `python -m neuf.baselines.workflow` 使用固定版本的官方网络：

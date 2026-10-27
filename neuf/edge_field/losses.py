@@ -62,6 +62,28 @@ def gradients(image):
     return dx, dy
 
 
+def masked_ssim(prediction, reference, support):
+    """纯单尺度 11×11 Gaussian SSIM，只统计支持域内完整窗口。"""
+    if prediction.shape != reference.shape or prediction.shape != support.shape:
+        raise ValueError("SSIM 输入须为相同形状 [B,1,H,W]")
+    axis = torch.arange(11, device=prediction.device, dtype=prediction.dtype) - 5
+    gaussian = torch.exp(-.5 * (axis / 1.5).square())
+    gaussian /= gaussian.sum()
+    kernel = (gaussian[:, None] * gaussian[None])[None, None]
+    pool = lambda x: F.conv2d(x, kernel)
+    valid = F.avg_pool2d(support.detach().to(prediction.dtype), 11, stride=1) > .99999
+    if not bool(valid.any()):
+        raise ValueError("SSIM 没有完整有效的 11×11 窗口")
+    reference = reference.detach()
+    ma, mb = pool(prediction), pool(reference)
+    va = (pool(prediction.square()) - ma.square()).clamp_min(0)
+    vb = (pool(reference.square()) - mb.square()).clamp_min(0)
+    covariance = pool(prediction * reference) - ma * mb
+    score = ((2 * ma * mb + .01**2) * (2 * covariance + .03**2)
+             / ((ma.square() + mb.square() + .01**2) * (va + vb + .03**2)))
+    return score[valid].mean(), int(valid.sum())
+
+
 def sagittal_patch_losses(prediction, reference, support, feature_weights=None, *,
                           pitch_mm=.131204, sigma_mm=.5):
     """直接约束 sagittal 灰度图块，输入均为 [B,1,H,W]、灰度范围 [0,1]。

@@ -888,6 +888,254 @@ def align_poses(data, args):
                 real_pose_accuracy="unknown; only edge consistency and controlled perturbation recovery can be evaluated"))
 
 
+def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_state=None, smoke=False):
+    """固定 sag、纯 SSIM 的 PE / PE+CNN 对照；一步始终表示一次 INR 更新。"""
+    import random
+    from .coronal_features import pose_update_rate, render_coronal_field
+    from .losses import masked_ssim
+    from .evaluation import evaluate_coronal_trial
+
+    output = Path(output)
+    for folder in ("checkpoints", "metrics", "plots", "predictions", "run_config"):
+        (output / folder).mkdir(parents=True, exist_ok=True)
+    device = data.images.device
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+    generator = torch.Generator().manual_seed(args.seed)
+    sag_generator = torch.Generator().manual_seed(args.seed + 1)
+    context = dict(frames=len(data.images), height=96, width=128, channels=32, sigma_mm=.75)
+    model = EdgeField(data.bounds, bands=args.bands, width=args.width,
+                      coronal_config=context if conditioned else None).to(device)
+    if initial_state is not None:
+        # 扩大的第一层保留相同 PE 权重；新增列从零开始，其余网络逐项相同。
+        with torch.no_grad():
+            for name, value in model.state_dict().items():
+                if name in initial_state:
+                    original = initial_state[name].to(device)
+                    if value.shape == original.shape:
+                        value.copy_(original)
+                    elif name == "trunk.0.weight":
+                        value.zero_()
+                        value[:, :original.shape[1]].copy_(original)
+                    else:
+                        raise ValueError(f"未预期的基线权重形状差异: {name}")
+    shared_initial = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()
+                      if not key.startswith("coronal.")}
+    if conditioned:
+        model.coronal.initialize(data)
+    all_frames = torch.arange(len(data.images), device=device)
+    poses = PoseRefiner(data.initial, all_frames, data.bounds.mean(0),
+                        translation_mm=1., rotation_deg=2.).to(device)
+    guidance.pose.requires_grad_(False)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    pose_optimizer = torch.optim.Adam(poses.parameters(), lr=args.pose_lr)
+    milestones = sorted({math.ceil(args.steps / 2), math.ceil(3 * args.steps / 4), args.steps})
+    config = dict(vars(args), conditioned=conditioned, model_config=model.config,
+                  steps=args.steps, checkpoint_milestones=milestones, loss="pure single-scale 1-SSIM",
+                  pose_schedule=dict(start=.2, peak=.4, end=.7, peak_updates_per_inr=1),
+                  source_frames=data.frame_ids.tolist(), fixed_sagittal=True,
+                  source_scope="all coronal frames; in-sample reconstruction, no held-out claim",
+                  pose_limits=dict(translation_component_mm=1., rotation_component_deg=2., first_frame_fixed=True),
+                  sag_render="two nearest supported coronal planes, projected INR predictions, Gaussian distance fusion",
+                  feature_fusion="all coronal maps, Gaussian normal distance sigma=0.75 mm, normalized valid weights",
+                  shared_initial_sha256=tensor_signature(shared_initial.values()))
+    config = {key: str(value) if isinstance(value, Path) else value for key, value in config.items()}
+    write_json(output / "run_config/config.json", config)
+    write_json(output / "run_config/data_manifest.json", data.metadata)
+    timing, paths, audits = [], [], []
+    pose_updates, accumulator, completed = 0, 0., 0
+    started, stamp = time.perf_counter(), timestamp()
+    frozen_pose = None
+    cnn_gradient_seen = False
+    sag_fixed = guidance.pose.matrix().detach().clone()
+    centers = guidance.uniform_centers
+    size = args.patch_size
+    # 固定参考及初始支持决定候选中心；不按模型预测挑选易拟合区域。
+    with torch.no_grad():
+        from .coronal_features import coronal_projection
+        initial_support = []
+        for xyz in guidance.xyz_grid.reshape(-1, 3).split(4096):
+            initial_support.append(coronal_projection(xyz, data.initial, data.local, data.mask)[2])
+        initial_support = torch.cat(initial_support).reshape_as(guidance.reference) & guidance.roi
+        safe = torch.nn.functional.avg_pool2d(initial_support[None, None].float(), 21, stride=1, padding=10)[0, 0] > .9999
+        centers = torch.nonzero(safe).cpu()
+        if not len(centers):
+            raise ValueError("固定 sag 支持域缺少有效采样中心")
+    guidance.cnn_fixed_support = initial_support
+    status = "failed"
+    try:
+        if not smoke:
+            if conditioned:
+                with torch.no_grad():
+                    model.coronal.prepare(poses.matrices())
+            evaluate_coronal_trial(model, poses, data, guidance, output, 0, 0., timing)
+        columns = ("epoch", "global_step", "step_time_sec", "elapsed_sec", "loss", "sag_loss",
+                   "pose_rate", "pose_updated", "pose_updates", "pose_gradient_norm", "cnn_gradient_norm")
+        with (output / "metrics/timing.csv").open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=columns)
+            writer.writeheader()
+            bar = tqdm(range(1, args.steps + 1), desc=output.name, mininterval=5, file=__import__("sys").stdout)
+            for step in bar:
+                t0 = time.perf_counter()
+                progress = min(step / args.steps / .7, 1.)
+                rate = pose_update_rate(step / args.steps)
+                poses.requires_grad_(False)
+                model.requires_grad_(True)
+                model.edge.requires_grad_(False)
+                optimizer.zero_grad(set_to_none=True)
+                pose_optimizer.zero_grad(set_to_none=True)
+                before_pose = poses.raw.detach().clone()
+                if conditioned:
+                    model.coronal.prepare(poses.matrices())
+                patch = data.patches(args.patches, size, generator)
+                prediction = model(poses(patch["frames"], patch["local"]), progress)[..., 0].reshape(-1, 1, size, size)
+                score, _ = masked_ssim(prediction, patch["image"], patch["mask"])
+                loss = 1 - score
+                loss.backward()
+                cnn_grad = (float(torch.linalg.vector_norm(torch.stack([
+                    parameter.grad.norm() for parameter in model.coronal.encoder.parameters()
+                    if parameter.grad is not None]))) if conditioned else 0.)
+                cnn_gradient_seen |= cnn_grad > 0
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
+                optimizer.step()
+                if poses.raw.grad is not None or not torch.equal(before_pose, poses.raw):
+                    raise AssertionError("coronal loss 改变了位姿")
+                for group in optimizer.param_groups:
+                    group["lr"] = args.lr * (1 - .9 * step / args.steps)
+                accumulator += rate
+                do_pose = rate > 0 and accumulator >= 1 - 1e-10
+                sag_loss, pose_grad = float("nan"), 0.
+                if do_pose:
+                    accumulator -= 1
+                    model.requires_grad_(False)
+                    poses.requires_grad_(True)
+                    optimizer.zero_grad(set_to_none=True)
+                    pose_optimizer.zero_grad(set_to_none=True)
+                    before_field = [parameter.detach().clone() for parameter in model.parameters()] if smoke else None
+                    if conditioned:
+                        model.coronal.prepare(poses.matrices())
+                    selected = centers[torch.randint(len(centers), (args.sagittal_patches,), generator=sag_generator)].to(device)
+                    rr = (selected[:, 0] - size // 2).clamp(0, guidance.reference.shape[0] - size)[:, None, None] + torch.arange(size, device=device)[None, :, None]
+                    cc = (selected[:, 1] - size // 2).clamp(0, guidance.reference.shape[1] - size)[:, None, None] + torch.arange(size, device=device)[None, None, :]
+                    predicted, support = render_coronal_field(model, guidance.xyz_grid[rr, cc], poses.matrices(),
+                                                              data.local, data.mask, progress)
+                    support = support & initial_support[rr, cc]
+                    score, _ = masked_ssim(predicted[:, None], guidance.reference[rr, cc][:, None], support[:, None])
+                    geometry_loss = 1 - score
+                    geometry_loss.backward()
+                    pose_grad = float(poses.raw.grad.norm())
+                    if not math.isfinite(pose_grad) or pose_grad <= 0:
+                        raise AssertionError("sag SSIM 没有有效的 coronal 位姿梯度")
+                    torch.nn.utils.clip_grad_norm_(poses.parameters(), 1., error_if_nonfinite=True)
+                    pose_optimizer.step()
+                    pose_updates += 1
+                    sag_loss = float(geometry_loss.detach())
+                    if any(parameter.grad is not None for parameter in model.parameters()):
+                        raise AssertionError("sag loss 泄漏到 CNN/INR")
+                    if smoke:
+                        assert all(torch.equal(old, now) for old, now in zip(before_field, model.parameters()))
+                assert torch.equal(sag_fixed, guidance.pose.matrix())
+                if step <= math.floor(.2 * args.steps):
+                    assert torch.count_nonzero(poses.raw) == 0
+                if step >= math.ceil(.7 * args.steps):
+                    if frozen_pose is None:
+                        frozen_pose = poses.raw.detach().clone()
+                    assert torch.equal(frozen_pose, poses.raw)
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                completed = step
+                row = dict(epoch=1, global_step=step, step_time_sec=time.perf_counter()-t0,
+                           elapsed_sec=time.perf_counter()-started, loss=float(loss.detach()), sag_loss=sag_loss,
+                           pose_rate=rate, pose_updated=int(do_pose), pose_updates=pose_updates,
+                           pose_gradient_norm=pose_grad, cnn_gradient_norm=cnn_grad)
+                timing.append(row)
+                writer.writerow(row)
+                if step % 20 == 0:
+                    stream.flush()
+                bar.set_postfix(loss=f"{row['loss']:.4f}", pose=pose_updates,
+                                dt=f"{row['step_time_sec']:.2f}s", epoch="1/1", refresh=False)
+                if step in milestones:
+                    model.requires_grad_(False)
+                    poses.requires_grad_(False)
+                    with torch.no_grad():
+                        if conditioned:
+                            model.coronal.prepare(poses.matrices())
+                        payload = checkpoint(model, poses, data, (optimizer, pose_optimizer), config, step,
+                                             generators=dict(patch=generator, pose=sag_generator), sagittal=guidance)
+                        payload.update(frequency_progress=progress, python_rng_state=random.getstate(),
+                                       numpy_rng_state=np.random.get_state(), pose_accumulator=accumulator,
+                                       pose_updates=pose_updates, pose_config=dict(translation_mm=1., rotation_deg=2.))
+                        path = output / "checkpoints" / f"step_{step:06d}.pt"
+                        with path.open("xb") as handle:
+                            torch.save(payload, handle)
+                        paths.append(str(path))
+                        audits.append(dict(step=step, path=str(path), sha256=__import__("hashlib").sha256(path.read_bytes()).hexdigest()))
+                    if not smoke or step == args.steps:
+                        evaluate_coronal_trial(model, poses, data, guidance, output, step, progress, timing)
+            if conditioned and not cnn_gradient_seen:
+                raise AssertionError("CNN 未收到 coronal SSIM 梯度")
+        # 只查每个独立里程碑的可读取性与保存后未被覆盖，质量另由图像评价。
+        points = data.local[::100, ::100].reshape(-1, 3)
+        for audit in audits:
+            path = Path(audit["path"])
+            assert __import__("hashlib").sha256(path.read_bytes()).hexdigest() == audit["sha256"]
+            loaded, saved = load_field(path, device)
+            assert saved["completed_steps"] == audit["step"] and saved["optimizer_states"]
+            with torch.no_grad():
+                restored = PoseRefiner(saved["poses"]["initial"], saved["train_indices"],
+                                       saved["poses"]["center"], **saved["pose_config"]).to(device)
+                restored.load_state_dict(saved["poses"], strict=True)
+                torch.testing.assert_close(restored.matrices(), saved["corrected_poses"].to(device), atol=0, rtol=0)
+                world = points @ restored.matrices()[0, :3, :3].T + restored.matrices()[0, :3, 3]
+                assert torch.isfinite(loaded(world)).all()
+                if audit["step"] == args.steps:
+                    torch.testing.assert_close(loaded(world), model(world, progress), atol=1e-6, rtol=1e-5)
+            audit["independently_loaded"] = True
+            del loaded, saved, restored
+        write_json(output / "metrics/checkpoint_reload.json", audits)
+        status = "complete"
+    finally:
+        write_json(output / "metrics/training_summary.json", dict(status=status,
+            configured_total_steps=args.steps, completed_total_steps=completed,
+            configured_epochs=1, completed_epochs=int(completed == args.steps),
+            start_timestamp=stamp, end_timestamp=timestamp(), total_wall_time_sec=time.perf_counter()-started,
+            mean_step_time_sec=float(np.mean([row["step_time_sec"] for row in timing])) if timing else None,
+            pose_updates=pose_updates, cnn_gradient_seen=cnn_gradient_seen,
+            retained_checkpoints=paths, final_checkpoint=paths[-1] if paths else None,
+            quality="in-sample; assess fixed-plane images, not checkpoint checks"))
+    return shared_initial
+
+
+def run_coronal_comparison(args):
+    """同一病例全部 coronal、同采样流、相同 PE 主干初始化的两组短实验。"""
+    from .sagittal_guidance import SagittalGuidance
+    from .evaluation import compare_coronal_trials
+    if args.output is None or args.output.exists():
+        raise ValueError("必须指定尚不存在的 --output")
+    if args.steps < 20 or args.patch_size < 32 or args.patches < 1 or args.sagittal_patches < 1:
+        raise ValueError("要求 steps>=20、patch-size>=32、patches>=1")
+    data = EdgeData(args.dataset, args.teacher, args.source_images, device="cuda")
+    original_splits = data.metadata["splits"]
+    data.splits["training"] = torch.arange(len(data.images), device=data.images.device)
+    data.metadata.update(original_splits=original_splits, all_coronal_conditioning=True,
+                         evaluation_scope="in-sample reconstruction; all coronal frames participate")
+    data.metadata["splits"] = dict(training=data.frame_ids.tolist(), validation=[], test=[])
+    guidance = SagittalGuidance(data, args.sagittal_reference, args.sagittal_calibration, args.landmarks)
+    data.bounds = guidance.field_bounds
+    comparison = args.output / "comparison"
+    (comparison / "run_config/source").mkdir(parents=True)
+    for path in Path(__file__).parent.glob("*.py"):
+        shutil.copy2(path, comparison / "run_config/source" / path.name)
+    write_json(comparison / "run_config/comparison_manifest.json", dict(
+        coronal_frame_ids=data.frame_ids[data.comparison].tolist(), sagittal_plane="fixed initial calibration",
+        intensity_range=[0, 1], loss="11x11 Gaussian sigma=1.5 single-scale 1-SSIM",
+        all_coronal_in_training=True, seed=args.seed, steps=args.steps, data=data.metadata))
+    initial = train_coronal_variant(data, guidance, args.output / "PE", args, conditioned=False)
+    train_coronal_variant(data, guidance, args.output / "PECNN", args, conditioned=True, initial_state=initial)
+    compare_coronal_trials(args.output, args.steps)
+
+
 def parser():
     parser = argparse.ArgumentParser(description="固定 NLSTV teacher 的灰度/response 三维场与位姿修正")
     root = Path(__file__).resolve().parents[2]
@@ -896,6 +1144,7 @@ def parser():
     parser.add_argument("--teacher", type=Path, default=workspace/"NLSTV/logs/20260903_train03/cerebral/index_0/nlstv_lambda009/predictions/cerebral_edges.mat")
     parser.add_argument("--source-images", type=Path, default=workspace/"UltraNeRF-Studio/data/cerebral/patient_0_convex/images.npy")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--coronal-cnn-comparison", action="store_true", help="全 coronal 空间条件与纯 PE 的 SSIM 对照")
     parser.add_argument("--steps", type=int, default=12000)
     parser.add_argument("--stop-step", type=int,
                         help="在指定步数保存最终结果并停止；学习率和损失调度仍以 --steps 为准")
@@ -998,6 +1247,9 @@ def defaults():
 
 def main():
     args = parser().parse_args()
+    if args.coronal_cnn_comparison:
+        run_coronal_comparison(args)
+        return
     if args.sagittal_three_way:
         if args.encoding != "hash":
             raise ValueError("三组 sagittal 对照要求相同 Hash 编码")

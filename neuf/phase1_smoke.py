@@ -507,7 +507,7 @@ def run_frozen_smoke(dataset_path: Path, output_dir: Path, teacher_path: Path) -
     return result
 
 
-def run_sagittal_pose_smoke(output_dir: Path, *, baseline=False) -> dict:
+def run_sagittal_pose_smoke(output_dir: Path, *, baseline=False, coronal=False) -> dict:
     """同一合成三维场上的最小训练检查；不读取患者数据，不评价医学重建质量。"""
     import h5py
     from scipy.io import savemat
@@ -579,6 +579,29 @@ def run_sagittal_pose_smoke(output_dir: Path, *, baseline=False) -> dict:
                                 config_dir/"landmarks.mat")
     # 新旧模型固定相同的世界包围盒、源图批次、初始化和 INR 更新预算。
     guidance.field_bounds = data.bounds
+    if coronal:
+        import shutil
+        from neuf.edge_field.workflow import train_coronal_variant
+        from neuf.edge_field.coronal_features import pose_update_rate
+        snapshot = config_dir / "source"
+        snapshot.mkdir()
+        for source in (Path(__file__).parent / "edge_field").glob("*.py"):
+            shutil.copy2(source, snapshot / source.name)
+        shutil.copy2(__file__, snapshot / "phase1_smoke.py")
+        data.comparison = [2, 5]
+        data.splits["training"] = torch.arange(count, device=device)
+        args = defaults()
+        args.steps, args.patches, args.patch_size, args.sagittal_patches = 40, 1, 32, 1
+        args.width, args.bands = 32, 6
+        assert [pose_update_rate(p) for p in (0., .2, .4, .7, 1.)] == [0., 0., 1., 0., 0.]
+        initial = train_coronal_variant(data, guidance, output_dir.parent/"PE", args, conditioned=False, smoke=True)
+        train_coronal_variant(data, guidance, output_dir.parent/"PECNN", args, conditioned=True,
+                              initial_state=initial, smoke=True)
+        result = dict(status="complete", steps=40, gradient_isolation=True,
+                      fixed_sagittal=True, phase_boundaries=True,
+                      independent_milestones=[20, 30, 40], quality="synthetic implementation check only")
+        write_json(output_dir/"metrics/coronal_smoke.json", result)
+        return result
     geometry = None
     if not baseline:
         from neuf.edge_field.sweep_geometry import SagittalPoseRefiner, load_sagittal_pose
@@ -656,8 +679,11 @@ def main() -> None:
     parser.add_argument("--edge-source-images", type=Path, help="teacher 对应的原始 uint8 images.npy")
     parser.add_argument("--sagittal-pose-smoke", action="store_true", help="合成三维场上检查 sag 六自由度与梯度隔离")
     parser.add_argument("--sagittal-pose-baseline", action="store_true", help="由 qsub 用修改前源代码运行同条件对照")
+    parser.add_argument("--coronal-cnn-smoke", action="store_true", help="同一合成场验证 coronal CNN、梯度隔离与位置日程")
     args = parser.parse_args()
-    if args.sagittal_pose_smoke:
+    if args.coronal_cnn_smoke:
+        result = run_sagittal_pose_smoke(args.output_dir, coronal=True)
+    elif args.sagittal_pose_smoke:
         result = run_sagittal_pose_smoke(args.output_dir, baseline=args.sagittal_pose_baseline)
     elif args.edge_teacher is not None:
         if args.teacher_checkpoint is not None or args.edge_source_images is None:

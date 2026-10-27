@@ -84,7 +84,7 @@ class EdgeField(nn.Module):
                  hash_levels=16, hash_features=2, log2_hashmap_size=19,
                  hash_base_resolution=16, hash_finest_resolution=512,
                  edge_conditioned=False, coarse_hash_levels=8, detail_scale=2.,
-                 progressive_hash=False):
+                 progressive_hash=False, coronal_config=None):
         super().__init__()
         if encoding not in ("fourier", "hash"):
             raise ValueError(f"未知坐标编码: {encoding}")
@@ -98,6 +98,8 @@ class EdgeField(nn.Module):
             raise ValueError("渐进 Hash 要求 hash 编码且 1<=coarse_hash_levels<hash_levels")
         if detail_scale <= 0:
             raise ValueError("detail_scale 必须为正")
+        if coronal_config is not None and (encoding != "fourier" or edge_conditioned or response_only):
+            raise ValueError("coronal CNN 当前仅用于 Fourier PE 灰度场")
         bounds = torch.as_tensor(bounds, dtype=torch.float32)
         self.register_buffer("center", bounds.mean(0))
         self.register_buffer("extent", (bounds[1] - bounds[0]).clamp_min(1))
@@ -114,6 +116,11 @@ class EdgeField(nn.Module):
             detail_scale=detail_scale,
             progressive_hash=bool(progressive_hash),
         )
+        self.coronal = None
+        if coronal_config is not None:
+            from .coronal_features import CoronalFeatures
+            self.coronal = CoronalFeatures(**coronal_config)
+            self.config["coronal_config"] = dict(coronal_config)
         self.response_only = response_only
         self.encoding = encoding
         self.edge_conditioned = bool(edge_conditioned)
@@ -132,6 +139,8 @@ class EdgeField(nn.Module):
             self.hash_encoder.out_dim if self.hash_encoder is not None
             else 3 + 6 * bands + 3 * plane_channels * len(plane_resolutions)
         )
+        if self.coronal is not None:
+            encoded_dimension += coronal_config["channels"]
         self.encoded_dimension = encoded_dimension
         self.coarse_encoded_dimension = coarse_hash_levels * hash_features if edge_conditioned else encoded_dimension
 
@@ -193,6 +202,8 @@ class EdgeField(nn.Module):
                 active = min(1., max(0., 2 + (len(self.planes)-2)*progress - level))
                 features.append(values[..., 0].permute(2, 0, 1).reshape(*x.shape[:-1], -1)*active)
             encoded = torch.cat((encoded, *features), -1)
+        if self.coronal is not None:
+            encoded = torch.cat((encoded, self.coronal(xyz)), -1)
         features = self.trunk(encoded)
         if self.response_only:
             return self.edge(features).sigmoid()

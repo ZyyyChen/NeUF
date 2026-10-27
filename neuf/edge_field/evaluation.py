@@ -30,6 +30,147 @@ EDGE_PRESERVE_VARIANTS = (
 
 
 @torch.no_grad()
+def evaluate_coronal_trial(model, poses, data, guidance, output, step, progress, history):
+    """固定原生 sag 网格和 coronal 帧，全部灰度采用 [0,1]，不另作归一化。"""
+    from .coronal_features import render_coronal_field
+    from .losses import masked_ssim
+    output = Path(output)
+    matrices = poses.matrices()
+    if model.coronal is not None:
+        model.coronal.prepare(matrices)
+    gray, current = render_coronal_field(model, guidance.xyz_grid, matrices, data.local, data.mask, progress)
+    fixed = guidance.cnn_fixed_support
+    support = current & fixed
+    ssim, windows = masked_ssim(gray[None, None], guidance.reference[None, None], support[None, None])
+    reference, prediction = guidance.reference.cpu().numpy(), gray.cpu().numpy()
+    probe_rows = torch.tensor([int((data.height - 1) * value) for value in (.15, .5, .9)], device=data.local.device)
+    local_probes = data.local[probe_rows, data.width // 2]
+    current_points = local_probes @ matrices[:, :3, :3].transpose(-1, -2) + matrices[:, None, :3, 3]
+    initial_points = local_probes @ data.initial[:, :3, :3].transpose(-1, -2) + data.initial[:, None, :3, 3]
+    direction_dot = (current_points.diff(dim=0) * initial_points.diff(dim=0)).sum(-1)
+    backward_count = int((direction_dot < 0).sum())
+    coronal_predictions, coronal_references, coronal_metrics = [], [], []
+    # 只查询实际扇区；显示图仍保留原生尺寸、原坐标与固定选择的帧。
+    for index in data.comparison:
+        points = data.local[data.mask] @ matrices[index, :3, :3].T + matrices[index, :3, 3]
+        image = torch.zeros_like(data.images[index])
+        image[data.mask] = torch.cat([model(part, progress)[..., 0] for part in points.split(2048)])
+        value, _ = masked_ssim(image[None, None], data.images[index][None, None], data.mask[None, None])
+        coronal_metrics.append(dict(frame_id=int(data.frame_ids[index]), ssim=float(value)))
+        coronal_predictions.append(image.cpu().numpy())
+        coronal_references.append(data.images[index].cpu().numpy())
+    metrics = dict(step=step, model=output.name, sag_ssim=float(ssim), valid_windows=windows,
+                   local_backward_samples=backward_count, local_direction_samples=direction_dot.numel(),
+                   fixed_support_coverage=float(support.sum() / fixed.sum()),
+                   coronal=coronal_metrics, mean_coronal_ssim=float(np.mean([row["ssim"] for row in coronal_metrics])),
+                   evaluation_scope="all coronal input; sag supervised; no held-out or 3D accuracy claim")
+    write_json(output / "metrics" / f"step_{step:06d}.json", metrics)
+    np.savez_compressed(output / "predictions" / f"step_{step:06d}.npz",
+                        reference=reference, gray=prediction, fixed_support=fixed.cpu().numpy(),
+                        current_support=current.cpu().numpy(), frame_ids=data.frame_ids.cpu().numpy(),
+                        coronal=np.stack(coronal_predictions), coronal_reference=np.stack(coronal_references),
+                        coronal_mask=data.mask.cpu().numpy(), corrections=poses.twists().cpu().numpy(),
+                        corrected_poses=matrices.cpu().numpy())
+    display = support.cpu().numpy()
+    fig, axes = plt.subplots(1, 3, figsize=(15, 6), layout="constrained")
+    for axis, panel, title, cmap in zip(axes, (reference, prediction, np.abs(reference - prediction)),
+                                       ("Measured sagittal", output.name, "Absolute difference"),
+                                       ("gray", "gray", "magma")):
+        axis.imshow(np.where(display, panel, np.nan), cmap=cmap, vmin=0, vmax=1)
+        axis.set(title=title, xlabel="Native column [px]", ylabel="Native row [px]")
+    fig.suptitle(f"Step {step}; fixed sagittal plane; SSIM {float(ssim):.5f}; coverage {metrics['fixed_support_coverage']:.3f}")
+    fig.savefig(output / "plots" / f"sagittal_{step:06d}.png", dpi=130)
+    plt.close(fig)
+    fig, axes = plt.subplots(3, len(coronal_predictions), figsize=(4*len(coronal_predictions), 9), squeeze=False, layout="constrained")
+    for column, (target, image, row) in enumerate(zip(coronal_references, coronal_predictions, coronal_metrics)):
+        for axis, panel, title in zip(axes[:, column], (target, image, np.abs(target-image)),
+                                      (f"Observed frame {row['frame_id']}", f"SSIM {row['ssim']:.4f}", "Absolute difference")):
+            axis.imshow(np.where(data.mask.cpu().numpy(), panel, np.nan), cmap="magma" if axis is axes[2, column] else "gray", vmin=0, vmax=1)
+            axis.set(title=title, xlabel="Native column [px]", ylabel="Native row [px]")
+    fig.savefig(output / "plots" / f"coronal_{step:06d}.png", dpi=110)
+    plt.close(fig)
+    if history:
+        fig, axes = plt.subplots(3, 1, figsize=(9, 8), sharex=True, layout="constrained")
+        steps = [row["global_step"] for row in history]
+        axes[0].plot(steps, [row["loss"] for row in history], label="Coronal")
+        active = [row for row in history if row["pose_updated"]]
+        axes[0].plot([row["global_step"] for row in active], [row["sag_loss"] for row in active], label="Sagittal", alpha=.7)
+        axes[0].set_ylabel("1 - SSIM")
+        axes[0].legend()
+        axes[1].plot(steps, [row["pose_rate"] for row in history])
+        axes[1].set_ylabel("Pose updates / INR")
+        axes[2].plot(steps, [row["pose_updates"] for row in history])
+        axes[2].set(ylabel="Cumulative pose updates", xlabel="INR update")
+        fig.savefig(output / "plots" / f"training_{step:06d}.png", dpi=130)
+        plt.close(fig)
+    return metrics
+
+
+def compare_coronal_trials(root, step):
+    """只在共同完整窗口比较两组，初始图也在相同末态共同域重新计分。"""
+    from .losses import masked_ssim
+    root = Path(root)
+    output = root / "comparison"
+    for folder in ("metrics", "plots"):
+        (output / folder).mkdir(parents=True, exist_ok=True)
+    records = {}
+    for name in ("PE", "PECNN"):
+        for index in (0, step):
+            with np.load(root / name / "predictions" / f"step_{index:06d}.npz") as saved:
+                records[name, index] = {key: saved[key].copy() for key in saved.files}
+    reference = records["PE", 0]["reference"]
+    common = np.logical_and.reduce([record["fixed_support"] & record["current_support"] for record in records.values()])
+    rows = []
+    for (name, index), record in records.items():
+        assert np.array_equal(record["reference"], reference)
+        tensor = lambda value: torch.as_tensor(value)[None, None]
+        score, windows = masked_ssim(tensor(record["gray"]), tensor(reference), tensor(common))
+        corrections = record["corrections"]
+        rows.append(dict(model=name, step=index, common_sag_ssim=float(score), complete_windows=windows,
+                         mean_coronal_ssim=float(np.mean([float(masked_ssim(tensor(p), tensor(t), tensor(record["coronal_mask"]))[0])
+                                                for p, t in zip(record["coronal"], record["coronal_reference"])])),
+                         max_translation_component_mm=float(np.abs(corrections[:, :3]).max()),
+                         max_rotation_component_deg=float(np.degrees(np.abs(corrections[:, 3:])).max()),
+                         fixed_support_coverage=float((record["current_support"] & record["fixed_support"]).sum() / record["fixed_support"].sum())))
+        import json
+        diagnostics = json.loads((root / name / "metrics" / f"step_{index:06d}.json").read_text())
+        rows[-1].update(local_backward_samples=diagnostics["local_backward_samples"],
+                        local_direction_samples=diagnostics["local_direction_samples"])
+    write_csv(output / "metrics/comparison.csv", rows)
+    write_json(output / "metrics/comparison.json", dict(rows=rows, common_pixels=int(common.sum()),
+               same_initial_prediction_max_error=float(np.max(np.abs(records["PE", 0]["gray"]-records["PECNN", 0]["gray"]))),
+               interpretation="within-case reconstruction; all source images and sag participate in fitting"))
+    fig, axes = plt.subplots(2, 3, figsize=(15, 11), layout="constrained")
+    panels = [("Measured sagittal", reference), ("PE final", records["PE", step]["gray"]),
+              ("PE + coronal CNN final", records["PECNN", step]["gray"])]
+    for column, (title, panel) in enumerate(panels):
+        axes[0, column].imshow(np.where(common, panel, np.nan), cmap="gray", vmin=0, vmax=1)
+        axes[0, column].set_title(title)
+        difference = panel if column == 0 else np.abs(panel-reference)
+        axes[1, column].imshow(np.where(common, difference, np.nan), cmap="gray" if column == 0 else "magma", vmin=0, vmax=1)
+        axes[1, column].set_title("Reference" if column == 0 else "Absolute difference")
+    for axis in axes.flat:
+        axis.set(xlabel="Native column [px]", ylabel="Native row [px]")
+    fig.savefig(output / "plots/final_comparison.png", dpi=140)
+    # 固定 ROI 同时给出原生像素局部细节，不按最终结果移动裁剪框。
+    for axis in axes.flat:
+        axis.set(xlim=(350, 650), ylim=(500, 200))
+    fig.savefig(output / "plots/fixed_roi.png", dpi=150)
+    plt.close(fig)
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True, layout="constrained")
+    for name in ("PE", "PECNN"):
+        record = records[name, step]
+        axes[0].plot(record["frame_ids"], np.linalg.norm(record["corrections"][:, :3], axis=-1), label=name)
+        axes[1].plot(record["frame_ids"], np.degrees(np.linalg.norm(record["corrections"][:, 3:], axis=-1)), label=name)
+    axes[0].set_ylabel("Translation generator norm [mm]")
+    axes[1].set(ylabel="Rotation vector norm [deg]", xlabel="Original coronal frame")
+    for axis in axes:
+        axis.legend()
+    fig.savefig(output / "plots/pose_corrections.png", dpi=130)
+    plt.close(fig)
+
+
+@torch.no_grad()
 def query(model, xyz, progress=None, chunk=65536):
     flat = xyz.reshape(-1, 3)
     channels = 1 if model.response_only else 2
