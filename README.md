@@ -28,7 +28,13 @@ qsub日志在 `qsub/logs/neuf/<RUN_ID>/`。正式实验独立保存
 
 项目目标与测试原则：以相同原生切面、共同支持域内的图像与SSIM评价结构、散斑和伪影；
 梯度隔离、阶段冻结和checkpoint重载只证明实现可用，不证明质量或几何精度提高。
-本轮真实效果待实验完成；历史模型、配置和checkpoint保留。
+`20261027_train03` 两组均完成2000步、500次位置更新，六份里程碑独立重载通过。
+共同域 sag SSIM：PE 0.652938、PECNN 0.659958；四张固定coronal均值分别为
+0.787150、0.835175。CNN恢复部分粗结构但仍明显模糊，局部轨迹反向抽查仍有66/723，
+不能据此宣称几何已正确；全部帧参与拟合。详见工作区
+[实验记录](../experiment_reports/2026/1027.md) 和
+[固定切面对照](../logs/20261027_train03/cerebral/index_patient0/comparison/plots/final_comparison.png)。
+历史模型、配置和checkpoint保留。
 
 ## 官方 ImplicitVol / NeSVoR 逐序列重建基线
 
