@@ -20,10 +20,13 @@ SSIM 使用11×11 Gaussian（sigma=1.5px），只统计参考 mask 与重建支�
 各分量限2°。全部原始帧参与输入与拟合，固定展示帧不再宣称是留出测试。
 
 通过工作区 `qsub/neuf/coronal_cnn.sh` 提交；`MODE=smoke` 运行已有轻量检查入口的
-合成场40步两组验证，`MODE=train` 运行Patient0两组各2000步。结果在工作区
+合成场40步两组验证，`MODE=train` 默认运行Patient0两组各20000步，可用 `STEPS` 覆盖。
+20000步时，第4000步后逐步开启位置更新，第8000步达到1:1，第14000步起冻结位置。
+结果在工作区
 `logs/<RUN_ID>/<cerebral或synthetic_cerebral>/index_patient0/{PE,PECNN,comparison}/`；
 qsub日志在 `qsub/logs/neuf/<RUN_ID>/`。正式实验独立保存
-`checkpoints/step_{001000,001500,002000}.pt`，排他创建禁止覆盖，包含完整CNN输入、
+50%、75%和结束的checkpoint（20000步为 `checkpoints/step_{010000,015000,020000}.pt`），
+排他创建禁止覆盖，包含完整CNN输入、
 权重、物理标定、位姿、优化器、原总预算及随机状态，支持 `load_field` 独立查询。
 
 项目目标与测试原则：以相同原生切面、共同支持域内的图像与SSIM评价结构、散斑和伪影；

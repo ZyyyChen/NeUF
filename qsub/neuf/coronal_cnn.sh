@@ -45,7 +45,7 @@ if [[ "${MODE}" == smoke ]]; then
     cmd=("${PYTHON_BIN}" -m neuf.phase1_smoke --coronal-cnn-smoke --output-dir "${RESULT_DIR}/CoronalSmoke")
 else
     cmd=("${PYTHON_BIN}" -m neuf.edge_field.workflow --coronal-cnn-comparison
-         --output "${RESULT_DIR}" --steps 2000 --patches 4 --patch-size 64 --sagittal-patches 2
+         --output "${RESULT_DIR}" --steps "${STEPS:-20000}" --patches 4 --patch-size 64 --sagittal-patches 2
          --width 128 --bands 10 --seed 3407 --lr 0.0005 --pose-lr 0.002)
 fi
 printf 'Mode: %s\nCommand:' "${MODE}"; printf ' %q' "${cmd[@]}"; printf '\n'
