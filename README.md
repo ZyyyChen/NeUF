@@ -577,6 +577,41 @@ qsub -v RUN_ID=YYYYMMDD_trainNN,MODE=smoke \
 
 ## 既有 checkpoint 兼容性
 
+### Patient0 七种现有轨迹的隐式重建与位置修正
+
+`neuf.edge_field.trajectory_reconstruction` 读取已经保存的 4P、7P、Edge、
+Edge 初始化 CNN200、Edge+DT200、人工标注和人工标注+DT200 完整位姿。
+标注两组使用 `20261104_train01/AnnotationSevenDTBaseline` 的第0/200步，
+其余五组使用 `20261029_train01/NetworkInitializationComparison` 的位姿归档。
+每个方法比较 `off`、`translation`、`se3`、`sweep` 四种追加修正；
+上游 CNN/DT 结果保持不变，28组均使用同一 Fourier PE+MLP 灰度场。
+
+训练采用纯单尺度 `1-SSIM`：源帧只更新隐式场，固定 SAG 图只更新位姿。
+首帧固定；平移分量限幅1mm，6DoF旋转向量分量和单一扫角限幅2°。
+扫角绕固定 SAG 法向、各方法保存的初始几何中心旋转，零残差保留完整原位姿。
+Edge/CNN/Edge+DT 的中心继承原7P初始化，是冻结的几何假设，不是实测探头原点。
+每组默认20,000次场更新，位置更新频率在20%–40%升至1、40%–70%降至0，
+其余阶段冻结；关闭模式不执行位置更新。独立保留10,000/15,000/20,000步
+checkpoint，包括模型、位姿模式与中心、优化器、配置和随机状态。
+
+全部242帧参与病例内拟合；原始图像和完整帧声学mask统一。
+自动方法与标注方法保留各自冻结SAG标定，分别为0.133849221834和
+0.13120436758640056mm/px。评价统一到原生708×944像素和
+`EdgeReg/configs/patient0_rois.json` 的R1–R5，报告28组共同域及各方法
+四模式共同域的SSIM、完整窗口数量和覆盖率。这两种评价域不可混减；
+跨方法比较包含既有标定差异，不等于统一物理标定或独立三维定位验证。
+
+通过 `qsub/neuf/trajectory_reconstruction.sh` 提交，资源沿用gpu32×1、
+4CPU、32GB、2小时。先 `MODE=smoke` 合并执行必要模式检查和七组输入核验；
+通过后 `MODE=train,METHOD=FourP`（其他方法同理），全部完成再 `MODE=compare`。
+统一设置 `RUN_ID=YYYYMMDD_trainNN`，结果位于工作区
+`logs/RUN_ID/cerebral/index_patient0/<方法>_<模式>/`，汇总在`comparison/`；
+qsub原生日志单独位于`qsub/logs/neuf/RUN_ID/`，提交前创建日志目录并显式传`-o/-e`。
+
+项目目标与测试原则：观察固定图像的结构清晰度、几何一致性和伪影；
+最小检查只验证坐标、梯度、冻结和checkpoint契约，不能证明重建质量提高。
+本节记录实现设置，实际实验状态与质量结论以共享日报和本轮结果为准。
+
 当前加载器只接受固定几何、无方向分支的 `HASH` 和 `DUAL_HASH` checkpoint。
 属于已移除路线的 checkpoint 会明确报错，不会用 `strict=False` 静默吞掉
 新模型的缺失权重。E2 checkpoint 会严格检查 schema 和两个 decoder head。

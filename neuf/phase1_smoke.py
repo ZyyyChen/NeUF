@@ -507,7 +507,64 @@ def run_frozen_smoke(dataset_path: Path, output_dir: Path, teacher_path: Path) -
     return result
 
 
-def run_sagittal_pose_smoke(output_dir: Path, *, baseline=False, coronal=False) -> dict:
+def check_trajectory_pose_modes(device):
+    """用含离面旋转的完整位姿检查四种残差，不假定输入本来就是平面扇扫。"""
+    from neuf.edge_field.model import PoseRefiner, se3_exp
+
+    twists = torch.tensor([[1., 2., 3., .1, -.2, .05], [2., 3., 4., -.1, .15, .07],
+                           [3., 2., 1., .04, .03, -.1]], device=device)
+    initial = se3_exp(twists)
+    centers = torch.tensor([[.2, -.3, .1], [.4, -.2, .2], [.1, -.1, -.2]], device=device)
+    indices = torch.arange(len(initial), device=device)
+    results = {}
+    for mode in ("off", "translation", "se3", "sweep"):
+        pose = PoseRefiner(initial, indices, centers.mean(0), translation_mm=1., rotation_deg=2.,
+                           mode=mode, sweep_centers=centers, sweep_axis=[0., 0., 1.]).to(device).double()
+        assert torch.equal(pose.matrices(), pose.initial), f"{mode}: 零残差改变输入"
+        with torch.no_grad():
+            pose.raw.fill_(.2)
+        current = pose.matrices()
+        assert torch.equal(current[0], pose.initial[0]), f"{mode}: 首帧未固定"
+        if mode == "off":
+            assert torch.equal(current, pose.initial)
+            results[mode] = dict(zero_preserves_input=True, fixed_first=True, fixed_all=True)
+            continue
+        if mode == "translation":
+            assert torch.equal(current[:, :3, :3], pose.initial[:, :3, :3])
+        if mode == "sweep":
+            local_pivot = torch.einsum("ni,nij->nj", pose.sweep_centers-pose.initial[:, :3, 3],
+                                      pose.initial[:, :3, :3])
+            moved_pivot = (current[:, :3, :3] @ local_pivot[..., None])[..., 0]+current[:, :3, 3]
+            torch.testing.assert_close(moved_pivot, pose.sweep_centers, atol=2e-6, rtol=2e-6)
+            assert float(pose.twists()[:, 3:].norm(dim=-1).max()) <= np.deg2rad(2.)+1e-7
+        # 在零修正处核对实际世界查询的导数，避免用零分支意外切断位置梯度。
+        with torch.no_grad():
+            pose.raw.zero_()
+        points = pose.initial.new_tensor([.8, -.4, 1.2])
+        weights = pose.initial.new_tensor([.4, -.7, .2])
+        def objective():
+            matrix = pose.matrices()[1]
+            return ((matrix[:3, :3] @ points+matrix[:3, 3])*weights).sum()
+        objective().backward()
+        gradient = float(pose.raw.grad[1, 0])
+        assert np.isfinite(gradient) and abs(gradient) > 1e-9
+        assert torch.count_nonzero(pose.raw.grad[0]) == 0
+        epsilon = 1e-5
+        with torch.no_grad():
+            pose.raw[1, 0] = epsilon
+            positive = float(objective())
+            pose.raw[1, 0] = -epsilon
+            negative = float(objective())
+            pose.raw.zero_()
+        numerical = (positive-negative)/(2*epsilon)
+        np.testing.assert_allclose(gradient, numerical, rtol=2e-5, atol=1e-7)
+        results[mode] = dict(zero_preserves_input=True, fixed_first=True,
+                             gradient=gradient, finite_difference=numerical,
+                             fixed_rotation=mode == "translation", fixed_sweep_centers=mode == "sweep")
+    return results
+
+
+def run_sagittal_pose_smoke(output_dir: Path, *, baseline=False, coronal=False, trajectory=False) -> dict:
     """同一合成三维场上的最小训练检查；不读取患者数据，不评价医学重建质量。"""
     import h5py
     from scipy.io import savemat
@@ -579,7 +636,7 @@ def run_sagittal_pose_smoke(output_dir: Path, *, baseline=False, coronal=False) 
                                 config_dir/"landmarks.mat")
     # 新旧模型固定相同的世界包围盒、源图批次、初始化和 INR 更新预算。
     guidance.field_bounds = data.bounds
-    if coronal:
+    if coronal or trajectory:
         import shutil
         from neuf.edge_field.workflow import train_coronal_variant
         from neuf.edge_field.coronal_features import pose_update_rate
@@ -594,6 +651,24 @@ def run_sagittal_pose_smoke(output_dir: Path, *, baseline=False, coronal=False) 
         args.steps, args.patches, args.patch_size, args.sagittal_patches = 40, 1, 32, 1
         args.width, args.bands = 32, 6
         assert [pose_update_rate(p) for p in (0., .2, .4, .7, 1.)] == [0., 0., 1., 0., 0.]
+        if trajectory:
+            checks = check_trajectory_pose_modes(device)
+            data.sweep_centers = data.initial[:, :3, 3]-28.1915615*pitch*data.initial[:, :3, 0]
+            data.sweep_axis = tensor(np.array([1., 0., 0.], dtype=np.float32))
+            initial, runs = None, {}
+            for mode in ("off", "translation", "se3", "sweep"):
+                args.pose_mode = mode
+                directory = output_dir.parent/f"PE_{mode}"
+                initial = train_coronal_variant(data, guidance, directory, args, conditioned=False,
+                                                 initial_state=initial, smoke=True)
+                summary = json.loads((directory/"metrics/training_summary.json").read_text())
+                assert summary["pose_updates"] == (0 if mode == "off" else 10)
+                runs[mode] = summary
+            result = dict(status="complete", steps=40, residual_checks=checks, runs=runs,
+                          gradient_isolation=True, fixed_sagittal=True,
+                          independent_milestones=[20, 30, 40], quality="synthetic implementation check only")
+            write_json(output_dir/"metrics/trajectory_pose_smoke.json", result)
+            return result
         initial = train_coronal_variant(data, guidance, output_dir.parent/"PE", args, conditioned=False, smoke=True)
         train_coronal_variant(data, guidance, output_dir.parent/"PECNN", args, conditioned=True,
                               initial_state=initial, smoke=True)
@@ -680,8 +755,11 @@ def main() -> None:
     parser.add_argument("--sagittal-pose-smoke", action="store_true", help="合成三维场上检查 sag 六自由度与梯度隔离")
     parser.add_argument("--sagittal-pose-baseline", action="store_true", help="由 qsub 用修改前源代码运行同条件对照")
     parser.add_argument("--coronal-cnn-smoke", action="store_true", help="同一合成场验证 coronal CNN、梯度隔离与位置日程")
+    parser.add_argument("--trajectory-pose-smoke", action="store_true", help="同一合成场检查关闭、平移、六自由度与扫角四种残差")
     args = parser.parse_args()
-    if args.coronal_cnn_smoke:
+    if args.trajectory_pose_smoke:
+        result = run_sagittal_pose_smoke(args.output_dir, trajectory=True)
+    elif args.coronal_cnn_smoke:
         result = run_sagittal_pose_smoke(args.output_dir, coronal=True)
     elif args.sagittal_pose_smoke:
         result = run_sagittal_pose_smoke(args.output_dir, baseline=args.sagittal_pose_baseline)

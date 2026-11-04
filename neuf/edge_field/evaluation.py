@@ -29,19 +29,37 @@ EDGE_PRESERVE_VARIANTS = (
 )
 
 
+def _masked_ssim_or_nan(prediction, reference, support):
+    """无完整窗口只报告缺失值，不能把空域当作零分或满分。"""
+    from .losses import masked_ssim
+    if min(support.shape[-2:]) < 11 or not bool((torch.nn.functional.avg_pool2d(
+            support.float(), 11, stride=1) > .99999).any()):
+        return prediction.new_tensor(float("nan")), 0
+    return masked_ssim(prediction, reference, support)
+
+
+def _finite_metric_json(value):
+    """CSV保留NaN；严格JSON以null配合status记录不可计算的指标。"""
+    if isinstance(value, dict):
+        return {key: _finite_metric_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite_metric_json(item) for item in value]
+    return None if isinstance(value, float) and not math.isfinite(value) else value
+
+
 @torch.no_grad()
 def evaluate_coronal_trial(model, poses, data, guidance, output, step, progress, history):
     """固定原生 sag 网格和 coronal 帧，全部灰度采用 [0,1]，不另作归一化。"""
     from .coronal_features import render_coronal_field
-    from .losses import masked_ssim
     output = Path(output)
     matrices = poses.matrices()
     if model.coronal is not None:
         model.coronal.prepare(matrices)
     gray, current = render_coronal_field(model, guidance.xyz_grid, matrices, data.local, data.mask, progress)
-    fixed = guidance.cnn_fixed_support
+    reference_mask = getattr(guidance, "reference_mask", guidance.roi).bool()
+    fixed = guidance.cnn_fixed_support.bool() & reference_mask
     support = current & fixed
-    ssim, windows = masked_ssim(gray[None, None], guidance.reference[None, None], support[None, None])
+    ssim, windows = _masked_ssim_or_nan(gray[None, None], guidance.reference[None, None], support[None, None])
     reference, prediction = guidance.reference.cpu().numpy(), gray.cpu().numpy()
     probe_rows = torch.tensor([int((data.height - 1) * value) for value in (.15, .5, .9)], device=data.local.device)
     local_probes = data.local[probe_rows, data.width // 2]
@@ -49,27 +67,41 @@ def evaluate_coronal_trial(model, poses, data, guidance, output, step, progress,
     initial_points = local_probes @ data.initial[:, :3, :3].transpose(-1, -2) + data.initial[:, None, :3, 3]
     direction_dot = (current_points.diff(dim=0) * initial_points.diff(dim=0)).sum(-1)
     backward_count = int((direction_dot < 0).sum())
-    coronal_predictions, coronal_references, coronal_metrics = [], [], []
+    coronal_predictions, coronal_references, coronal_masks, coronal_metrics = [], [], [], []
     # 只查询实际扇区；显示图仍保留原生尺寸、原坐标与固定选择的帧。
     for index in data.comparison:
-        points = data.local[data.mask] @ matrices[index, :3, :3].T + matrices[index, :3, 3]
+        frame_mask = (data.mask[index] if data.mask.ndim == 3 else data.mask).bool()
+        points = data.local[frame_mask] @ matrices[index, :3, :3].T + matrices[index, :3, 3]
         image = torch.zeros_like(data.images[index])
-        image[data.mask] = torch.cat([model(part, progress)[..., 0] for part in points.split(2048)])
-        value, _ = masked_ssim(image[None, None], data.images[index][None, None], data.mask[None, None])
-        coronal_metrics.append(dict(frame_id=int(data.frame_ids[index]), ssim=float(value)))
+        if len(points):
+            image[frame_mask] = torch.cat([model(part, progress)[..., 0] for part in points.split(2048)])
+        value, count = _masked_ssim_or_nan(image[None, None], data.images[index][None, None], frame_mask[None, None])
+        coronal_metrics.append(dict(frame_id=int(data.frame_ids[index]), ssim=float(value), valid_windows=count,
+                                    status="ok" if count else "no_complete_11x11_windows"))
         coronal_predictions.append(image.cpu().numpy())
         coronal_references.append(data.images[index].cpu().numpy())
+        coronal_masks.append(frame_mask.cpu().numpy())
+    fixed_coverage = float(support.sum() / fixed.sum()) if bool(fixed.any()) else float("nan")
+    reference_coverage = float((current & reference_mask).sum() / reference_mask.sum()) if bool(reference_mask.any()) else float("nan")
     metrics = dict(step=step, model=output.name, sag_ssim=float(ssim), valid_windows=windows,
+                   ssim_status="ok" if windows else "no_complete_11x11_windows",
                    local_backward_samples=backward_count, local_direction_samples=direction_dot.numel(),
-                   fixed_support_coverage=float(support.sum() / fixed.sum()),
+                   fixed_support_coverage=fixed_coverage, reference_mask_coverage=reference_coverage,
+                   reference_mask_pixels=int(reference_mask.sum()), fixed_support_pixels=int(fixed.sum()),
                    coronal=coronal_metrics, mean_coronal_ssim=float(np.mean([row["ssim"] for row in coronal_metrics])),
-                   evaluation_scope="all coronal input; sag supervised; no held-out or 3D accuracy claim")
-    write_json(output / "metrics" / f"step_{step:06d}.json", metrics)
+                   pose_mode=getattr(poses, "mode", "se3"),
+                   evaluation_scope=("all coronal input; SAG evaluation only in this NeRF stage; no held-out or 3D accuracy claim"
+                                     if getattr(poses, "mode", "se3") == "off" else
+                                     "all coronal input; SAG drives pose updates; no held-out or 3D accuracy claim"))
+    write_json(output / "metrics" / f"step_{step:06d}.json", _finite_metric_json(metrics))
     np.savez_compressed(output / "predictions" / f"step_{step:06d}.npz",
                         reference=reference, gray=prediction, fixed_support=fixed.cpu().numpy(),
+                        reference_mask=reference_mask.cpu().numpy(),
                         current_support=current.cpu().numpy(), frame_ids=data.frame_ids.cpu().numpy(),
                         coronal=np.stack(coronal_predictions), coronal_reference=np.stack(coronal_references),
-                        coronal_mask=data.mask.cpu().numpy(), corrections=poses.twists().cpu().numpy(),
+                        coronal_mask=(np.stack(coronal_masks) if data.mask.ndim == 3 else coronal_masks[0]),
+                        coronal_frame_ids=np.array([int(data.frame_ids[index]) for index in data.comparison]),
+                        corrections=poses.twists().cpu().numpy(), initial_poses=data.initial.cpu().numpy(),
                         corrected_poses=matrices.cpu().numpy())
     display = support.cpu().numpy()
     fig, axes = plt.subplots(1, 3, figsize=(15, 6), layout="constrained")
@@ -85,7 +117,7 @@ def evaluate_coronal_trial(model, poses, data, guidance, output, step, progress,
     for column, (target, image, row) in enumerate(zip(coronal_references, coronal_predictions, coronal_metrics)):
         for axis, panel, title in zip(axes[:, column], (target, image, np.abs(target-image)),
                                       (f"Observed frame {row['frame_id']}", f"SSIM {row['ssim']:.4f}", "Absolute difference")):
-            axis.imshow(np.where(data.mask.cpu().numpy(), panel, np.nan), cmap="magma" if axis is axes[2, column] else "gray", vmin=0, vmax=1)
+            axis.imshow(np.where(coronal_masks[column], panel, np.nan), cmap="magma" if axis is axes[2, column] else "gray", vmin=0, vmax=1)
             axis.set(title=title, xlabel="Native column [px]", ylabel="Native row [px]")
     fig.savefig(output / "plots" / f"coronal_{step:06d}.png", dpi=110)
     plt.close(fig)
@@ -168,6 +200,204 @@ def compare_coronal_trials(root, step):
         axis.legend()
     fig.savefig(output / "plots/pose_corrections.png", dpi=130)
     plt.close(fig)
+
+
+def compare_trajectory_trials(root, step, methods, modes, roi_config):
+    """在原生SAG像素域比较全部轨迹；全组域与每方法消融域分别报告。"""
+    from PIL import Image
+    root, workspace = Path(root), Path(__file__).resolve().parents[3]
+    roi_path = Path(roi_config)
+    if not roi_path.is_absolute():
+        roi_path = workspace / roi_path
+    roi_path = roi_path.resolve()
+    if not roi_path.is_relative_to(workspace):
+        raise ValueError("ROI配置必须位于当前工作区")
+    roi = json.loads(roi_path.read_text())
+    reference_path = (workspace / roi["image_path"]).resolve()
+    if not reference_path.is_relative_to(workspace):
+        raise ValueError("ROI参考图必须位于当前工作区")
+    if hashlib.sha256(reference_path.read_bytes()).hexdigest() != roi["image_sha256"]:
+        raise ValueError("ROI参考图哈希不匹配")
+    reference_uint8 = np.asarray(Image.open(reference_path).convert("L"))
+    if list(reference_uint8.shape) != roi["image_shape_hw"]:
+        raise ValueError("ROI参考图尺寸不匹配")
+    output = root / "comparison"
+    for directory in ("metrics", "plots", "predictions", "run_config"):
+        (output / directory).mkdir(parents=True, exist_ok=True)
+    records, manifests, diagnostics = {}, {}, {}
+    keys = ("reference", "reference_mask", "gray", "fixed_support", "current_support",
+            "frame_ids", "corrections", "initial_poses", "corrected_poses")
+    for method in methods:
+        for mode in modes:
+            name = f"{method}_{mode}"
+            folder = root / name
+            with np.load(folder / "predictions" / f"step_{step:06d}.npz") as saved:
+                records[method, mode] = {key: saved[key].copy() for key in keys}
+            manifests[name] = json.loads((folder / "run_config/data_manifest.json").read_text())
+            diagnostics[name] = json.loads((folder / "metrics" / f"step_{step:06d}.json").read_text())
+    reference = records[methods[0], modes[0]]["reference"]
+    reference_mask = records[methods[0], modes[0]]["reference_mask"].astype(bool)
+    np.testing.assert_allclose(reference, reference_uint8.astype(np.float32) / 255, atol=1e-7, rtol=0)
+    supports, scores, motions = {}, {}, {}
+    for key, record in records.items():
+        np.testing.assert_array_equal(record["reference"], reference)
+        np.testing.assert_array_equal(record["reference_mask"], reference_mask)
+        np.testing.assert_array_equal(record["frame_ids"], records[methods[0], modes[0]]["frame_ids"])
+        prediction = record["gray"]
+        if prediction.shape != reference.shape or not np.isfinite(prediction).all():
+            raise ValueError(f"{key} 的原生重建尺寸或有限值检查失败")
+        supports[key] = record["fixed_support"].astype(bool) & record["current_support"].astype(bool) & reference_mask
+        # 每个结果只计算一次Gaussian11图，再选择不同域的完整窗口中心。
+        a, b = prediction.astype(np.float64), reference.astype(np.float64)
+        smooth = lambda array: gaussian_filter(array, 1.5, truncate=5 / 1.5, mode="constant")
+        ma, mb = smooth(a), smooth(b)
+        va, vb = np.maximum(smooth(a*a)-ma*ma, 0), np.maximum(smooth(b*b)-mb*mb, 0)
+        covariance = smooth(a*b)-ma*mb
+        scores[key] = ((2*ma*mb+.01**2)*(2*covariance+.03**2)
+                       / ((ma*ma+mb*mb+.01**2)*(va+vb+.03**2)))
+        initial, corrected = record["initial_poses"], record["corrected_poses"]
+        np.testing.assert_array_equal(initial, records[key[0], modes[0]]["initial_poses"])
+        np.testing.assert_array_equal(record["fixed_support"], records[key[0], modes[0]]["fixed_support"])
+        # 用差值构造相对旋转，使off/纯平移的完全相同R精确得到单位阵。
+        initial_rotation = initial[:, :3, :3].astype(np.float64)
+        relative_rotation = ((corrected[:, :3, :3].astype(np.float64)-initial_rotation)
+                             @ np.linalg.inv(initial_rotation) + np.eye(3))
+        skew = np.stack((relative_rotation[:, 2, 1]-relative_rotation[:, 1, 2],
+                         relative_rotation[:, 0, 2]-relative_rotation[:, 2, 0],
+                         relative_rotation[:, 1, 0]-relative_rotation[:, 0, 1]), axis=-1) / 2
+        motions[key] = (np.linalg.norm(corrected[:, :3, 3]-initial[:, :3, 3], axis=-1),
+                        np.degrees(np.arctan2(np.linalg.norm(skew, axis=-1),
+                                             (relative_rotation.trace(axis1=1, axis2=2)-1)/2)))
+    global_common = np.logical_and.reduce(list(supports.values()))
+    method_common = {method: np.logical_and.reduce([supports[method, mode] for mode in modes]) for method in methods}
+    complete_global = minimum_filter(global_common, size=11, mode="constant", cval=0)
+    metric_validation = dict(status="not_applicable", reason="no_complete_11x11_windows", complete_windows=0)
+    if complete_global.any():
+        first = (methods[0], modes[0])
+        tensor = lambda value: torch.as_tensor(value, dtype=torch.float64)[None, None]
+        torch_score, count = _masked_ssim_or_nan(tensor(records[first]["gray"]), tensor(reference), tensor(global_common))
+        scipy_score = float(scores[first][complete_global].mean())
+        difference = abs(float(torch_score)-scipy_score)
+        if count != int(complete_global.sum()) or difference > 1e-9:
+            raise AssertionError(f"SSIM完整窗口或双实现核验失败: windows={count}, difference={difference}")
+        metric_validation = dict(status="passed", method=first[0], mode=first[1], complete_windows=count,
+                                 torch_ssim=float(torch_score), scipy_ssim=scipy_score, absolute_difference=difference,
+                                 tolerance=1e-9)
+    regions = {"Full": np.ones(reference.shape, dtype=bool)}
+    for region_id, (x, y, width, height) in zip(roi["roi_ids"], roi["roi_xywh"]):
+        if min(x, y, width, height) < 0 or x+width > reference.shape[1] or y+height > reference.shape[0]:
+            raise ValueError(f"{region_id} ROI越出参考图")
+        mask = np.zeros(reference.shape, dtype=bool)
+        mask[y:y+height, x:x+width] = True
+        regions[region_id] = mask
+    rows = []
+    domains = {"all_methods_modes": global_common, **{f"within_{method}": mask for method, mask in method_common.items()}}
+    for domain, common in domains.items():
+        included = methods if domain == "all_methods_modes" else [domain.removeprefix("within_")]
+        for region, region_mask in regions.items():
+            support = common & region_mask
+            complete = minimum_filter(support, size=11, mode="constant", cval=0)
+            count = int(complete.sum())
+            for method in included:
+                for mode in modes:
+                    key, name = (method, mode), f"{method}_{mode}"
+                    record, motion = records[key], motions[key]
+                    current = record["current_support"].astype(bool) & reference_mask
+                    fixed = record["fixed_support"].astype(bool) & reference_mask
+                    denominator = int((region_mask & reference_mask).sum())
+                    fixed_count = int((fixed & region_mask).sum())
+                    rows.append(dict(method=method, mode=mode, step=step, domain=domain, region=region,
+                        ssim=float(scores[key][complete].mean()) if count else float("nan"),
+                        complete_windows=count, common_pixels=int(support.sum()),
+                        status="ok" if count else "no_complete_11x11_windows",
+                        reference_mask_coverage=float((current & region_mask).sum()/denominator) if denominator else float("nan"),
+                        fixed_support_coverage=float((current & fixed & region_mask).sum()/fixed_count) if fixed_count else float("nan"),
+                        mean_coronal_ssim=diagnostics[name]["mean_coronal_ssim"],
+                        max_origin_displacement_mm=float(motion[0].max()),
+                        max_relative_rotation_deg=float(motion[1].max())))
+    global_rows = [row for row in rows if row["domain"] == "all_methods_modes"]
+    paired_rows = [row for row in rows if row["domain"] != "all_methods_modes"]
+    write_csv(output / "metrics/global_comparison.csv", global_rows)
+    write_csv(output / "metrics/within_method_comparison.csv", paired_rows)
+    write_json(output / "metrics/comparison.json", _finite_metric_json(dict(step=step, global_rows=global_rows, within_method_rows=paired_rows,
+        metric_validation=metric_validation,
+        global_common_pixels=int(global_common.sum()), method_common_pixels={k: int(v.sum()) for k, v in method_common.items()},
+        metric="Gaussian11 sigma1.5 SSIM; data_range1; population covariance; complete windows within ROI and common support",
+        interpretation="in-sample reconstruction; all coronal inputs used; SAG drives NeRF pose updates only in non-off modes; "
+                       "upstream trajectories already fitted to this SAG; original per-method frozen calibration retained; "
+                       "global and within-method domains cannot be compared by subtracting scores; no independent 3D GT")))
+    write_json(output / "run_config/trajectory_comparison_manifest.json", dict(methods=list(methods), modes=list(modes), step=step,
+        roi_config=str(roi_path), roi_config_sha256=hashlib.sha256(roi_path.read_bytes()).hexdigest(), roi=roi,
+        source_manifests=manifests, trajectory_frame_ids=records[methods[0], modes[0]]["frame_ids"].tolist(),
+        native_shape=list(reference.shape), display_range=[0, 1]))
+    np.savez_compressed(output / "predictions/comparison_domains.npz", reference_mask=reference_mask,
+                        global_common=global_common, **{f"within_{name}": value for name, value in method_common.items()})
+    lookup = {(row["method"], row["mode"], row["domain"], row["region"]): row for row in rows}
+    for region in regions:
+        fig, axes = plt.subplots(len(methods), len(modes)+1, figsize=(4*(len(modes)+1), 3.2*len(methods)),
+                                 squeeze=False, layout="constrained")
+        for row_index, method in enumerate(methods):
+            axes[row_index, 0].imshow(np.where(reference_mask, reference, np.nan), cmap="gray", vmin=0, vmax=1)
+            axes[row_index, 0].set_title(f"{method}: measured SAG")
+            for column, mode in enumerate(modes, 1):
+                axis, key = axes[row_index, column], (method, mode)
+                record = records[key]
+                display = record["current_support"].astype(bool) & reference_mask
+                axis.imshow(np.where(display, record["gray"], np.nan), cmap="gray", vmin=0, vmax=1)
+                if global_common.any() and not global_common.all():
+                    axis.contour(global_common, levels=[.5], colors=["#ffd34e"], linewidths=.45)
+                global_row = lookup[method, mode, "all_methods_modes", region]
+                local_row = lookup[method, mode, f"within_{method}", region]
+                axis.set_title(f"{mode}: all {global_row['ssim']:.4f} / within {local_row['ssim']:.4f}\n"
+                               f"coverage {global_row['reference_mask_coverage']:.1%}")
+            for axis in axes[row_index]:
+                axis.set(xlabel="Native column [px]", ylabel="Native row [px]")
+                if region != "Full":
+                    index = roi["roi_ids"].index(region)
+                    x, y, width, height = roi["roi_xywh"][index]
+                    axis.set(xlim=(x-.5, x+width-.5), ylim=(y+height-.5, y-.5))
+        fig.suptitle(f"{region}; step {step}; grayscale [0,1]; yellow = all-trial common domain; original frozen calibrations")
+        fig.savefig(output / "plots" / ("overview.png" if region == "Full" else f"roi_{region}.png"), dpi=110)
+        plt.close(fig)
+    fig, axes = plt.subplots(len(methods), len(modes), figsize=(4*len(modes), 3*len(methods)), squeeze=False, layout="constrained")
+    for row, method in enumerate(methods):
+        for column, mode in enumerate(modes):
+            record = records[method, mode]
+            display = record["current_support"].astype(bool) & reference_mask
+            view = axes[row, column].imshow(np.where(display, np.abs(record["gray"]-reference), np.nan),
+                                            cmap="magma", vmin=0, vmax=1)
+            axes[row, column].set(title=f"{method} / {mode}", xlabel="Native column [px]", ylabel="Native row [px]")
+    fig.colorbar(view, ax=list(axes.flat), label="Absolute gray difference [0,1]", shrink=.5)
+    fig.savefig(output / "plots/absolute_difference.png", dpi=110)
+    plt.close(fig)
+    fig, axes = plt.subplots(1, 3, figsize=(15, max(4, len(methods)*.8)), layout="constrained")
+    for axis, field, title, domain in zip(axes, ("ssim", "ssim", "reference_mask_coverage"),
+            ("SSIM: all-trial domain", "SSIM: within-method domains", "Coverage of original SAG mask"),
+            ("all_methods_modes", None, "all_methods_modes")):
+        matrix = np.array([[lookup[method, mode, domain or f"within_{method}", "Full"][field] for mode in modes] for method in methods])
+        view = axis.imshow(matrix, cmap="viridis", vmin=0 if field != "ssim" else -1, vmax=1, aspect="auto")
+        axis.set(xticks=range(len(modes)), xticklabels=modes, yticks=range(len(methods)), yticklabels=methods, title=title)
+        for row in range(len(methods)):
+            for column in range(len(modes)):
+                value = matrix[row, column]
+                axis.text(column, row, f"{value:.4f}" if np.isfinite(value) else "N/A", ha="center", va="center", color="white", fontsize=9)
+        fig.colorbar(view, ax=axis, shrink=.8)
+    fig.savefig(output / "plots/metrics_summary.png", dpi=140)
+    plt.close(fig)
+    fig, axes = plt.subplots(len(methods), 2, figsize=(12, 2.7*len(methods)), squeeze=False, layout="constrained")
+    for row, method in enumerate(methods):
+        for mode in modes:
+            frames = records[method, mode]["frame_ids"]
+            for column, values in enumerate(motions[method, mode]):
+                axes[row, column].plot(frames, values, label=mode)
+        axes[row, 0].set(title=method, ylabel="Actual origin displacement [mm]")
+        axes[row, 1].set(title=method, ylabel="Relative rotation [deg]")
+        for axis in axes[row]:
+            axis.set_xlabel("Original coronal frame")
+            axis.legend()
+    fig.savefig(output / "plots/pose_corrections.png", dpi=130)
+    plt.close(fig)
+    return dict(global_rows=global_rows, within_method_rows=paired_rows, metric_validation=metric_validation, output=str(output))
 
 
 @torch.no_grad()

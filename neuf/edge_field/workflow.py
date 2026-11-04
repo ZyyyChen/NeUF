@@ -18,7 +18,7 @@ from .data import EdgeData, SagittalIntersection, write_json
 from .evaluation import (compare, compare_sweeps, evaluate, evaluate_sweep, export_volume, query, write_csv,
                          evaluate_guided_sagittal, compare_guided_sagittal)
 from .losses import edge_guided_losses, edge_preserving_losses, losses, response_losses, sagittal_patch_losses
-from .model import EdgeField, PoseRefiner, load_field, se3_exp
+from .model import EdgeField, PoseRefiner, load_field, load_pose_refiner, se3_exp
 from .response_evaluation import compare_responses, evaluate_response
 from .sweep_geometry import SweepPoseRefiner, load_sagittal_pose, load_sweep
 
@@ -50,7 +50,8 @@ def checkpoint(model, poses, data, optimizers, config, step, *, generators=None,
                 torch_rng_state=torch.get_rng_state(),
                 cuda_rng_states=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
                 frequency_progress=min((step-1)/max(config["steps"]-1, 1)/(.5 if model.response_only else .7), 1.),
-                data_metadata=data.metadata, local_grid=data.local.cpu(), mask=data.mask.cpu(),
+                data_metadata=data.metadata, local_grid=data.local.cpu(),
+                mask=(data.mask.bool().cpu() if data.mask.ndim == 3 else data.mask.cpu()),
                 sweep_metadata=poses.metadata if isinstance(poses, SweepPoseRefiner) else None,
                 sagittal_pose=sagittal.pose.state_dict() if sagittal is not None else None,
                 corrected_sagittal_pose=sagittal.pose.matrix().detach().cpu() if sagittal is not None else None)
@@ -889,7 +890,7 @@ def align_poses(data, args):
 
 
 def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_state=None, smoke=False):
-    """固定 sag、纯 SSIM 的 PE / PE+CNN 对照；一步始终表示一次 INR 更新。"""
+    """固定 sag、纯 SSIM 的坐标场训练；smoke 复用实际数据与同一保存链路。"""
     import random
     from .coronal_features import pose_update_rate, render_coronal_field
     from .losses import masked_ssim
@@ -925,21 +926,31 @@ def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_
     if conditioned:
         model.coronal.initialize(data)
     all_frames = torch.arange(len(data.images), device=device)
+    pose_mode = getattr(args, "pose_mode", "se3")
+    pose_config = dict(translation_mm=1., rotation_deg=2., mode=pose_mode)
+    sweep_config = (dict(sweep_centers=getattr(data, "sweep_centers", None),
+                         sweep_axis=getattr(data, "sweep_axis", None)) if pose_mode == "sweep" else {})
     poses = PoseRefiner(data.initial, all_frames, data.bounds.mean(0),
-                        translation_mm=1., rotation_deg=2.).to(device)
+                        **pose_config, **sweep_config).to(device)
     guidance.pose.requires_grad_(False)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     pose_optimizer = torch.optim.Adam(poses.parameters(), lr=args.pose_lr)
     milestones = sorted({math.ceil(args.steps / 2), math.ceil(3 * args.steps / 4), args.steps})
     config = dict(vars(args), conditioned=conditioned, model_config=model.config,
                   steps=args.steps, checkpoint_milestones=milestones, loss="pure single-scale 1-SSIM",
-                  pose_schedule=dict(start=.2, peak=.4, end=.7, peak_updates_per_inr=1),
+                  pose_mode=pose_mode,
+                  pose_schedule=dict(start=.2, peak=.4, end=.7, peak_updates_per_inr=int(pose_mode != "off")),
                   source_frames=data.frame_ids.tolist(), fixed_sagittal=True,
                   source_scope="all coronal frames; in-sample reconstruction, no held-out claim",
+                  sagittal_supervision=pose_mode != "off",
                   pose_limits=dict(translation_component_mm=1., rotation_component_deg=2., first_frame_fixed=True),
                   sag_render="two nearest supported coronal planes, projected INR predictions, Gaussian distance fusion",
                   feature_fusion="all coronal maps, Gaussian normal distance sigma=0.75 mm, normalized valid weights",
                   shared_initial_sha256=tensor_signature(shared_initial.values()))
+    if pose_mode == "sweep":
+        config["sweep_geometry"] = dict(axis=poses.sweep_axis.cpu().tolist(),
+            centers_mm=poses.sweep_centers.cpu().tolist(),
+            definition="bounded scalar residual about frozen source initialization centers; preserves full input pose at zero")
     config = {key: str(value) if isinstance(value, Path) else value for key, value in config.items()}
     write_json(output / "run_config/config.json", config)
     write_json(output / "run_config/data_manifest.json", data.metadata)
@@ -979,7 +990,7 @@ def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_
             for step in bar:
                 t0 = time.perf_counter()
                 progress = min(step / args.steps / .7, 1.)
-                rate = pose_update_rate(step / args.steps)
+                rate = pose_update_rate(step / args.steps) if pose_mode != "off" else 0.
                 poses.requires_grad_(False)
                 model.requires_grad_(True)
                 model.edge.requires_grad_(False)
@@ -1036,6 +1047,8 @@ def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_
                     if smoke:
                         assert all(torch.equal(old, now) for old, now in zip(before_field, model.parameters()))
                 assert torch.equal(sag_fixed, guidance.pose.matrix())
+                if pose_mode == "off":
+                    assert pose_updates == 0 and torch.equal(poses.matrices(), poses.initial)
                 if step <= math.floor(.2 * args.steps):
                     assert torch.count_nonzero(poses.raw) == 0
                 if step >= math.ceil(.7 * args.steps):
@@ -1065,7 +1078,7 @@ def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_
                                              generators=dict(patch=generator, pose=sag_generator), sagittal=guidance)
                         payload.update(frequency_progress=progress, python_rng_state=random.getstate(),
                                        numpy_rng_state=np.random.get_state(), pose_accumulator=accumulator,
-                                       pose_updates=pose_updates, pose_config=dict(translation_mm=1., rotation_deg=2.))
+                                       pose_updates=pose_updates, pose_config=pose_config)
                         path = output / "checkpoints" / f"step_{step:06d}.pt"
                         with path.open("xb") as handle:
                             torch.save(payload, handle)
@@ -1083,10 +1096,15 @@ def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_
             loaded, saved = load_field(path, device)
             assert saved["completed_steps"] == audit["step"] and saved["optimizer_states"]
             with torch.no_grad():
-                restored = PoseRefiner(saved["poses"]["initial"], saved["train_indices"],
-                                       saved["poses"]["center"], **saved["pose_config"]).to(device)
-                restored.load_state_dict(saved["poses"], strict=True)
+                restored = load_pose_refiner(saved, device)
                 torch.testing.assert_close(restored.matrices(), saved["corrected_poses"].to(device), atol=0, rtol=0)
+                if saved["data_metadata"].get("reference_geometry") == "native_sag_pixel_pitch_v1":
+                    from .trajectory_reconstruction import load_fixed_reference
+                    reference_pose = load_fixed_reference(saved, device)
+                    torch.testing.assert_close(reference_pose.grid(), guidance.xyz_grid, atol=0, rtol=0)
+                    torch.testing.assert_close(reference_pose.native_shape, guidance.pose.native_shape, atol=0, rtol=0)
+                    torch.testing.assert_close(reference_pose.pitch, guidance.pose.pitch, atol=0, rtol=0)
+                    audit["reference_grid_independently_loaded"] = True
                 world = points @ restored.matrices()[0, :3, :3].T + restored.matrices()[0, :3, 3]
                 assert torch.isfinite(loaded(world)).all()
                 if audit["step"] == args.steps:
@@ -1101,7 +1119,7 @@ def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_
             configured_epochs=1, completed_epochs=int(completed == args.steps),
             start_timestamp=stamp, end_timestamp=timestamp(), total_wall_time_sec=time.perf_counter()-started,
             mean_step_time_sec=float(np.mean([row["step_time_sec"] for row in timing])) if timing else None,
-            pose_updates=pose_updates, cnn_gradient_seen=cnn_gradient_seen,
+            pose_updates=pose_updates, pose_mode=pose_mode, cnn_gradient_seen=cnn_gradient_seen,
             retained_checkpoints=paths, final_checkpoint=paths[-1] if paths else None,
             quality="in-sample; assess fixed-plane images, not checkpoint checks"))
     return shared_initial
@@ -1171,6 +1189,8 @@ def parser():
     parser.add_argument("--plane-resolutions", nargs="*", type=int, default=[], help="response 场的多分辨率特征平面；空值沿用纯 MLP")
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--pose-lr", type=float, default=2e-3)
+    parser.add_argument("--pose-mode", choices=("off", "translation", "se3", "sweep"), default="se3",
+                        help="coronal 坐标场的附加位置修正；sweep 需要来源中保存的旋转中心")
     parser.add_argument("--pose-every", type=int, default=5)
     parser.add_argument("--pose-start", type=float, default=.2, help="全点模式开始几何更新的 INR 预算比例")
     parser.add_argument("--pose-end", type=float, default=.8, help="全点模式结束几何更新的 INR 预算比例")

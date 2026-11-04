@@ -81,8 +81,15 @@ def coronal_projection(xyz, matrices, local_grid, mask, *, neighbors=2, sigma_mm
                          matrices[:, :3, :3])
     uv = 2 * (local[..., :2] - local_grid[0, 0, :2]) / (
         local_grid[-1, -1, :2] - local_grid[0, 0, :2]) - 1
-    sampled_mask = F.grid_sample(mask[None, None].float().expand(len(matrices), -1, -1, -1),
-                                 uv.flip(-1)[:, :, None], align_corners=True)[..., 0][:, 0]
+    # 新轨迹入口缓存逐帧浮点掩膜；旧入口的共同二维掩膜仍按帧广播。
+    if mask.ndim == 2:
+        masks = mask[None, None].to(local.dtype).expand(len(matrices), -1, -1, -1)
+    elif mask.ndim == 3 and len(mask) == len(matrices):
+        masks = mask[:, None].to(local.dtype)
+    else:
+        raise ValueError("coronal mask 必须为 [H,W] 或与位姿对应的 [N,H,W]")
+    sampled_mask = F.grid_sample(masks, uv.flip(-1)[:, :, None],
+                                 align_corners=True)[..., 0][:, 0]
     valid = sampled_mask > .999
     distance = local[..., 2].abs()
     ranked = distance.detach().masked_fill(~valid, float("inf"))

@@ -211,30 +211,63 @@ class EdgeField(nn.Module):
 
 
 class PoseRefiner(nn.Module):
-    def __init__(self, initial, train_indices, center, *, translation_mm=2.0, rotation_deg=2.0):
+    """在完整输入位姿上施加残差；零残差保留原有离面、旋转及平移。"""
+
+    def __init__(self, initial, train_indices, center, *, translation_mm=2.0, rotation_deg=2.0,
+                 mode="se3", sweep_centers=None, sweep_axis=None):
         super().__init__()
+        if mode not in ("off", "translation", "se3", "sweep"):
+            raise ValueError(f"未知位姿修正模式: {mode}")
         initial = torch.as_tensor(initial, dtype=torch.float32)
+        if initial.ndim != 3 or initial.shape[1:] != (4, 4) or not torch.isfinite(initial).all():
+            raise ValueError("initial 须为有限的 [N,4,4] 完整位姿")
+        self.mode = mode
         self.register_buffer("initial", initial)
-        self.register_buffer("center", torch.as_tensor(center, dtype=torch.float32))
-        self.register_buffer("limits", torch.tensor([translation_mm] * 3 +
-                                                    [math.radians(rotation_deg)] * 3))
-        active = torch.zeros(len(initial), 1)
+        self.register_buffer("center", torch.as_tensor(center, dtype=initial.dtype, device=initial.device))
+        self.register_buffer("limits", initial.new_tensor([translation_mm] * 3 +
+                                                          [math.radians(rotation_deg)] * 3))
+        active = initial.new_zeros(len(initial), 1)
         active[train_indices] = 1
         active[train_indices[0]] = 0
         self.register_buffer("active", active)
-        self.raw = nn.Parameter(torch.zeros(len(initial), 6))
+        dimensions = {"off": 6, "translation": 3, "se3": 6, "sweep": 1}
+        self.raw = nn.Parameter(initial.new_zeros(len(initial), dimensions[mode]))
+        if mode == "sweep":
+            if sweep_centers is None:
+                raise ValueError("扫角模式必须提供原方法保存的逐帧旋转中心")
+            pivots = torch.as_tensor(sweep_centers, dtype=initial.dtype, device=initial.device)
+            axis = torch.as_tensor([0., 0., 1.] if sweep_axis is None else sweep_axis,
+                                   dtype=initial.dtype, device=initial.device)
+            if pivots.shape != (len(initial), 3) or not torch.isfinite(pivots).all():
+                raise ValueError("扫角中心须为有限的 [N,3] 世界毫米坐标")
+            if axis.shape != (3,) or not torch.isfinite(axis).all() or axis.norm() <= 0:
+                raise ValueError("扫角轴须为非零有限的三维世界方向")
+            self.register_buffer("sweep_centers", pivots)
+            self.register_buffer("sweep_axis", axis / axis.norm())
 
     def twists(self):
+        if self.mode == "off":
+            return self.raw * 0
+        if self.mode == "translation":
+            translation = self.raw.tanh() * self.limits[:3] * self.active
+            return torch.cat((translation, torch.zeros_like(translation)), -1)
+        if self.mode == "sweep":
+            rotation = self.raw.tanh() * self.limits[3] * self.active * self.sweep_axis
+            return torch.cat((torch.zeros_like(rotation), rotation), -1)
         return self.raw.tanh() * self.limits * self.active
 
     def matrices(self):
-        # 在固定场景中心附近做左乘修正，避免世界原点很远时旋转引入巨大平移。
-        centered = self.initial.clone()
-        centered[:, :3, 3] -= self.center
-        corrected = se3_exp(self.twists()) @ centered
-        result = torch.cat((torch.cat((corrected[:, :3, :3],
-                            (corrected[:, :3, 3] + self.center).unsqueeze(-1)), -1),
-                            corrected[:, 3:4]), -2)
+        if self.mode == "off":
+            return self.initial
+        correction = se3_exp(self.twists())
+        pivot = self.sweep_centers if self.mode == "sweep" else self.center
+        # 用增量表达避免 (t-c)+c 的舍入误差；零残差逐元素等于输入，且零点梯度保留。
+        delta_rotation = correction[:, :3, :3] - torch.eye(3, device=self.initial.device,
+                                                          dtype=self.initial.dtype)
+        rotation = self.initial[:, :3, :3] + delta_rotation @ self.initial[:, :3, :3]
+        translation = (self.initial[:, :3, 3] + correction[:, :3, 3]
+                       + (delta_rotation @ (self.initial[:, :3, 3]-pivot)[..., None])[..., 0])
+        result = torch.cat((torch.cat((rotation, translation[..., None]), -1), self.initial[:, 3:4]), -2)
         return torch.where(self.active[:, :, None].bool(), result, self.initial)
 
     def forward(self, frame_indices, local_points):
@@ -248,6 +281,19 @@ class PoseRefiner(nn.Module):
         gaps = (frame_ids[train_indices][1:] - frame_ids[train_indices][:-1]).clamp_min(1)
         smooth = ((selected[1:] - selected[:-1]) / gaps[:, None]).square().mean()
         return normalized.square().mean() + smooth
+
+
+def load_pose_refiner(checkpoint, device="cpu"):
+    """仅用 checkpoint 恢复残差模式和固定中心；旧 checkpoint 默认六自由度。"""
+    state = checkpoint["poses"]
+    config = dict(checkpoint.get("pose_config", {}))
+    config.setdefault("translation_mm", float(state["limits"][0]))
+    config.setdefault("rotation_deg", math.degrees(float(state["limits"][3])))
+    if config.get("mode", "se3") == "sweep":
+        config.update(sweep_centers=state["sweep_centers"], sweep_axis=state["sweep_axis"])
+    poses = PoseRefiner(state["initial"], checkpoint["train_indices"], state["center"], **config).to(device)
+    poses.load_state_dict(state, strict=True)
+    return poses
 
 
 class InPlanePoseRefiner(nn.Module):
