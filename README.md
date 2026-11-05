@@ -584,7 +584,11 @@ Edge 初始化 CNN200、Edge+DT200、人工标注和人工标注+DT200 完整位
 标注两组使用 `20261104_train01/AnnotationSevenDTBaseline` 的第0/200步，
 其余五组使用 `20261029_train01/NetworkInitializationComparison` 的位姿归档。
 每个方法比较 `off`、`translation`、`se3`、`sweep` 四种追加修正；
-上游 CNN/DT 结果保持不变，28组均使用同一 Fourier PE+MLP 灰度场。
+上游 CNN/DT 结果保持不变，28组默认使用同一 HashGrid+MLP 灰度场
+（16层、每层2维、哈希表上限2^19、分辨率16–512）。入口通过
+`--encoding hash|fourier` 选择，qsub通过 `ENCODING` 传入，默认 `hash`；
+旧 Fourier 结果保留，不混入新轮结果。汇总表单独标明是否修改位置坐标，
+`off` 为否，另外三种模式为是。
 
 训练采用纯单尺度 `1-SSIM`：源帧只更新隐式场，固定 SAG 图只更新位姿。
 首帧固定；平移分量限幅1mm，6DoF旋转向量分量和单一扫角限幅2°。

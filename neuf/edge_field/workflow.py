@@ -907,6 +907,7 @@ def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_
     sag_generator = torch.Generator().manual_seed(args.seed + 1)
     context = dict(frames=len(data.images), height=96, width=128, channels=32, sigma_mm=.75)
     model = EdgeField(data.bounds, bands=args.bands, width=args.width,
+                      encoding=getattr(args, "encoding", "fourier"),
                       coronal_config=context if conditioned else None).to(device)
     if initial_state is not None:
         # 扩大的第一层保留相同 PE 权重；新增列从零开始，其余网络逐项相同。

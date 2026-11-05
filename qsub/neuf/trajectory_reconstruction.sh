@@ -13,6 +13,8 @@ PYTHON_BIN=/home/zchen/.conda/envs/neuf/bin/python
 MODE=${MODE:-smoke}
 METHOD=${METHOD:-all}
 ATTEMPT=${ATTEMPT:-1}
+ENCODING=${ENCODING:-hash}
+[[ "$ENCODING" == hash || "$ENCODING" == fourier ]]
 [[ "$RUN_ID" =~ ^[0-9]{8}_train[0-9]{2,}$ ]]
 [[ "$MODE" == smoke || "$MODE" == prepare || "$MODE" == train || "$MODE" == compare ]]
 [[ "$METHOD" =~ ^(all|FourP|SevenP|Edge|CNN|EdgeDT|Annotation|AnnotationDT)$ ]]
@@ -43,26 +45,28 @@ cp neuf/phase1_smoke.py "${BASH_SOURCE[0]}" "$RESULT_DIR/comparison/run_config/$
 git rev-parse HEAD > "$RESULT_DIR/comparison/run_config/$TASK/git_commit.txt"
 git diff -- neuf/edge_field neuf/phase1_smoke.py qsub/neuf/trajectory_reconstruction.sh > "$RESULT_DIR/comparison/run_config/$TASK/source.diff"
 run() { printf '命令:'; printf ' %q' "$@"; printf '\n'; "$@"; }
+# 所有实际训练和评价入口显式记录本轮编码器。
+trajectory() { run "$PYTHON_BIN" -m neuf.edge_field.trajectory_reconstruction --encoding "$ENCODING" "$@"; }
 printf '模式=%s 方法=%s 预算=%s 节点=%s Job=%s\n' "$MODE" "$METHOD" "${STEPS:-20000}" "$(hostname)" "$PBS_JOBID"
 if [[ "$MODE" == smoke ]]; then
     run "$PYTHON_BIN" -m neuf.phase1_smoke --trajectory-pose-smoke \
         --output-dir "$WORKSPACE_ROOT/logs/$RUN_ID/synthetic_cerebral/index_patient0/PoseSmoke"
-    run "$PYTHON_BIN" -m neuf.edge_field.trajectory_reconstruction --mode prepare --output "$RESULT_DIR" --device cpu
-    run "$PYTHON_BIN" -m neuf.edge_field.trajectory_reconstruction --mode smoke --output "$RESULT_DIR" \
+    trajectory --mode prepare --output "$RESULT_DIR" --device cpu
+    trajectory --mode smoke --output "$RESULT_DIR" \
         --method AnnotationDT --pose-mode all --steps 20
-    run "$PYTHON_BIN" -m neuf.edge_field.trajectory_reconstruction --mode compare --output "$RESULT_DIR" \
+    trajectory --mode compare --output "$RESULT_DIR" \
         --method AnnotationDT --pose-mode all --steps 20
 else
     if [[ "$MODE" == train && "$METHOD" == FourP ]]; then
-        run "$PYTHON_BIN" -m neuf.edge_field.trajectory_reconstruction --mode prepare --output "$RESULT_DIR" --device cpu
+        trajectory --mode prepare --output "$RESULT_DIR" --device cpu
     fi
-    run "$PYTHON_BIN" -m neuf.edge_field.trajectory_reconstruction --mode "$MODE" --output "$RESULT_DIR" \
+    trajectory --mode "$MODE" --output "$RESULT_DIR" \
         --method "$METHOD" --pose-mode all --steps "${STEPS:-20000}"
 fi
 
 if [[ "$MODE" == compare && "$METHOD" == all ]]; then
     # 汇总仅引用本轮实际产物，向共享工作台追加图表，不复制训练实现。
-    export RUN_ID WORKSPACE_ROOT RESULT_DIR
+    export RUN_ID WORKSPACE_ROOT RESULT_DIR ENCODING
     run "$PYTHON_BIN" - <<'PY'
 import json
 import os
@@ -81,27 +85,30 @@ names = dict(FourP='4P', SevenP='7P', Edge='Edge', CNN='CNN', EdgeDT='Edge+DT',
              Annotation='标注', AnnotationDT='标注+DT')
 modes = dict(off='不修正', translation='仅平移', se3='平移＋旋转', sweep='仅扫角')
 number = lambda value: '不可用' if value is None else f'{value:.6f}'
-table = ['| 方法 | 追加修正 | 全28组共同域 SSIM ↑ | 方法内共同域 SSIM ↑ | SAG覆盖率 | 场/位置更新 | 状态 |',
-         '|---|---|---:|---:|---:|---|---|']
+table = ['| 方法 | 修改位置坐标 | 追加修正 | 全28组共同域 SSIM ↑ | 方法内共同域 SSIM ↑ | SAG覆盖率 | 场/位置更新 | 状态 |',
+         '|---|---|---|---:|---:|---:|---|---|']
 details = []
 for row in rows:
     name = f"{row['method']}_{row['mode']}"
     folder = result/name
     summary = json.loads((folder/'metrics/training_summary.json').read_text())
+    config = json.loads((folder/'run_config/config.json').read_text())
+    assert config['model_config']['encoding'] == os.environ['ENCODING']
     audits = json.loads((folder/'metrics/checkpoint_reload.json').read_text())
     assert summary['status'] == 'complete' and summary['completed_total_steps'] == 20000
     assert [entry['step'] for entry in audits] == [10000, 15000, 20000]
     assert all(entry['independently_loaded'] and entry['reference_grid_independently_loaded'] for entry in audits)
     paths = [str(Path(entry['path'])) for entry in audits]
     assert all(Path(path).is_file() for path in paths)
-    table.append(f"| {names[row['method']]} | {modes[row['mode']]} | {number(row['ssim'])} | "
+    table.append(f"| {names[row['method']]} | {'否' if row['mode'] == 'off' else '是'} | {modes[row['mode']]} | {number(row['ssim'])} | "
                  f"{number(paired[row['method'], row['mode']]['ssim'])} | {row['reference_mask_coverage']:.2%} | "
                  f"20000 / {summary['pose_updates']} | 完成 |")
     details.append(f"- {name}：50% `{paths[0]}`；75% `{paths[1]}`；结束 `{paths[2]}`。"
                    f"独立重载通过；训练阶段（含阶段评价）{summary['total_wall_time_sec']:.1f}秒。")
 table_text = '\n'.join(table)
 relative = result.relative_to(root).as_posix()
-description = ('以同一Fourier PE+MLP三维隐式灰度场重建七种已保存的完整轨迹，比较关闭、仅平移、6DoF和仅扫角四种追加修正。')
+encoder = 'HashGrid' if os.environ['ENCODING'] == 'hash' else 'Fourier PE'
+description = (f'以同一{encoder}+MLP三维隐式灰度场重建七种已保存的完整轨迹，比较不修改位置坐标、仅平移、6DoF和仅扫角。')
 conditions = ('全部242帧参与病例内拟合；每组20000次场更新、seed3407、纯单尺度1−SSIM。'
               '自动与标注方法保留各自原标定，SAG图像708×944、灰度[0,1]及R1–R5固定。'
               '全28组共同域与每方法四模式共同域不同，两列分数不能相减；跨方法比较包含原始标定差异。'
@@ -134,7 +141,7 @@ assert notebook_path.read_bytes() == before, '工作台并发修改，保留临�
 temporary.replace(notebook_path)
 
 report_path = root/'experiment_reports'/run_id[:4]/f'{run_id[4:8]}.md'
-heading = '## NeUF：七种现有轨迹 × 四种位置修正'
+heading = f'## NeUF：七种现有轨迹 × 四种位置修正（{encoder}，{run_id}）'
 link = f'../../{relative}/comparison'
 section = (f'{heading}\n\n{description}\n\n{table_text}\n\n{conditions}\n\n'
            f'![共同域SSIM及覆盖率]({link}/plots/metrics_summary.png)\n\n'

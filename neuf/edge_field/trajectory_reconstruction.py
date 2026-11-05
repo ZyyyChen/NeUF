@@ -1,4 +1,4 @@
-"""在现有完整轨迹上比较同一个 PE 隐式场与四种附加位姿修正。"""
+"""在现有完整轨迹上比较同一个坐标隐式场与四种附加位姿修正。"""
 
 from __future__ import annotations
 
@@ -269,6 +269,7 @@ def main():
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--steps", type=int, default=20000)
     parser.add_argument("--seed", type=int, default=3407)
+    parser.add_argument("--encoding", choices=("fourier", "hash"), default="hash")
     args = parser.parse_args()
     args.output = workspace_path(args.output)
     if not args.output.is_relative_to(WORKSPACE / "logs"):
