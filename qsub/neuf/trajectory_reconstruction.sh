@@ -35,7 +35,7 @@ trap finish EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
 cd "$REPO_DIR"
-export PYTHONPATH="$REPO_DIR"
+export PYTHONPATH="$REPO_DIR:$REPO_DIR/.baseline_deps${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 MPLBACKEND=Agg
 export OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4
 export MPLCONFIGDIR="${TMPDIR:-/tmp}/neuf-trajectory-${PBS_JOBID}"
@@ -84,9 +84,9 @@ paired = {(row['method'], row['mode']): row for row in comparison['within_method
 names = dict(FourP='4P', SevenP='7P', Edge='Edge', CNN='CNN', EdgeDT='Edge+DT',
              Annotation='标注', AnnotationDT='标注+DT')
 modes = dict(off='不修正', translation='仅平移', se3='平移＋旋转', sweep='仅扫角')
-number = lambda value: '不可用' if value is None else f'{value:.6f}'
-table = ['| 方法 | 修改位置坐标 | 追加修正 | 全28组共同域 SSIM ↑ | 方法内共同域 SSIM ↑ | SAG覆盖率 | 场/位置更新 | 状态 |',
-         '|---|---|---|---:|---:|---:|---|---|']
+number = lambda value, digits=6: '不可用' if value is None else f'{value:.{digits}f}'
+table = ['| 方法 | 修改位置坐标 | 追加修正 | SSIM ↑ | PSNR dB ↑ | LPIPS ↓ | NCC ↑ | R² ↑ | 方法内 SSIM ↑ | SAG覆盖率 | 场/位置更新 | 状态 |',
+         '|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|']
 details = []
 for row in rows:
     name = f"{row['method']}_{row['mode']}"
@@ -101,6 +101,7 @@ for row in rows:
     paths = [str(Path(entry['path'])) for entry in audits]
     assert all(Path(path).is_file() for path in paths)
     table.append(f"| {names[row['method']]} | {'否' if row['mode'] == 'off' else '是'} | {modes[row['mode']]} | {number(row['ssim'])} | "
+                 f"{number(row['psnr_db'], 3)} | {number(row['lpips'])} | {number(row['ncc'])} | {number(row['r2'])} | "
                  f"{number(paired[row['method'], row['mode']]['ssim'])} | {row['reference_mask_coverage']:.2%} | "
                  f"20000 / {summary['pose_updates']} | 完成 |")
     details.append(f"- {name}：50% `{paths[0]}`；75% `{paths[1]}`；结束 `{paths[2]}`。"
@@ -112,11 +113,12 @@ description = (f'以同一{encoder}+MLP三维隐式灰度场重建七种已保�
 conditions = ('全部242帧参与病例内拟合；每组20000次场更新、seed3407、纯单尺度1−SSIM。'
               '自动与标注方法保留各自原标定，SAG图像708×944、灰度[0,1]及R1–R5固定。'
               '全28组共同域与每方法四模式共同域不同，两列分数不能相减；跨方法比较包含原始标定差异。'
+              'SSIM使用完整11×11窗口；PSNR、LPIPS、SSE/SST/R²、MAE/RMSE、NCC、梯度NCC和对比度率使用同一共同像素域。'
               f"全组共同域{comparison['global_common_pixels']}像素、{rows[0]['complete_windows']}个完整11×11窗口。")
 principle = ('项目目标与测试原则：观察固定原生图像的结构、散斑和伪影；坐标、梯度和checkpoint检查只证明实现契约，'
              '不证明重建质量提高，也不提供独立三维定位精度。')
 notebook_text = (f'## NeUF：七种轨迹 × 四种位置修正（{run_id}）\n\n{description}\n\n{conditions}\n\n'
-                 f'{table_text}\n\n![统一指标]({relative}/comparison/plots/metrics_summary.png)\n\n'
+                 f'{table_text}\n\n![SSIM、PSNR、LPIPS、NCC与覆盖率]({relative}/comparison/plots/metrics_summary.png)\n\n'
                  f'![原生SAG对比]({relative}/comparison/plots/overview.png)\n\n'
                  + ' · '.join(f'[R{i}]({relative}/comparison/plots/roi_R{i}.png)' for i in range(1, 6))
                  + f'\n\n{principle}\n\n复现入口：`NeUF/neuf/edge_field/trajectory_reconstruction.py`；'
@@ -144,7 +146,7 @@ report_path = root/'experiment_reports'/run_id[:4]/f'{run_id[4:8]}.md'
 heading = f'## NeUF：七种现有轨迹 × 四种位置修正（{encoder}，{run_id}）'
 link = f'../../{relative}/comparison'
 section = (f'{heading}\n\n{description}\n\n{table_text}\n\n{conditions}\n\n'
-           f'![共同域SSIM及覆盖率]({link}/plots/metrics_summary.png)\n\n'
+           f'![共同域SSIM、PSNR、LPIPS、NCC及覆盖率]({link}/plots/metrics_summary.png)\n\n'
            f'![统一灰度原生SAG对比]({link}/plots/overview.png)\n\n'
            + ' · '.join(f'[R{i}]({link}/plots/roi_R{i}.png)' for i in range(1, 6))
            + f' · [误差图]({link}/plots/absolute_difference.png) · [位姿变化]({link}/plots/pose_corrections.png)\n\n'
@@ -153,7 +155,9 @@ section = (f'{heading}\n\n{description}\n\n{table_text}\n\n{conditions}\n\n'
              'CNN/DT使用已保存200步终态；标注两组为20261104_train01普通SSIM Baseline第0/200步。\n'
            + '- 首帧固定；平移生成元各分量1mm、旋转分量/扫角2°限幅。扫角中心继承保存的初始几何；'
              'Edge/CNN/Edge+DT的中心为原7P初始化的冻结假设。\n'
-           + f"- 指标数值核验：`{comparison['metric_validation']}`。\n"
+           + f"- SSIM数值核验：`{comparison['metric_validation']}`。\n"
+           + f"- PSNR与LPIPS数值核验：`{comparison['pointwise_metric_validation']}`。SST为参考图在当前共同域的总平方和，"
+             "同域各方法相同；用SSE/SST形成R²，不能把SST单独当作质量排名。\n"
            + f'- 实验日志：`{result}/comparison/metrics/`；qsub日志：`{root}/qsub/logs/neuf/{run_id}/`；'
              f'脚本：`{root}/qsub/neuf/trajectory_reconstruction.sh`。实际Job ID在qsub日志中逐项保留。\n'
            + '\n'.join(details) + '\n\n- 实际提交、推送及图像审阅结论由本轮完成后补记；根报告和工作台无所属Git仓库。'

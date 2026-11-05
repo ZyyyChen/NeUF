@@ -17,7 +17,7 @@ from scipy.ndimage import gaussian_filter, map_coordinates, maximum_filter, mini
 from scipy.interpolate import griddata
 from scipy.optimize import curve_fit
 from scipy.spatial import cKDTree
-from skimage.metrics import structural_similarity
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 from skimage.feature import canny
 
 from .data import write_json
@@ -45,6 +45,86 @@ def _finite_metric_json(value):
     if isinstance(value, (list, tuple)):
         return [_finite_metric_json(item) for item in value]
     return None if isinstance(value, float) and not math.isfinite(value) else value
+
+
+def _correlation_or_nan(first, second):
+    """返回总体 Pearson 相关；常量区域不伪造相关性。"""
+    first = np.asarray(first, dtype=np.float64)
+    second = np.asarray(second, dtype=np.float64)
+    first = first - first.mean()
+    second = second - second.mean()
+    denominator = math.sqrt(float(first @ first) * float(second @ second))
+    return float(first @ second / denominator) if denominator > 1e-15 else float("nan")
+
+
+def _masked_point_metrics(prediction, reference, support):
+    """在同一像素域报告强度、相关性、梯度和对比度指标。"""
+    support = np.asarray(support, dtype=bool)
+    count = int(support.sum())
+    missing = dict(psnr_db=float("nan"), sse=float("nan"), sst=float("nan"), r2=float("nan"),
+                   mse=float("nan"), rmse=float("nan"),
+                   mae=float("nan"), ncc=float("nan"), gradient_ncc=float("nan"),
+                   gradient_pixels=0, contrast_std_ratio=float("nan"),
+                   point_status="no_common_pixels")
+    if not count:
+        return missing
+    selected_prediction = np.asarray(prediction, dtype=np.float64)[support]
+    selected_reference = np.asarray(reference, dtype=np.float64)[support]
+    error = selected_prediction - selected_reference
+    sse = float(error @ error)
+    mse = sse / count
+    centered_reference = selected_reference - selected_reference.mean()
+    sst = float(centered_reference @ centered_reference)
+    reference_std = float(selected_reference.std())
+    gradient_support = minimum_filter(support, size=3, mode="constant", cval=0).astype(bool)
+    prediction_gradient = np.hypot(sobel(prediction, axis=0), sobel(prediction, axis=1))
+    reference_gradient = np.hypot(sobel(reference, axis=0), sobel(reference, axis=1))
+    gradient_count = int(gradient_support.sum())
+    return dict(
+        psnr_db=float("inf") if mse == 0 else float(-10 * math.log10(mse)),
+        sse=sse,
+        sst=sst,
+        r2=float(1 - sse / sst) if sst > 1e-15 else float("nan"),
+        mse=mse,
+        rmse=float(math.sqrt(mse)),
+        mae=float(np.mean(np.abs(error))),
+        ncc=_correlation_or_nan(selected_prediction, selected_reference),
+        gradient_ncc=(_correlation_or_nan(prediction_gradient[gradient_support],
+                                          reference_gradient[gradient_support])
+                      if gradient_count else float("nan")),
+        gradient_pixels=gradient_count,
+        contrast_std_ratio=(float(selected_prediction.std() / reference_std)
+                            if reference_std > 1e-15 else float("nan")),
+        point_status="ok",
+    )
+
+
+def _load_lpips_model(device):
+    """沿用项目既有AlexNet LPIPS定义；依赖缺失时明确失败。"""
+    try:
+        import lpips
+    except ImportError as error:
+        raise RuntimeError("LPIPS评估需要安装 lpips==0.1.4") from error
+    model = lpips.LPIPS(net="alex").to(device).eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    return model
+
+
+def _masked_lpips(model, prediction, reference, support, device):
+    """共同域紧致裁剪；灰度复制为RGB，范围从[0,1]映射到[-1,1]。"""
+    rows, columns = np.nonzero(support)
+    if not len(rows):
+        return float("nan")
+    row0, row1 = int(rows.min()), int(rows.max()) + 1
+    col0, col1 = int(columns.min()), int(columns.max()) + 1
+    valid = support[row0:row1, col0:col1].astype(np.float32)
+    prediction = prediction[row0:row1, col0:col1].astype(np.float32) * valid
+    reference = reference[row0:row1, col0:col1].astype(np.float32) * valid
+    prediction = torch.from_numpy(prediction)[None, None].repeat(1, 3, 1, 1).to(device) * 2 - 1
+    reference = torch.from_numpy(reference)[None, None].repeat(1, 3, 1, 1).to(device) * 2 - 1
+    with torch.inference_mode():
+        return float(model(prediction, reference, normalize=False).reshape(()).item())
 
 
 @torch.no_grad()
@@ -270,8 +350,11 @@ def compare_trajectory_trials(root, step, methods, modes, roi_config):
                                              (relative_rotation.trace(axis1=1, axis2=2)-1)/2)))
     global_common = np.logical_and.reduce(list(supports.values()))
     method_common = {method: np.logical_and.reduce([supports[method, mode] for mode in modes]) for method in methods}
+    perceptual_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    lpips_model = _load_lpips_model(perceptual_device)
     complete_global = minimum_filter(global_common, size=11, mode="constant", cval=0)
     metric_validation = dict(status="not_applicable", reason="no_complete_11x11_windows", complete_windows=0)
+    pointwise_metric_validation = dict(status="not_applicable", reason="no_common_pixels", common_pixels=0)
     if complete_global.any():
         first = (methods[0], modes[0])
         tensor = lambda value: torch.as_tensor(value, dtype=torch.float64)[None, None]
@@ -283,6 +366,24 @@ def compare_trajectory_trials(root, step, methods, modes, roi_config):
         metric_validation = dict(status="passed", method=first[0], mode=first[1], complete_windows=count,
                                  torch_ssim=float(torch_score), scipy_ssim=scipy_score, absolute_difference=difference,
                                  tolerance=1e-9)
+    if global_common.any():
+        first = (methods[0], modes[0])
+        measured = _masked_point_metrics(records[first]["gray"], reference, global_common)
+        selected_prediction = records[first]["gray"][global_common].astype(np.float64)
+        selected_reference = reference[global_common].astype(np.float64)
+        independent_psnr = float(peak_signal_noise_ratio(selected_reference, selected_prediction, data_range=1.))
+        psnr_difference = abs(measured["psnr_db"] - independent_psnr)
+        identity_lpips = _masked_lpips(lpips_model, reference, reference, global_common, perceptual_device)
+        if psnr_difference > 1e-12:
+            raise AssertionError(f"PSNR双实现核验失败: difference={psnr_difference}")
+        if abs(identity_lpips) > 1e-7:
+            raise AssertionError(f"LPIPS同图核验失败: identity={identity_lpips}")
+        pointwise_metric_validation = dict(
+            status="passed", method=first[0], mode=first[1], common_pixels=int(global_common.sum()),
+            implementation_psnr_db=measured["psnr_db"], skimage_psnr_db=independent_psnr,
+            absolute_difference=psnr_difference, tolerance=1e-12,
+            identity_lpips=identity_lpips, identity_lpips_tolerance=1e-7,
+        )
     regions = {"Full": np.ones(reference.shape, dtype=bool)}
     for region_id, (x, y, width, height) in zip(roi["roi_ids"], roi["roi_xywh"]):
         if min(x, y, width, height) < 0 or x+width > reference.shape[1] or y+height > reference.shape[0]:
@@ -306,10 +407,22 @@ def compare_trajectory_trials(root, step, methods, modes, roi_config):
                     fixed = record["fixed_support"].astype(bool) & reference_mask
                     denominator = int((region_mask & reference_mask).sum())
                     fixed_count = int((fixed & region_mask).sum())
+                    point_metrics = _masked_point_metrics(record["gray"], reference, support)
+                    lpips_value = _masked_lpips(lpips_model, record["gray"], reference, support, perceptual_device)
                     rows.append(dict(method=method, mode=mode, step=step, domain=domain, region=region,
                         ssim=float(scores[key][complete].mean()) if count else float("nan"),
+                        psnr_db=point_metrics["psnr_db"], lpips=lpips_value,
+                        sse=point_metrics["sse"], sst=point_metrics["sst"], r2=point_metrics["r2"],
+                        mse=point_metrics["mse"],
+                        rmse=point_metrics["rmse"], mae=point_metrics["mae"], ncc=point_metrics["ncc"],
+                        gradient_ncc=point_metrics["gradient_ncc"],
+                        contrast_std_ratio=point_metrics["contrast_std_ratio"],
                         complete_windows=count, common_pixels=int(support.sum()),
-                        status="ok" if count else "no_complete_11x11_windows",
+                        gradient_pixels=point_metrics["gradient_pixels"],
+                        status=("ok" if count and point_metrics["point_status"] == "ok" else
+                                "no_complete_11x11_windows" if not count else point_metrics["point_status"]),
+                        ssim_status="ok" if count else "no_complete_11x11_windows",
+                        point_status=point_metrics["point_status"],
                         reference_mask_coverage=float((current & region_mask).sum()/denominator) if denominator else float("nan"),
                         fixed_support_coverage=float((current & fixed & region_mask).sum()/fixed_count) if fixed_count else float("nan"),
                         mean_coronal_ssim=diagnostics[name]["mean_coronal_ssim"],
@@ -320,16 +433,23 @@ def compare_trajectory_trials(root, step, methods, modes, roi_config):
     write_csv(output / "metrics/global_comparison.csv", global_rows)
     write_csv(output / "metrics/within_method_comparison.csv", paired_rows)
     write_json(output / "metrics/comparison.json", _finite_metric_json(dict(step=step, global_rows=global_rows, within_method_rows=paired_rows,
-        metric_validation=metric_validation,
+        metric_validation=metric_validation, pointwise_metric_validation=pointwise_metric_validation,
         global_common_pixels=int(global_common.sum()), method_common_pixels={k: int(v.sum()) for k, v in method_common.items()},
         metric="Gaussian11 sigma1.5 SSIM; data_range1; population covariance; complete windows within ROI and common support",
+        point_metrics=("PSNR/LPIPS/SSE/SST/R2/MSE/RMSE/MAE/NCC/contrast std ratio use identical common pixels "
+                       "within each ROI; data_range1; SST is reference total sum of squares and is constant within a domain; "
+                       "LPIPS uses AlexNet, a tight masked crop, grayscale repeated to RGB and [0,1] mapped to [-1,1]; "
+                       "gradient NCC uses Sobel magnitudes and a complete 3x3 common neighborhood"),
         interpretation="in-sample reconstruction; all coronal inputs used; SAG drives NeRF pose updates only in non-off modes; "
                        "upstream trajectories already fitted to this SAG; original per-method frozen calibration retained; "
                        "global and within-method domains cannot be compared by subtracting scores; no independent 3D GT")))
     write_json(output / "run_config/trajectory_comparison_manifest.json", dict(methods=list(methods), modes=list(modes), step=step,
         roi_config=str(roi_path), roi_config_sha256=hashlib.sha256(roi_path.read_bytes()).hexdigest(), roi=roi,
         source_manifests=manifests, trajectory_frame_ids=records[methods[0], modes[0]]["frame_ids"].tolist(),
-        native_shape=list(reference.shape), display_range=[0, 1]))
+        native_shape=list(reference.shape), display_range=[0, 1],
+        reported_metrics=["ssim", "psnr_db", "lpips", "sse", "sst", "r2", "mse", "rmse", "mae",
+                          "ncc", "gradient_ncc", "contrast_std_ratio"],
+        lpips_definition="AlexNet; tight masked crop; grayscale repeated to RGB; [0,1] mapped to [-1,1]"))
     np.savez_compressed(output / "predictions/comparison_domains.npz", reference_mask=reference_mask,
                         global_common=global_common, **{f"within_{name}": value for name, value in method_common.items()})
     lookup = {(row["method"], row["mode"], row["domain"], row["region"]): row for row in rows}
@@ -348,7 +468,8 @@ def compare_trajectory_trials(root, step, methods, modes, roi_config):
                     axis.contour(global_common, levels=[.5], colors=["#ffd34e"], linewidths=.45)
                 global_row = lookup[method, mode, "all_methods_modes", region]
                 local_row = lookup[method, mode, f"within_{method}", region]
-                axis.set_title(f"{mode}: all {global_row['ssim']:.4f} / within {local_row['ssim']:.4f}\n"
+                axis.set_title(f"{mode}: all SSIM {global_row['ssim']:.4f}, PSNR {global_row['psnr_db']:.2f} dB, "
+                               f"LPIPS {global_row['lpips']:.4f}\nwithin SSIM {local_row['ssim']:.4f}; "
                                f"coverage {global_row['reference_mask_coverage']:.1%}")
             for axis in axes[row_index]:
                 axis.set(xlabel="Native column [px]", ylabel="Native row [px]")
@@ -370,17 +491,26 @@ def compare_trajectory_trials(root, step, methods, modes, roi_config):
     fig.colorbar(view, ax=list(axes.flat), label="Absolute gray difference [0,1]", shrink=.5)
     fig.savefig(output / "plots/absolute_difference.png", dpi=110)
     plt.close(fig)
-    fig, axes = plt.subplots(1, 3, figsize=(15, max(4, len(methods)*.8)), layout="constrained")
-    for axis, field, title, domain in zip(axes, ("ssim", "ssim", "reference_mask_coverage"),
-            ("SSIM: all-trial domain", "SSIM: within-method domains", "Coverage of original SAG mask"),
-            ("all_methods_modes", None, "all_methods_modes")):
+    fig, axes = plt.subplots(2, 4, figsize=(21, max(8, len(methods)*1.6)), layout="constrained")
+    panels = (
+        ("ssim", "SSIM: all-trial domain", "all_methods_modes", "viridis", -1, 1, ".4f"),
+        ("psnr_db", "PSNR [dB]: all-trial domain", "all_methods_modes", "magma", None, None, ".2f"),
+        ("lpips", "LPIPS: all-trial domain", "all_methods_modes", "magma_r", None, None, ".4f"),
+        ("ncc", "NCC: all-trial domain", "all_methods_modes", "viridis", -1, 1, ".4f"),
+        ("ssim", "SSIM: within-method domains", None, "viridis", -1, 1, ".4f"),
+        ("psnr_db", "PSNR [dB]: within-method domains", None, "magma", None, None, ".2f"),
+        ("lpips", "LPIPS: within-method domains", None, "magma_r", None, None, ".4f"),
+        ("reference_mask_coverage", "Coverage of original SAG mask", "all_methods_modes", "viridis", 0, 1, ".4f"),
+    )
+    for axis, (field, title, domain, cmap, lower, upper, number_format) in zip(axes.flat, panels):
         matrix = np.array([[lookup[method, mode, domain or f"within_{method}", "Full"][field] for mode in modes] for method in methods])
-        view = axis.imshow(matrix, cmap="viridis", vmin=0 if field != "ssim" else -1, vmax=1, aspect="auto")
+        view = axis.imshow(matrix, cmap=cmap, vmin=lower, vmax=upper, aspect="auto")
         axis.set(xticks=range(len(modes)), xticklabels=modes, yticks=range(len(methods)), yticklabels=methods, title=title)
         for row in range(len(methods)):
             for column in range(len(modes)):
                 value = matrix[row, column]
-                axis.text(column, row, f"{value:.4f}" if np.isfinite(value) else "N/A", ha="center", va="center", color="white", fontsize=9)
+                axis.text(column, row, format(value, number_format) if np.isfinite(value) else "N/A",
+                          ha="center", va="center", color="white", fontsize=9)
         fig.colorbar(view, ax=axis, shrink=.8)
     fig.savefig(output / "plots/metrics_summary.png", dpi=140)
     plt.close(fig)
@@ -397,7 +527,8 @@ def compare_trajectory_trials(root, step, methods, modes, roi_config):
             axis.legend()
     fig.savefig(output / "plots/pose_corrections.png", dpi=130)
     plt.close(fig)
-    return dict(global_rows=global_rows, within_method_rows=paired_rows, metric_validation=metric_validation, output=str(output))
+    return dict(global_rows=global_rows, within_method_rows=paired_rows, metric_validation=metric_validation,
+                pointwise_metric_validation=pointwise_metric_validation, output=str(output))
 
 
 @torch.no_grad()
