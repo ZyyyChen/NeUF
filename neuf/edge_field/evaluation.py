@@ -477,16 +477,17 @@ def compare_trajectory_trials(root, step, methods, modes, roi_config):
                     axis.contour(global_common, levels=[.5], colors=["#ffd34e"], linewidths=.45)
                 global_row = lookup[method, mode, "all_methods_modes", region]
                 local_row = lookup[method, mode, f"within_{method}", region]
-                axis.set_title(f"{mode}: all SSIM {global_row['ssim']:.4f}, PSNR {global_row['psnr_db']:.2f} dB, "
-                               f"LPIPS {global_row['lpips']:.4f}\nwithin SSIM {local_row['ssim']:.4f}; "
-                               f"coverage {global_row['reference_mask_coverage']:.1%}")
+                axis.set_title(f"{mode}: all SSIM {global_row['ssim']:.4f}, PSNR {global_row['psnr_db']:.2f} dB\n"
+                               f"LPIPS {global_row['lpips']:.4f}; within SSIM {local_row['ssim']:.4f}\n"
+                               f"coverage {global_row['reference_mask_coverage']:.1%}", fontsize=8)
             for axis in axes[row_index]:
                 axis.set(xlabel="Native column [px]", ylabel="Native row [px]")
                 if region != "Full":
                     index = roi["roi_ids"].index(region)
                     x, y, width, height = roi["roi_xywh"][index]
                     axis.set(xlim=(x-.5, x+width-.5), ylim=(y+height-.5, y-.5))
-        fig.suptitle(f"{region}; step {step}; grayscale [0,1]; yellow = all-trial common domain; original frozen calibrations")
+        fig.suptitle(f"{region}; step {step}; grayscale [0,1]\n"
+                     "yellow = all-trial common domain; original frozen calibrations", fontsize=10)
         fig.savefig(output / "plots" / ("overview.png" if region == "Full" else f"roi_{region}.png"), dpi=110)
         plt.close(fig)
     fig, axes = plt.subplots(len(methods), len(modes), figsize=(4*len(modes), 3*len(methods)), squeeze=False, layout="constrained")
