@@ -351,7 +351,14 @@ def compare_trajectory_trials(root, step, methods, modes, roi_config):
     global_common = np.logical_and.reduce(list(supports.values()))
     method_common = {method: np.logical_and.reduce([supports[method, mode] for mode in modes]) for method in methods}
     perceptual_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    lpips_model = _load_lpips_model(perceptual_device)
+    try:
+        lpips_model = _load_lpips_model(perceptual_device)
+    except RuntimeError as error:
+        if perceptual_device.type != "cuda" or "CUDA" not in str(error):
+            raise
+        print(f"LPIPS CUDA不可用，回退CPU：{error}", flush=True)
+        perceptual_device = torch.device("cpu")
+        lpips_model = _load_lpips_model(perceptual_device)
     complete_global = minimum_filter(global_common, size=11, mode="constant", cval=0)
     metric_validation = dict(status="not_applicable", reason="no_complete_11x11_windows", complete_windows=0)
     pointwise_metric_validation = dict(status="not_applicable", reason="no_common_pixels", common_pixels=0)
@@ -383,6 +390,7 @@ def compare_trajectory_trials(root, step, methods, modes, roi_config):
             implementation_psnr_db=measured["psnr_db"], skimage_psnr_db=independent_psnr,
             absolute_difference=psnr_difference, tolerance=1e-12,
             identity_lpips=identity_lpips, identity_lpips_tolerance=1e-7,
+            lpips_device=str(perceptual_device),
         )
     regions = {"Full": np.ones(reference.shape, dtype=bool)}
     for region_id, (x, y, width, height) in zip(roi["roi_ids"], roi["roi_xywh"]):
@@ -449,6 +457,7 @@ def compare_trajectory_trials(root, step, methods, modes, roi_config):
         native_shape=list(reference.shape), display_range=[0, 1],
         reported_metrics=["ssim", "psnr_db", "lpips", "sse", "sst", "r2", "mse", "rmse", "mae",
                           "ncc", "gradient_ncc", "contrast_std_ratio"],
+        lpips_device=str(perceptual_device),
         lpips_definition="AlexNet; tight masked crop; grayscale repeated to RGB; [0,1] mapped to [-1,1]"))
     np.savez_compressed(output / "predictions/comparison_domains.npz", reference_mask=reference_mask,
                         global_common=global_common, **{f"within_{name}": value for name, value in method_common.items()})
