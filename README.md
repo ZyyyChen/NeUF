@@ -591,6 +591,14 @@ Edge 初始化 CNN200、Edge+DT200、人工标注和人工标注+DT200 完整位
 `off` 为否，另外三种模式为是。
 
 训练采用纯单尺度 `1-SSIM`：源帧只更新隐式场，固定 SAG 图只更新位姿。
+位姿阶段默认 `--pose-supervision observed`：以当前完整位姿的逆变换，将固定
+SAG世界点映射到各实测COR图像，双线性采样灰度，并沿用最近两个有效平面及
+Gaussian距离权重。源图与INR均冻结，梯度经过局部采样坐标传到位姿，包含面内
+平移和旋转；SAG重建评价仍查询INR，不能将实测图重采样分数当作INR质量。
+`--pose-supervision legacy_field`仅复现旧实验；其固定世界场投影查询缺少面内
+配准信号。qsub通过`POSE_SUPERVISION`选择，默认`observed`，配置随checkpoint保存。
+该修改只修复观测梯度，尚不包含轨迹平滑或单调约束；质量以同条件图像对照为准。
+新默认仅属于本七轨迹入口；旧`--coronal-cnn-comparison`保持历史监督方式。
 首帧固定；平移分量限幅1mm，6DoF旋转向量分量和单一扫角限幅2°。
 扫角绕固定 SAG 法向、各方法保存的初始几何中心旋转，零残差保留完整原位姿。
 Edge/CNN/Edge+DT 的中心继承原7P初始化，是冻结的几何假设，不是实测探头原点。
@@ -611,6 +619,8 @@ checkpoint，包括模型、位姿模式与中心、优化器、配置和随机�
 通过 `qsub/neuf/trajectory_reconstruction.sh` 提交，资源沿用gpu32×1、
 4CPU、32GB、2小时。先 `MODE=smoke` 合并执行必要模式检查和七组输入核验；
 通过后 `MODE=train,METHOD=FourP`（其他方法同理），全部完成再 `MODE=compare`。
+可用`POSE_MODE=translation|se3|sweep|off`单独提交某一模式，默认`all`；各模式
+使用独立日志标识，不能在同一结果目录重复运行相同方法/模式或混入不同监督方式。
 统一设置 `RUN_ID=YYYYMMDD_trainNN`，结果位于工作区
 `logs/RUN_ID/cerebral/index_patient0/<方法>_<模式>/`，汇总在`comparison/`；
 qsub原生日志单独位于`qsub/logs/neuf/RUN_ID/`，提交前创建日志目录并显式传`-o/-e`。

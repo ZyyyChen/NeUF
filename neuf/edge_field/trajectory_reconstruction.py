@@ -266,6 +266,8 @@ def main():
     parser.add_argument("--mode", choices=("prepare", "smoke", "train", "compare"), required=True)
     parser.add_argument("--method", choices=("all", *METHODS), default="all")
     parser.add_argument("--pose-mode", choices=("all", *MODES), default="all")
+    parser.add_argument("--pose-supervision", choices=("observed", "legacy_field"), default="observed",
+                        help="observed按位姿采样实测COR；legacy_field仅复现旧的投影场监督")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--steps", type=int, default=20000)
     parser.add_argument("--seed", type=int, default=3407)

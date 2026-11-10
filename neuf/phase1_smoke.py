@@ -507,6 +507,67 @@ def run_frozen_smoke(dataset_path: Path, output_dir: Path, teacher_path: Path) -
     return result
 
 
+def check_coronal_pose_sampling(device):
+    """真实位姿观测接口的面内平移/旋转回归，有限差分不跨插值网格或mask边界。"""
+    from neuf.edge_field.coronal_features import render_coronal_pose
+    from neuf.edge_field.losses import masked_ssim
+    from neuf.edge_field.model import se3_exp
+
+    dtype = torch.float64
+    row, col = torch.meshgrid(torch.arange(48, device=device, dtype=dtype) * .25,
+                              torch.arange(56, device=device, dtype=dtype) * .25, indexing="ij")
+    local = torch.stack((row, col, torch.zeros_like(row)), -1)
+    pattern = lambda x, y: .1 + .012*x + .021*y + .001*x*y
+    images = torch.stack((pattern(row, col), pattern(row, col)+.08)).requires_grad_()
+    mask = torch.ones_like(images)
+    initial = torch.eye(4, device=device, dtype=dtype).repeat(2, 1, 1)
+    initial[:, 2, 3] = initial.new_tensor([-.3, .8])
+    xyz = local[10:26, 12:30].clone()
+    xyz[..., :2] += .071
+    parameter = torch.zeros(3, device=device, dtype=dtype, requires_grad=True)
+    class FixedField(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.ones((), device=device, dtype=dtype))
+        def forward(self, points, progress=1.):
+            return (self.scale*pattern(points[..., 0], points[..., 1]))[..., None]
+    model = FixedField()
+    def render(value):
+        zero = value[0]*0
+        twist = torch.stack((value[0], value[1], zero, zero, zero, value[2]))
+        matrices = torch.stack((initial[0], se3_exp(twist) @ initial[1]))
+        return render_coronal_pose(model, xyz, matrices, local, mask, images)
+    target, target_support = render(parameter.new_tensor([.11, -.09, .012]))
+    target = target.detach()
+    def objective(value):
+        prediction, support = render(value)
+        score, _ = masked_ssim(prediction[None, None], target[None, None],
+                               (support & target_support)[None, None])
+        return 1-score
+    loss = objective(parameter)
+    gradient = torch.autograd.grad(loss, parameter, retain_graph=True)[0]
+    assert bool((gradient.abs() > 1e-7).all()), f"面内配准梯度缺失: {gradient.tolist()}"
+    epsilon, numerical = 1e-5, []
+    for axis in range(3):
+        offset = torch.zeros_like(parameter)
+        offset[axis] = epsilon
+        numerical.append(float((objective(parameter.detach()+offset)-objective(parameter.detach()-offset))/(2*epsilon)))
+    torch.testing.assert_close(gradient, gradient.new_tensor(numerical), rtol=2e-4, atol=1e-7)
+    loss.backward()
+    assert images.grad is None and model.scale.grad is None, "位姿观测不得更新源图或INR"
+    prediction, support = render(parameter.detach())
+    weight = torch.exp(-.5*(initial[:, 2, 3]/.75).square())
+    expected = pattern(xyz[..., 0], xyz[..., 1])+.08*weight[1]/weight.sum()
+    torch.testing.assert_close(prediction, expected, atol=1e-12, rtol=1e-12)
+    assert bool(support.all())
+    outside = xyz+xyz.new_tensor([100., 100., 0.])
+    empty, valid = render_coronal_pose(model, outside, initial, local, mask, images)
+    assert not bool(valid.any()) and bool(torch.isfinite(empty).all()) and bool((empty == 0).all())
+    return dict(gradient=gradient.detach().cpu().tolist(), finite_difference=numerical,
+                source_and_field_frozen=True, local_axes_and_pixel_centers=True,
+                unsupported_zero=True)
+
+
 def check_trajectory_pose_modes(device):
     """用含离面旋转的完整位姿检查四种残差，不假定输入本来就是平面扇扫。"""
     from neuf.edge_field.model import PoseRefiner, se3_exp
@@ -652,7 +713,9 @@ def run_sagittal_pose_smoke(output_dir: Path, *, baseline=False, coronal=False, 
         args.width, args.bands = 32, 6
         assert [pose_update_rate(p) for p in (0., .2, .4, .7, 1.)] == [0., 0., 1., 0., 0.]
         if trajectory:
+            args.pose_supervision = "observed"
             checks = check_trajectory_pose_modes(device)
+            checks["observed_coronal_sampling"] = check_coronal_pose_sampling(device)
             data.sweep_centers = data.initial[:, :3, 3]-28.1915615*pitch*data.initial[:, :3, 0]
             data.sweep_axis = tensor(np.array([1., 0., 0.], dtype=np.float32))
             initial, runs = None, {}

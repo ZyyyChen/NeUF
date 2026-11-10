@@ -892,7 +892,7 @@ def align_poses(data, args):
 def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_state=None, smoke=False):
     """固定 sag、纯 SSIM 的坐标场训练；smoke 复用实际数据与同一保存链路。"""
     import random
-    from .coronal_features import pose_update_rate, render_coronal_field
+    from .coronal_features import pose_update_rate, render_coronal_pose
     from .losses import masked_ssim
     from .evaluation import evaluate_coronal_trial
 
@@ -928,6 +928,10 @@ def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_
         model.coronal.initialize(data)
     all_frames = torch.arange(len(data.images), device=device)
     pose_mode = getattr(args, "pose_mode", "se3")
+    # 七轨迹入口显式默认observed；未提供此选项的旧CNN对照保留历史行为。
+    pose_supervision = getattr(args, "pose_supervision", "legacy_field")
+    if pose_supervision not in ("observed", "legacy_field"):
+        raise ValueError(f"未知位姿监督方式: {pose_supervision}")
     pose_config = dict(translation_mm=1., rotation_deg=2., mode=pose_mode)
     sweep_config = (dict(sweep_centers=getattr(data, "sweep_centers", None),
                          sweep_axis=getattr(data, "sweep_axis", None)) if pose_mode == "sweep" else {})
@@ -939,13 +943,15 @@ def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_
     milestones = sorted({math.ceil(args.steps / 2), math.ceil(3 * args.steps / 4), args.steps})
     config = dict(vars(args), conditioned=conditioned, model_config=model.config,
                   steps=args.steps, checkpoint_milestones=milestones, loss="pure single-scale 1-SSIM",
-                  pose_mode=pose_mode,
+                  pose_mode=pose_mode, pose_supervision=pose_supervision,
                   pose_schedule=dict(start=.2, peak=.4, end=.7, peak_updates_per_inr=int(pose_mode != "off")),
                   source_frames=data.frame_ids.tolist(), fixed_sagittal=True,
                   source_scope="all coronal frames; in-sample reconstruction, no held-out claim",
                   sagittal_supervision=pose_mode != "off",
                   pose_limits=dict(translation_component_mm=1., rotation_component_deg=2., first_frame_fixed=True),
                   sag_render="two nearest supported coronal planes, projected INR predictions, Gaussian distance fusion",
+                  pose_render=("measured COR bilinear sampling at inverse-pose local coordinates; no INR gradient"
+                               if pose_supervision == "observed" else "legacy projected frozen INR query"),
                   feature_fusion="all coronal maps, Gaussian normal distance sigma=0.75 mm, normalized valid weights",
                   shared_initial_sha256=tensor_signature(shared_initial.values()))
     if pose_mode == "sweep":
@@ -1025,13 +1031,13 @@ def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_
                     optimizer.zero_grad(set_to_none=True)
                     pose_optimizer.zero_grad(set_to_none=True)
                     before_field = [parameter.detach().clone() for parameter in model.parameters()] if smoke else None
-                    if conditioned:
+                    if conditioned and pose_supervision == "legacy_field":
                         model.coronal.prepare(poses.matrices())
                     selected = centers[torch.randint(len(centers), (args.sagittal_patches,), generator=sag_generator)].to(device)
                     rr = (selected[:, 0] - size // 2).clamp(0, guidance.reference.shape[0] - size)[:, None, None] + torch.arange(size, device=device)[None, :, None]
                     cc = (selected[:, 1] - size // 2).clamp(0, guidance.reference.shape[1] - size)[:, None, None] + torch.arange(size, device=device)[None, None, :]
-                    predicted, support = render_coronal_field(model, guidance.xyz_grid[rr, cc], poses.matrices(),
-                                                              data.local, data.mask, progress)
+                    predicted, support = render_coronal_pose(model, guidance.xyz_grid[rr, cc], poses.matrices(),
+                        data.local, data.mask, data.images, progress, supervision=pose_supervision)
                     support = support & initial_support[rr, cc]
                     score, _ = masked_ssim(predicted[:, None], guidance.reference[rr, cc][:, None], support[:, None])
                     geometry_loss = 1 - score

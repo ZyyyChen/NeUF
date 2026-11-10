@@ -14,7 +14,11 @@ MODE=${MODE:-smoke}
 METHOD=${METHOD:-all}
 ATTEMPT=${ATTEMPT:-1}
 ENCODING=${ENCODING:-hash}
+POSE_SUPERVISION=${POSE_SUPERVISION:-observed}
+POSE_MODE=${POSE_MODE:-all}
 [[ "$ENCODING" == hash || "$ENCODING" == fourier ]]
+[[ "$POSE_SUPERVISION" == observed || "$POSE_SUPERVISION" == legacy_field ]]
+[[ "$POSE_MODE" =~ ^(all|off|translation|se3|sweep)$ ]]
 [[ "$RUN_ID" =~ ^[0-9]{8}_train[0-9]{2,}$ ]]
 [[ "$MODE" == smoke || "$MODE" == prepare || "$MODE" == train || "$MODE" == compare ]]
 [[ "$METHOD" =~ ^(all|FourP|SevenP|Edge|CNN|EdgeDT|Annotation|AnnotationDT)$ ]]
@@ -22,6 +26,9 @@ ENCODING=${ENCODING:-hash}
 RESULT_DIR="$WORKSPACE_ROOT/logs/$RUN_ID/cerebral/index_patient0"
 QSUB_LOG_DIR="$WORKSPACE_ROOT/qsub/logs/neuf/$RUN_ID"
 TASK="${MODE}_${METHOD}_attempt${ATTEMPT}"
+if [[ "$POSE_MODE" != all || "$POSE_SUPERVISION" != observed ]]; then
+    TASK="${TASK}_${POSE_MODE}_${POSE_SUPERVISION}"
+fi
 mkdir -p "$QSUB_LOG_DIR" "$RESULT_DIR/comparison/metrics" "$RESULT_DIR/comparison/run_config/$TASK"
 printf '%s\n' "${PBS_JOBID:?需要通过qsub执行}" > "$QSUB_LOG_DIR/${TASK}_job_id.txt"
 exec > >(tee "$RESULT_DIR/comparison/metrics/${TASK}_execution.log") 2>&1
@@ -46,7 +53,7 @@ git rev-parse HEAD > "$RESULT_DIR/comparison/run_config/$TASK/git_commit.txt"
 git diff -- neuf/edge_field neuf/phase1_smoke.py qsub/neuf/trajectory_reconstruction.sh > "$RESULT_DIR/comparison/run_config/$TASK/source.diff"
 run() { printf '命令:'; printf ' %q' "$@"; printf '\n'; "$@"; }
 # 所有实际训练和评价入口显式记录本轮编码器。
-trajectory() { run "$PYTHON_BIN" -m neuf.edge_field.trajectory_reconstruction --encoding "$ENCODING" "$@"; }
+trajectory() { run "$PYTHON_BIN" -m neuf.edge_field.trajectory_reconstruction --encoding "$ENCODING" --pose-supervision "$POSE_SUPERVISION" "$@"; }
 printf '模式=%s 方法=%s 预算=%s 节点=%s Job=%s\n' "$MODE" "$METHOD" "${STEPS:-20000}" "$(hostname)" "$PBS_JOBID"
 if [[ "$MODE" == smoke ]]; then
     run "$PYTHON_BIN" -m neuf.phase1_smoke --trajectory-pose-smoke \
@@ -61,10 +68,10 @@ else
         trajectory --mode prepare --output "$RESULT_DIR" --device cpu
     fi
     trajectory --mode "$MODE" --output "$RESULT_DIR" \
-        --method "$METHOD" --pose-mode all --steps "${STEPS:-20000}"
+        --method "$METHOD" --pose-mode "$POSE_MODE" --steps "${STEPS:-20000}"
 fi
 
-if [[ "$MODE" == compare && "$METHOD" == all ]]; then
+if [[ "$MODE" == compare && "$METHOD" == all && "$POSE_MODE" == all ]]; then
     # 汇总仅引用本轮实际产物，向共享工作台追加图表，不复制训练实现。
     export RUN_ID WORKSPACE_ROOT RESULT_DIR ENCODING
     run "$PYTHON_BIN" - <<'PY'

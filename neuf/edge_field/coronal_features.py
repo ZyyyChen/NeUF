@@ -74,8 +74,10 @@ class CoronalFeatures(nn.Module):
         return torch.cat(outputs).reshape(*shape, -1)
 
 
-def coronal_projection(xyz, matrices, local_grid, mask, *, neighbors=2, sigma_mm=.75):
-    """选择覆盖查询点的最近物理平面；离面距离仍参与可微权重与投影。"""
+def _coronal_sampling_geometry(xyz, matrices, local_grid, mask, *, neighbors=2, sigma_mm=.75):
+    """共享邻居、声学支持和距离权重；保留局部像素坐标的位姿导数。"""
+    if neighbors < 1 or sigma_mm <= 0 or not len(matrices):
+        raise ValueError("coronal采样要求非空位姿、正邻居数和正sigma_mm")
     flat = xyz.reshape(-1, 3)
     local = torch.einsum("npi,nij->npj", flat[None] - matrices[:, None, :3, 3],
                          matrices[:, :3, :3])
@@ -96,17 +98,23 @@ def coronal_projection(xyz, matrices, local_grid, mask, *, neighbors=2, sigma_mm
     chosen = ranked.topk(min(neighbors, len(matrices)), dim=0, largest=False).indices
     point_ids = torch.arange(len(flat), device=flat.device)[None].expand_as(chosen)
     selected_distance = local[chosen, point_ids, 2]
-    normals = matrices[chosen, :3, 2]
-    projected = flat[None] - selected_distance[..., None] * normals
     selected_valid = valid[chosen, point_ids] & (selected_distance.abs() <= 3 * sigma_mm)
     weight = torch.exp(-.5 * (selected_distance / sigma_mm).square()) * selected_valid
     support = weight.sum(0) > 1e-8
     weight = weight / weight.sum(0).clamp_min(1e-8)
-    return projected, weight, support.reshape(xyz.shape[:-1])
+    return uv.flip(-1), chosen, selected_distance, weight, support.reshape(xyz.shape[:-1])
+
+
+def coronal_projection(xyz, matrices, local_grid, mask, *, neighbors=2, sigma_mm=.75):
+    """选择覆盖查询点的最近物理平面；用于INR重建与旧实验复现。"""
+    _, chosen, distance, weight, support = _coronal_sampling_geometry(
+        xyz, matrices, local_grid, mask, neighbors=neighbors, sigma_mm=sigma_mm)
+    projected = xyz.reshape(-1, 3)[None] - distance[..., None] * matrices[chosen, :3, 2]
+    return projected, weight, support
 
 
 def render_coronal_field(model, xyz, matrices, local_grid, mask, progress=1.):
-    """固定 sag 世界点投影到 coronal 平面后查询 INR，保留两组共同的位姿梯度。"""
+    """在源平面上查询INR并融合；不能作为面内位姿配准的观测模型。"""
     predictions, supports = [], []
     for points in xyz.reshape(-1, 3).split(2048):
         projected, weight, support = coronal_projection(points, matrices, local_grid, mask)
@@ -122,3 +130,31 @@ def pose_update_rate(progress):
     if progress <= .2 or progress >= .7:
         return 0.
     return (progress - .2) / .2 if progress <= .4 else (.7 - progress) / .3
+
+
+def render_coronal_pose(model, xyz, matrices, local_grid, mask, images, progress=1., *,
+                        supervision="observed"):
+    """用实测COR的I_i((T_i^-1 x)_xy)监督位姿；INR及源图均不接收梯度。
+
+    legacy_field仅用于复现旧实验；observed保留面内平移/旋转的采样导数，
+    并沿用INR重建的最近两平面、逐帧mask及Gaussian距离权重。
+    """
+    if supervision == "legacy_field":
+        return render_coronal_field(model, xyz, matrices, local_grid, mask, progress)
+    if supervision != "observed":
+        raise ValueError(f"未知位姿监督方式: {supervision}")
+    if images.ndim != 3 or len(images) != len(matrices) or images.shape[-2:] != local_grid.shape[:2]:
+        raise ValueError("源COR灰度须为与位姿和local_grid对应的[N,H,W]")
+    observed = images.detach()[:, None]
+    predictions, supports = [], []
+    for points in xyz.reshape(-1, 3).split(2048):
+        grid, chosen, _, weight, support = _coronal_sampling_geometry(
+            points, matrices, local_grid, mask)
+        # grid是带位姿导数的局部坐标；不能detach，也不能替换成固定世界场查询。
+        samples = F.grid_sample(observed, grid[:, :, None], mode="bilinear",
+                                padding_mode="zeros", align_corners=True)[..., 0][:, 0]
+        values = samples.gather(0, chosen)
+        predictions.append((values * weight).sum(0))
+        supports.append(support)
+    return (torch.cat(predictions).reshape(xyz.shape[:-1]),
+            torch.cat(supports).reshape(xyz.shape[:-1]))
