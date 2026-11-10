@@ -889,8 +889,8 @@ def align_poses(data, args):
                 real_pose_accuracy="unknown; only edge consistency and controlled perturbation recovery can be evaluated"))
 
 
-def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_state=None, smoke=False):
-    """固定 sag、纯 SSIM 的坐标场训练；smoke 复用实际数据与同一保存链路。"""
+def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_state=None, smoke=False, observation=None):
+    """固定 SAG 的坐标场训练。可选 observation 明确指定 COR 成像及位姿损失。"""
     import random
     from .coronal_features import pose_update_rate, render_coronal_pose
     from .losses import masked_ssim
@@ -905,6 +905,9 @@ def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_
     random.seed(args.seed)
     generator = torch.Generator().manual_seed(args.seed)
     sag_generator = torch.Generator().manual_seed(args.seed + 1)
+    generators = dict(patch=generator, pose=sag_generator)
+    if observation is not None and observation.joint:
+        generators["cor_pose"] = torch.Generator().manual_seed(args.seed + 2)
     context = dict(frames=len(data.images), height=96, width=128, channels=32, sigma_mm=.75)
     model = EdgeField(data.bounds, bands=args.bands, width=args.width,
                       encoding=getattr(args, "encoding", "fourier"),
@@ -954,6 +957,8 @@ def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_
                                if pose_supervision == "observed" else "legacy projected frozen INR query"),
                   feature_fusion="all coronal maps, Gaussian normal distance sigma=0.75 mm, normalized valid weights",
                   shared_initial_sha256=tensor_signature(shared_initial.values()))
+    if observation is not None:
+        config.update(loss="masked COR MSE", observation=observation.config())
     if pose_mode == "sweep":
         config["sweep_geometry"] = dict(axis=poses.sweep_axis.cpu().tolist(),
             centers_mm=poses.sweep_centers.cpu().tolist(),
@@ -990,6 +995,8 @@ def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_
             evaluate_coronal_trial(model, poses, data, guidance, output, 0, 0., timing)
         columns = ("epoch", "global_step", "step_time_sec", "elapsed_sec", "loss", "sag_loss",
                    "pose_rate", "pose_updated", "pose_updates", "pose_gradient_norm", "cnn_gradient_norm")
+        if observation is not None:
+            columns += ("pose_cor_mse", "motion_penalty")
         with (output / "metrics/timing.csv").open("w", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=columns)
             writer.writeheader()
@@ -1007,9 +1014,12 @@ def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_
                 if conditioned:
                     model.coronal.prepare(poses.matrices())
                 patch = data.patches(args.patches, size, generator)
-                prediction = model(poses(patch["frames"], patch["local"]), progress)[..., 0].reshape(-1, 1, size, size)
-                score, _ = masked_ssim(prediction, patch["image"], patch["mask"])
-                loss = 1 - score
+                if observation is None:
+                    prediction = model(poses(patch["frames"], patch["local"]), progress)[..., 0].reshape(-1, 1, size, size)
+                    score, _ = masked_ssim(prediction, patch["image"], patch["mask"])
+                    loss = 1 - score
+                else:
+                    loss = observation.cor_loss(model, poses, patch, progress)
                 loss.backward()
                 cnn_grad = (float(torch.linalg.vector_norm(torch.stack([
                     parameter.grad.norm() for parameter in model.coronal.encoder.parameters()
@@ -1024,6 +1034,7 @@ def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_
                 accumulator += rate
                 do_pose = rate > 0 and accumulator >= 1 - 1e-10
                 sag_loss, pose_grad = float("nan"), 0.
+                pose_cor_mse, motion_penalty = float("nan"), float("nan")
                 if do_pose:
                     accumulator -= 1
                     model.requires_grad_(False)
@@ -1041,6 +1052,16 @@ def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_
                     support = support & initial_support[rr, cc]
                     score, _ = masked_ssim(predicted[:, None], guidance.reference[rr, cc][:, None], support[:, None])
                     geometry_loss = 1 - score
+                    sag_loss = float(geometry_loss.detach())
+                    if observation is not None and observation.constrained:
+                        penalty = observation.motion_penalty(poses.matrices())
+                        motion_penalty = float(penalty.detach())
+                        geometry_loss = geometry_loss + penalty
+                    if observation is not None and observation.joint:
+                        cor_patch = data.patches(args.patches, size, generators["cor_pose"])
+                        cor_mse = observation.cor_loss(model, poses, cor_patch, progress)
+                        pose_cor_mse = float(cor_mse.detach())
+                        geometry_loss = geometry_loss + observation.pose_cor_weight * cor_mse
                     geometry_loss.backward()
                     pose_grad = float(poses.raw.grad.norm())
                     if not math.isfinite(pose_grad) or pose_grad <= 0:
@@ -1048,7 +1069,6 @@ def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_
                     torch.nn.utils.clip_grad_norm_(poses.parameters(), 1., error_if_nonfinite=True)
                     pose_optimizer.step()
                     pose_updates += 1
-                    sag_loss = float(geometry_loss.detach())
                     if any(parameter.grad is not None for parameter in model.parameters()):
                         raise AssertionError("sag loss 泄漏到 CNN/INR")
                     if smoke:
@@ -1069,6 +1089,8 @@ def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_
                            elapsed_sec=time.perf_counter()-started, loss=float(loss.detach()), sag_loss=sag_loss,
                            pose_rate=rate, pose_updated=int(do_pose), pose_updates=pose_updates,
                            pose_gradient_norm=pose_grad, cnn_gradient_norm=cnn_grad)
+                if observation is not None:
+                    row.update(pose_cor_mse=pose_cor_mse, motion_penalty=motion_penalty)
                 timing.append(row)
                 writer.writerow(row)
                 if step % 20 == 0:
@@ -1082,7 +1104,7 @@ def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_
                         if conditioned:
                             model.coronal.prepare(poses.matrices())
                         payload = checkpoint(model, poses, data, (optimizer, pose_optimizer), config, step,
-                                             generators=dict(patch=generator, pose=sag_generator), sagittal=guidance)
+                                             generators=generators, sagittal=guidance)
                         payload.update(frequency_progress=progress, python_rng_state=random.getstate(),
                                        numpy_rng_state=np.random.get_state(), pose_accumulator=accumulator,
                                        pose_updates=pose_updates, pose_config=pose_config)
