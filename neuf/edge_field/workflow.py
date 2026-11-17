@@ -943,7 +943,8 @@ def train_coronal_variant(data, guidance, output, args, *, conditioned, initial_
     guidance.pose.requires_grad_(False)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     pose_optimizer = torch.optim.Adam(poses.parameters(), lr=args.pose_lr)
-    milestones = sorted({math.ceil(args.steps / 2), math.ceil(3 * args.steps / 4), args.steps})
+    milestones = sorted({math.ceil(args.steps / 2), math.ceil(3 * args.steps / 4), args.steps,
+                         *getattr(args, "extra_checkpoints", ())})
     config = dict(vars(args), conditioned=conditioned, model_config=model.config,
                   steps=args.steps, checkpoint_milestones=milestones, loss="pure single-scale 1-SSIM",
                   pose_mode=pose_mode, pose_supervision=pose_supervision,
