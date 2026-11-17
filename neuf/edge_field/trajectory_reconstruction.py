@@ -24,6 +24,7 @@ METHODS = ("FourP", "SevenP", "Edge", "CNN", "EdgeDT", "Annotation", "Annotation
 MODES = ("off", "translation", "se3", "sweep")
 WORKSPACE = Path(__file__).resolve().parents[3]
 AUTO_ROOT = "logs/20261029_train01/cerebral/index_patient0/NetworkInitializationComparison"
+CNN3D_ROOT = "logs/20261026_train23/cerebral/index_patient0/CNN3D6D"
 ANNOTATION_ROOT = "logs/20261104_train01/cerebral/index_patient0/AnnotationSevenDTBaseline"
 GEOMETRY_ROOT = "logs/20261026_train08/cerebral_patient0/index_x0472/EdgeRegistration"
 ANNOTATION_PREP = "logs/20261030_train03/cerebral/index_patient0/AnnotationDTComparison/run_config/preparation.json"
@@ -171,10 +172,21 @@ class TrajectoryData:
         self.frame_ids = torch.arange(len(self.images), device=device)
         self.splits = dict(training=self.frame_ids, validation=self.frame_ids[:0], test=self.frame_ids[:0])
         self.comparison = [236, 226, 216, 206]
-        automatic = method in AUTO_KEYS
+        automatic = method in AUTO_KEYS or method == "CNN3D"
         pitch = .133849221834 if automatic else float(inputs.annotation["reference_spacing_mm"])
         column = 472 if automatic else 477
-        if automatic:
+        if method == "CNN3D":
+            source = workspace_path(f"{CNN3D_ROOT}/predictions/step_000200.h5")
+            key = "poses"
+            manifest = json.loads(workspace_path(f"{CNN3D_ROOT}/run_config/input_manifest.json").read_text())
+            for name in ("coronal", "sagittal", "metadata", "reference_mask"):
+                if manifest[name]["sha256"] != inputs.sources[name]["sha256"]:
+                    raise ValueError(f"CNN3D trajectory input differs from NeUF: {name}")
+            pitch = float(manifest["reference_spacing_mm"])
+            column = int(manifest["registration_column"])
+            if (column, manifest["center_column"]) != (472, 472):
+                raise ValueError("CNN3D trajectory uses an unexpected pixel origin")
+        elif automatic:
             source = workspace_path(f"{AUTO_ROOT}/predictions/initialization_comparison.h5")
             key = f"{AUTO_KEYS[method]}/poses"
         else:
@@ -183,7 +195,7 @@ class TrajectoryData:
             key = "reference_pose_matrices"
         with h5py.File(source, "r") as handle:
             original = np.asarray(handle[key], dtype=np.float64)
-            if automatic:
+            if method in AUTO_KEYS:
                 np.testing.assert_allclose(handle["reference"][:], inputs.reference.cpu().numpy(), atol=1e-7, rtol=0)
         if original.shape != (242, 4, 4) or not np.isfinite(original).all():
             raise ValueError(f"{method} 缺少242个有效的完整刚体位姿")

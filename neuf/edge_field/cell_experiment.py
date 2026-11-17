@@ -81,15 +81,19 @@ def main():
     from .workflow import train_coronal_variant
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arm", choices=ARMS, required=True)
+    parser.add_argument("--trajectory", choices=("CNN", "CNN3D"), default="CNN")
+    parser.add_argument("--steps", type=int, default=20000)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.steps < 20:
+        parser.error("--steps must be at least 20")
     if args.output.exists():
         raise FileExistsError(args.output)
     torch.set_num_threads(4)
-    data = TrajectoryData(Inputs("cuda"), "CNN")
-    trial = argparse.Namespace(output=args.output, mode="train", method="CNN", device="cuda",
+    data = TrajectoryData(Inputs("cuda"), args.trajectory)
+    trial = argparse.Namespace(output=args.output, mode="train", method=args.trajectory, device="cuda",
                                pose_mode="off" if args.arm == "fixed" else "se3",
-                               pose_supervision="observed", steps=20000, seed=3407, encoding="hash",
+                               pose_supervision="observed", steps=args.steps, seed=3407, encoding="hash",
                                patches=4, patch_size=64, sagittal_patches=2, width=128, bands=10,
                                lr=.0005, pose_lr=.002)
     train_coronal_variant(data, data.guidance, args.output, trial, conditioned=False,
